@@ -48,6 +48,7 @@ if [ -f "$CONFIG_FILE" ]; then
         echo "WARNING: Configuration file '${CONFIG_FILE}' permissions are ${_cfg_perms} (expected 600). Tightening to 600..." >&2
         chmod 600 "$CONFIG_FILE" 2>/dev/null || true
     fi
+    # shellcheck source=/dev/null
     source "$CONFIG_FILE"
 fi
 
@@ -86,8 +87,17 @@ ENCRYPTION_PASSWORD="${ENCRYPTION_PASSWORD:-${BACKUP_ENCRYPTION_PASSWORD:-}}"
 SOURCE_DIR="${SOURCE_DIR:-$HOME}"
 
 # Retention Settings
+# Retention mode: 'count' (retain N newest archives, default) or 'tiered' / 'gfs' (Grandfather-Father-Son retention)
+RETENTION_MODE="${RETENTION_MODE:-count}"
 CLOUD_KEEP_COUNT="${CLOUD_KEEP_COUNT:-10}"
 LOCAL_KEEP_COUNT="${LOCAL_KEEP_COUNT:-10}"
+
+# Tiered / GFS Retention Settings (evaluated when RETENTION_MODE is 'tiered' or 'gfs')
+RETENTION_DAILY="${RETENTION_DAILY:-7}"
+RETENTION_WEEKLY="${RETENTION_WEEKLY:-4}"
+RETENTION_MONTHLY="${RETENTION_MONTHLY:-6}"
+RETENTION_YEARLY="${RETENTION_YEARLY:-1}"
+RETENTION_MIN_KEEP="${RETENTION_MIN_KEEP:-0}"
 
 # Local Backup & Disaster Recovery Mirroring Settings
 LOCAL_DRIVE_UUID="${LOCAL_DRIVE_UUID:-bc3968af-d154-4167-b73c-5a172d2a25b8}"
@@ -246,7 +256,7 @@ MAIL_COMMAND="${MAIL_COMMAND:-auto}"
 EMAIL_ALERT_SENT=0
 
 # Script version identifier
-SCRIPT_VERSION="9.36.0"
+SCRIPT_VERSION="10.0.0"
 
 # Path to this script for self-invocation
 SCRIPT_PATH="$(realpath "${BASH_SOURCE[0]}")"
@@ -432,8 +442,10 @@ fi
 #   FUNCTION:  get_encryption_password()
 #  DESCRIPTION:  Loads the encryption password dynamically following fallback order:
 #                1. Environment variable (ENCRYPTION_PASSWORD or BACKUP_ENCRYPTION_PASSWORD)
-#                2. Secure config file (chmod 600, default: ~/.config/backup_script/passphrase)
-#                3. Interactive prompt (with confirmation if creating a backup)
+#                2. Systemd encrypted credentials ($CREDENTIALS_DIRECTORY)
+#                3. Secret Service / GNOME Keyring via secret-tool
+#                4. Secure config file (chmod 600, default: ~/.config/backup_script/passphrase)
+#                5. Interactive prompt (with confirmation if creating a backup)
 #---
 get_encryption_password() {
     local action="${1:-}"
@@ -446,7 +458,31 @@ get_encryption_password() {
         return 0
     fi
 
-    # 2. Check secure config file
+    # 2. Check systemd encrypted credentials if running under a systemd service
+    if [ -n "${CREDENTIALS_DIRECTORY:-}" ]; then
+        local _cred_candidate _cred_val
+        for _cred_candidate in "backup_passphrase" "backup_password" "passphrase" "encryption_password"; do
+            if [ -f "${CREDENTIALS_DIRECTORY}/${_cred_candidate}" ] && [ -r "${CREDENTIALS_DIRECTORY}/${_cred_candidate}" ]; then
+                _cred_val=$(< "${CREDENTIALS_DIRECTORY}/${_cred_candidate}")
+                if [ -n "$_cred_val" ] && [ "$_cred_val" != "EnterPasswordHere" ]; then
+                    ENCRYPTION_PASSWORD="$_cred_val"
+                    return 0
+                fi
+            fi
+        done
+    fi
+
+    # 3. Check Secret Service / GNOME Keyring via secret-tool if installed
+    if command -v secret-tool &>/dev/null; then
+        local _sec_val
+        _sec_val=$(secret-tool lookup service backup_script user "$CURRENT_USER" 2>/dev/null || true)
+        if [ -n "$_sec_val" ] && [ "$_sec_val" != "EnterPasswordHere" ]; then
+            ENCRYPTION_PASSWORD="$_sec_val"
+            return 0
+        fi
+    fi
+
+    # 4. Check secure config file
     if [ -f "$PASSWORD_FILE" ]; then
         local pwd_dir dir_perms file_perms
         pwd_dir=$(dirname "$PASSWORD_FILE")
@@ -897,20 +933,156 @@ check_dependencies() {
 }
 
 #---
-#   FUNCTION:  run_rotation()
-#  DESCRIPTION:  Deletes old backups, keeping the most recent ones on the cloud.
+#   FUNCTION:  update_manifest_destination_status()
+#  DESCRIPTION:  Updates the destination status (e.g. local_backup or cloud_backup)
+#                inside a JSON companion manifest file.
 #---
-run_rotation() {
-    if ! [ "${CLOUD_KEEP_COUNT:-0}" -gt 0 ] 2>/dev/null; then
-        log_message "WARNING: Cloud backup rotation skipped. CLOUD_KEEP_COUNT must be a positive integer (currently '${CLOUD_KEEP_COUNT}')."
-        echo "Cloud backup rotation skipped (invalid or zero keep count)."
-        return 0
+update_manifest_destination_status() {
+    local manifest_file="$1"
+    local dest_key="$2"     # "local_backup" or "cloud_backup"
+    local status="$3"       # "OK", "Skipped (...)", "Failed", etc.
+
+    [ -f "$manifest_file" ] || return 0
+
+    local escaped_status
+    escaped_status=$(printf '%s\n' "$status" | sed -e 's/[\/&]/\\&/g')
+    sed -i -E "s/\"${dest_key}\":[[:space:]]*\"[^\"]*\"/\"${dest_key}\": \"${escaped_status}\"/" "$manifest_file" 2>/dev/null || true
+}
+
+#---
+#   FUNCTION:  calculate_tiered_retention_prune_list()
+#  DESCRIPTION:  Evaluates a list of backup archive filenames and determines which
+#                archives to prune based on Grandfather-Father-Son (GFS) tiered retention:
+#                - RETENTION_DAILY (default: 7 daily archives)
+#                - RETENTION_WEEKLY (default: 4 weekly archives)
+#                - RETENTION_MONTHLY (default: 6 monthly archives)
+#                - RETENTION_YEARLY (default: 1 yearly archive)
+#                Outputs filenames that should be pruned.
+#---
+# shellcheck disable=SC2120
+calculate_tiered_retention_prune_list() {
+    local daily_limit="${RETENTION_DAILY:-7}"
+    local weekly_limit="${RETENTION_WEEKLY:-4}"
+    local monthly_limit="${RETENTION_MONTHLY:-6}"
+    local yearly_limit="${RETENTION_YEARLY:-1}"
+    local min_keep="${RETENTION_MIN_KEEP:-0}"
+
+    local -A kept_archives=()
+    local -A day_buckets=()
+    local -A week_buckets=()
+    local -A month_buckets=()
+    local -A year_buckets=()
+
+    local -a all_archives=()
+    if [ $# -gt 0 ]; then
+        all_archives=("$@")
+    else
+        while IFS= read -r line || [ -n "$line" ]; do
+            [[ -z "$line" ]] && continue
+            all_archives+=("$line")
+        done
     fi
 
-    log_message "Running cloud backup rotation. Keeping the latest ${CLOUD_KEEP_COUNT} backups."
-    echo "Running cloud backup rotation (keeping ${CLOUD_KEEP_COUNT})..."
+    [ ${#all_archives[@]} -eq 0 ] && return 0
 
-    rclone lsf --fast-list "${BACKUP_DIR}" | grep -E "${TARBALL_BASENAME}_.*\.tar\.(zst|gz|xz)\.gpg$" | sort | head -n -"${CLOUD_KEEP_COUNT}" | while read -r file_to_delete; do
+    # Sort newest to oldest:
+    # Since filenames contain YYYY-MM-DD_HHMMSS, reverse lexical sort is chronological descending
+    mapfile -t all_archives < <(printf '%s\n' "${all_archives[@]}" | sort -r)
+
+    local day_count=0 week_count=0 month_count=0 year_count=0
+    local overall_idx=0
+
+    for archive in "${all_archives[@]}"; do
+        ((overall_idx++))
+
+        # Always keep if within min_keep threshold
+        if [ "$min_keep" -gt 0 ] && [ "$overall_idx" -le "$min_keep" ]; then
+            kept_archives["$archive"]=1
+        fi
+
+        if [[ "$archive" =~ ([0-9]{4})-([0-9]{2})-([0-9]{2})_([0-9]{6}) ]]; then
+            local y="${BASH_REMATCH[1]}"
+            local m="${BASH_REMATCH[2]}"
+            local d="${BASH_REMATCH[3]}"
+            local date_str="${y}-${m}-${d}"
+
+            local iso_week
+            iso_week=$(date -d "${date_str}" +%G-W%V 2>/dev/null || echo "${y}-W$(( (10#$m * 30 + 10#$d) / 7 ))")
+            local month_str="${y}-${m}"
+            local year_str="${y}"
+
+            local keep=false
+
+            # Daily bucket (keep newest for each distinct day)
+            if [ -z "${day_buckets[$date_str]+x}" ] && [ "$day_count" -lt "$daily_limit" ]; then
+                day_buckets["$date_str"]=1
+                ((day_count++))
+                keep=true
+            fi
+
+            # Weekly bucket (keep newest for each distinct ISO week)
+            if [ -z "${week_buckets[$iso_week]+x}" ] && [ "$week_count" -lt "$weekly_limit" ]; then
+                week_buckets["$iso_week"]=1
+                ((week_count++))
+                keep=true
+            fi
+
+            # Monthly bucket (keep newest for each distinct month)
+            if [ -z "${month_buckets[$month_str]+x}" ] && [ "$month_count" -lt "$monthly_limit" ]; then
+                month_buckets["$month_str"]=1
+                ((month_count++))
+                keep=true
+            fi
+
+            # Yearly bucket (keep newest for each distinct year)
+            if [ -z "${year_buckets[$year_str]+x}" ] && [ "$year_count" -lt "$yearly_limit" ]; then
+                year_buckets["$year_str"]=1
+                ((year_count++))
+                keep=true
+            fi
+
+            if [ "$keep" = true ]; then
+                kept_archives["$archive"]=1
+            fi
+        else
+            # Preserve archives with unrecognized timestamp format safely
+            kept_archives["$archive"]=1
+        fi
+    done
+
+    # Output any archive that is NOT in kept_archives
+    for archive in "${all_archives[@]}"; do
+        if [ -z "${kept_archives[$archive]+x}" ]; then
+            echo "$archive"
+        fi
+    done
+}
+
+#---
+#   FUNCTION:  run_rotation()
+#  DESCRIPTION:  Deletes old backups, keeping recent ones on cloud remote.
+#                Supports count-based retention (default) and GFS tiered retention.
+#---
+run_rotation() {
+    local -a files_to_delete=()
+
+    if [ "$RETENTION_MODE" = "tiered" ] || [ "$RETENTION_MODE" = "gfs" ]; then
+        log_message "Running tiered cloud backup rotation (daily=${RETENTION_DAILY:-7}, weekly=${RETENTION_WEEKLY:-4}, monthly=${RETENTION_MONTHLY:-6}, yearly=${RETENTION_YEARLY:-1})."
+        echo "Running tiered cloud backup rotation (daily=${RETENTION_DAILY:-7}, weekly=${RETENTION_WEEKLY:-4}, monthly=${RETENTION_MONTHLY:-6}, yearly=${RETENTION_YEARLY:-1})..."
+        mapfile -t files_to_delete < <(rclone lsf --fast-list "${BACKUP_DIR}" 2>/dev/null | grep -E "${TARBALL_BASENAME}_.*\.tar\.(zst|gz|xz)\.gpg$" | calculate_tiered_retention_prune_list)
+    else
+        if ! [ "${CLOUD_KEEP_COUNT:-0}" -gt 0 ] 2>/dev/null; then
+            log_message "WARNING: Cloud backup rotation skipped. CLOUD_KEEP_COUNT must be a positive integer (currently '${CLOUD_KEEP_COUNT}')."
+            echo "Cloud backup rotation skipped (invalid or zero keep count)."
+            return 0
+        fi
+
+        log_message "Running cloud backup rotation. Keeping the latest ${CLOUD_KEEP_COUNT} backups."
+        echo "Running cloud backup rotation (keeping ${CLOUD_KEEP_COUNT})..."
+        mapfile -t files_to_delete < <(rclone lsf --fast-list "${BACKUP_DIR}" 2>/dev/null | grep -E "${TARBALL_BASENAME}_.*\.tar\.(zst|gz|xz)\.gpg$" | sort | head -n -"${CLOUD_KEEP_COUNT}")
+    fi
+
+    for file_to_delete in "${files_to_delete[@]}"; do
         [ -z "$file_to_delete" ] && continue
         log_message "Trashing old cloud backup: ${file_to_delete}"
         echo "Trashing old cloud backup: ${file_to_delete}"
@@ -1455,6 +1627,7 @@ handle_local_backup() {
             # Mirror companion JSON manifest if present
             local manifest_src="${file_path}.manifest.json"
             if [ -f "$manifest_src" ]; then
+                update_manifest_destination_status "$manifest_src" "local_backup" "OK"
                 local final_manifest_dest="${local_backup_path}/${file_name}.manifest.json"
                 local temp_manifest_dest="${local_backup_path}/${file_name}.manifest.json.part"
                 CURRENT_LOCAL_TEMP_MANIFEST="${temp_manifest_dest}"
@@ -1470,22 +1643,31 @@ handle_local_backup() {
             fi
             
             # Local Rotation
-            if [ "${LOCAL_KEEP_COUNT:-0}" -gt 0 ] 2>/dev/null; then
-                echo "Running local backup rotation (keeping ${LOCAL_KEEP_COUNT})..."
-                log_message "Running local backup rotation. Keeping the latest ${LOCAL_KEEP_COUNT} backups."
-                # Find files matching the basename, sort by name (timestamped), delete all but the newest
-                find "${local_backup_path}" -maxdepth 1 -type f \( -name "${TARBALL_BASENAME}_*.tar.zst.gpg" -o -name "${TARBALL_BASENAME}_*.tar.gz.gpg" -o -name "${TARBALL_BASENAME}_*.tar.xz.gpg" \) -printf "%f\n" 2>/dev/null | sort | head -n -"${LOCAL_KEEP_COUNT}" | while read -r old_file; do
-                    [ -z "$old_file" ] && continue
-                    log_message "Deleting old local backup: ${old_file}"
-                    rm -f "${local_backup_path}/${old_file}"
-                    rm -f "${local_backup_path}/${old_file}.sha256"
-                    rm -f "${local_backup_path}/${old_file}.manifest.json"
-                done
-                sync -f "${local_backup_path}" 2>/dev/null || sync
+            local -a local_files_to_delete=()
+            if [ "$RETENTION_MODE" = "tiered" ] || [ "$RETENTION_MODE" = "gfs" ]; then
+                echo "Running tiered local backup rotation (daily=${RETENTION_DAILY:-7}, weekly=${RETENTION_WEEKLY:-4}, monthly=${RETENTION_MONTHLY:-6}, yearly=${RETENTION_YEARLY:-1})..."
+                log_message "Running tiered local backup rotation (daily=${RETENTION_DAILY:-7}, weekly=${RETENTION_WEEKLY:-4}, monthly=${RETENTION_MONTHLY:-6}, yearly=${RETENTION_YEARLY:-1})."
+                mapfile -t local_files_to_delete < <(find "${local_backup_path}" -maxdepth 1 -type f \( -name "${TARBALL_BASENAME}_*.tar.zst.gpg" -o -name "${TARBALL_BASENAME}_*.tar.gz.gpg" -o -name "${TARBALL_BASENAME}_*.tar.xz.gpg" \) -printf "%f\n" 2>/dev/null | calculate_tiered_retention_prune_list)
             else
-                log_message "WARNING: Local backup rotation skipped. LOCAL_KEEP_COUNT must be a positive integer (currently '${LOCAL_KEEP_COUNT}')."
-                echo "Local backup rotation skipped (invalid or zero keep count)."
+                if [ "${LOCAL_KEEP_COUNT:-0}" -gt 0 ] 2>/dev/null; then
+                    echo "Running local backup rotation (keeping ${LOCAL_KEEP_COUNT})..."
+                    log_message "Running local backup rotation. Keeping the latest ${LOCAL_KEEP_COUNT} backups."
+                    # Find files matching the basename, sort by name (timestamped), delete all but the newest
+                    mapfile -t local_files_to_delete < <(find "${local_backup_path}" -maxdepth 1 -type f \( -name "${TARBALL_BASENAME}_*.tar.zst.gpg" -o -name "${TARBALL_BASENAME}_*.tar.gz.gpg" -o -name "${TARBALL_BASENAME}_*.tar.xz.gpg" \) -printf "%f\n" 2>/dev/null | sort | head -n -"${LOCAL_KEEP_COUNT}")
+                else
+                    log_message "WARNING: Local backup rotation skipped. LOCAL_KEEP_COUNT must be a positive integer (currently '${LOCAL_KEEP_COUNT}')."
+                    echo "Local backup rotation skipped (invalid or zero keep count)."
+                fi
             fi
+
+            for old_file in "${local_files_to_delete[@]}"; do
+                [ -z "$old_file" ] && continue
+                log_message "Deleting old local backup: ${old_file}"
+                rm -f "${local_backup_path}/${old_file}"
+                rm -f "${local_backup_path}/${old_file}.sha256"
+                rm -f "${local_backup_path}/${old_file}.manifest.json"
+            done
+            sync -f "${local_backup_path}" 2>/dev/null || sync
 
             # Disaster Recovery: Mirror standalone script and cheatsheet to local backup drive
             mirror_script_and_cheatsheet "${local_backup_path}"
@@ -2811,6 +2993,7 @@ run_backup() {
     else
         local_backup_status="Failed"
     fi
+    update_manifest_destination_status "$FULL_MANIFEST_PATH" "local_backup" "$local_backup_status"
 
     # --- Step 4: Upload the encrypted tarball ---
     local cloud_backup_status="OK"
@@ -2835,6 +3018,13 @@ run_backup() {
         [ -n "$RCLONE_BWLIMIT" ] && rclone_common_opts+=(--bwlimit "$RCLONE_BWLIMIT")
 
         if ! rclone copy "${rclone_common_opts[@]}" "${rclone_progress_opts[@]}" --log-file "$rclone_log" "${FULL_ENCRYPTED_PATH}" "${BACKUP_DIR}"; then
+            cloud_backup_status="Failed"
+            update_manifest_destination_status "$FULL_MANIFEST_PATH" "cloud_backup" "Failed"
+            local local_backup_path
+            if local_backup_path=$(get_local_backup_path 2>/dev/null) && [ -n "$local_backup_path" ] && [ -d "$local_backup_path" ]; then
+                update_manifest_destination_status "${local_backup_path}/${ENCRYPTED_MANIFEST_NAME}" "cloud_backup" "Failed"
+            fi
+
             PRESERVE_ARCHIVE=true
             local PRESERVED_PATH="${SOURCE_DIR}/${ENCRYPTED_TARBALL_NAME}"
             if mv "${FULL_ENCRYPTED_PATH}" "${PRESERVED_PATH}"; then
@@ -2866,6 +3056,13 @@ run_backup() {
             fi
             send_notification "critical" "Backup Failed" "Upload failed. Archive preserved at ${PRESERVED_PATH}."
             return 1
+        fi
+
+        cloud_backup_status="OK"
+        update_manifest_destination_status "$FULL_MANIFEST_PATH" "cloud_backup" "OK"
+        local local_backup_path
+        if local_backup_path=$(get_local_backup_path 2>/dev/null) && [ -n "$local_backup_path" ] && [ -d "$local_backup_path" ]; then
+            update_manifest_destination_status "${local_backup_path}/${ENCRYPTED_MANIFEST_NAME}" "cloud_backup" "OK"
         fi
 
         # Also upload the companion SHA-256 sidecar to cloud
@@ -2900,6 +3097,11 @@ run_backup() {
         cloud_backup_status="Skipped (unreachable)"
         echo "Skipping cloud upload (cloud remote was unreachable during pre-flight check)."
         log_message "Skipped cloud upload: remote was unreachable during pre-flight check."
+        update_manifest_destination_status "$FULL_MANIFEST_PATH" "cloud_backup" "Skipped (unreachable)"
+        local local_backup_path
+        if local_backup_path=$(get_local_backup_path 2>/dev/null) && [ -n "$local_backup_path" ] && [ -d "$local_backup_path" ]; then
+            update_manifest_destination_status "${local_backup_path}/${ENCRYPTED_MANIFEST_NAME}" "cloud_backup" "Skipped (unreachable)"
+        fi
 
         local should_preserve="$PRESERVE_ARCHIVE"
         if [ "$local_rc" -ne 0 ]; then
@@ -7310,15 +7512,31 @@ init_config() {
 #------------------------------------------------------------------------------
 # 4. Retention Policies
 #------------------------------------------------------------------------------
-# Number of most recent cloud backup archives to retain on the rclone remote.
+# Retention mode:
+#   'count'  - Retains the N most recent backups (default, uses CLOUD_KEEP_COUNT / LOCAL_KEEP_COUNT).
+#   'tiered' - Grandfather-Father-Son (GFS) retention based on archive dates (daily, weekly, monthly, yearly).
+# Default: "count"
+#RETENTION_MODE="count"
+
+# Number of most recent cloud backup archives to retain on the rclone remote (for 'count' mode).
 # Older archives matching the naming pattern will be pruned after successful upload.
 # Default: 10
 #CLOUD_KEEP_COUNT=10
 
-# Number of most recent local backup archives to retain on the external backup drive.
+# Number of most recent local backup archives to retain on the external backup drive (for 'count' mode).
 # Older archives will be pruned automatically.
 # Default: 10
 #LOCAL_KEEP_COUNT=10
+
+# Tiered / GFS Retention Limits (active when RETENTION_MODE is 'tiered' or 'gfs')
+# Keep the newest backup for each distinct day, week, month, and year.
+# Default: daily=7, weekly=4, monthly=6, yearly=1
+#RETENTION_DAILY=7
+#RETENTION_WEEKLY=4
+#RETENTION_MONTHLY=6
+#RETENTION_YEARLY=1
+# Optional floor: always preserve the N newest backups regardless of buckets (0 = disabled)
+#RETENTION_MIN_KEEP=0
 
 #------------------------------------------------------------------------------
 # 5. Local Drive Backup Settings
@@ -8252,16 +8470,21 @@ check_config() {
 
     report_ok "Zstd Decompress Memory" "${ZSTD_DECOMPRESS_MEMORY}"
 
-    if [[ "${CLOUD_KEEP_COUNT:-10}" =~ ^[0-9]+$ ]] && [ "$CLOUD_KEEP_COUNT" -gt 0 ]; then
-        report_ok "Cloud Retention" "Retain ${CLOUD_KEEP_COUNT} newest archives"
+    if [ "$RETENTION_MODE" = "tiered" ] || [ "$RETENTION_MODE" = "gfs" ]; then
+        report_ok "Retention Policy" "Tiered GFS (daily=${RETENTION_DAILY:-7}, weekly=${RETENTION_WEEKLY:-4}, monthly=${RETENTION_MONTHLY:-6}, yearly=${RETENTION_YEARLY:-1})"
     else
-        report_fail "Cloud Retention" "Invalid CLOUD_KEEP_COUNT '${CLOUD_KEEP_COUNT}' (must be positive integer)"
-    fi
+        report_ok "Retention Policy" "Count-based mode"
+        if [[ "${CLOUD_KEEP_COUNT:-10}" =~ ^[0-9]+$ ]] && [ "$CLOUD_KEEP_COUNT" -gt 0 ]; then
+            report_ok "Cloud Retention" "Retain ${CLOUD_KEEP_COUNT} newest archives"
+        else
+            report_fail "Cloud Retention" "Invalid CLOUD_KEEP_COUNT '${CLOUD_KEEP_COUNT}' (must be positive integer)"
+        fi
 
-    if [[ "${LOCAL_KEEP_COUNT:-10}" =~ ^[0-9]+$ ]] && [ "$LOCAL_KEEP_COUNT" -gt 0 ]; then
-        report_ok "Local Retention" "Retain ${LOCAL_KEEP_COUNT} newest archives"
-    else
-        report_fail "Local Retention" "Invalid LOCAL_KEEP_COUNT '${LOCAL_KEEP_COUNT}' (must be positive integer)"
+        if [[ "${LOCAL_KEEP_COUNT:-10}" =~ ^[0-9]+$ ]] && [ "$LOCAL_KEEP_COUNT" -gt 0 ]; then
+            report_ok "Local Retention" "Retain ${LOCAL_KEEP_COUNT} newest archives"
+        else
+            report_fail "Local Retention" "Invalid LOCAL_KEEP_COUNT '${LOCAL_KEEP_COUNT}' (must be positive integer)"
+        fi
     fi
 
     # Post-Backup Auto-Verification Mode
