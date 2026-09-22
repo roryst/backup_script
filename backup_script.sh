@@ -216,6 +216,9 @@ ARCHIVE_LIST_PAGER="${ARCHIVE_LIST_PAGER:-${PAGER:-less -FRX}}"
 # Generate lightweight companion JSON manifest (.manifest.json) alongside archive and checksum.
 GENERATE_MANIFEST="${GENERATE_MANIFEST:-true}"
 
+# Generate lightweight companion file list index (.files.gz) for zero-bandwidth file queries.
+GENERATE_FILE_INDEX="${GENERATE_FILE_INDEX:-true}"
+
 # Lifecycle hook commands and directory for pre/post backup triggers
 # Supports executable scripts (${HOOKS_DIR}/pre-backup.sh, ${HOOKS_DIR}/post-backup.sh)
 # and/or inline shell commands (PRE_BACKUP_COMMAND, POST_BACKUP_COMMAND).
@@ -272,9 +275,11 @@ CURRENT_TEMP_ARCHIVE=""
 CURRENT_ENCRYPTED_ARCHIVE=""
 CURRENT_SHA256_FILE=""
 CURRENT_MANIFEST_FILE=""
+CURRENT_FILE_INDEX_FILE=""
 CURRENT_LOCAL_TEMP_ARCHIVE=""
 CURRENT_LOCAL_TEMP_SHA256=""
 CURRENT_LOCAL_TEMP_MANIFEST=""
+CURRENT_LOCAL_TEMP_INDEX=""
 CURRENT_VERIFY_TMP_DIR=""
 CURRENT_BACKUP_TMP_DIR=""
 CURRENT_RESTORE_TMP_DIR=""
@@ -924,7 +929,7 @@ execute_lifecycle_hook() {
 #  DESCRIPTION:  Checks if required commands are installed.
 #---
 check_dependencies() {
-    for cmd in tar rclone gpg pkill pgrep hostname zstd findmnt flock df awk numfmt sha256sum; do
+    for cmd in tar rclone gpg pkill pgrep hostname zstd findmnt flock df awk numfmt sha256sum gzip; do
         if ! command -v "$cmd" &> /dev/null; then
             echo "ERROR: Required command '$cmd' is not installed. Please install it to continue." >&2
             exit 1
@@ -1089,6 +1094,7 @@ run_rotation() {
         rclone deletefile "${BACKUP_DIR}${file_to_delete}" >> "$LOG_FILE" 2>&1
         rclone deletefile "${BACKUP_DIR}${file_to_delete}.sha256" >> "$LOG_FILE" 2>&1 || true
         rclone deletefile "${BACKUP_DIR}${file_to_delete}.manifest.json" >> "$LOG_FILE" 2>&1 || true
+        rclone deletefile "${BACKUP_DIR}${file_to_delete}.files.gz" >> "$LOG_FILE" 2>&1 || true
     done
 
     log_message "Cloud backup rotation complete."
@@ -1641,6 +1647,23 @@ handle_local_backup() {
                     log_message "WARNING: Failed to mirror backup manifest to local backup drive."
                 fi
             fi
+
+            # Mirror companion file list index sidecar if present
+            local index_src="${file_path}.files.gz"
+            if [ -f "$index_src" ]; then
+                local final_index_dest="${local_backup_path}/${file_name}.files.gz"
+                local temp_index_dest="${local_backup_path}/${file_name}.files.gz.part"
+                CURRENT_LOCAL_TEMP_INDEX="${temp_index_dest}"
+                if cp -p "${index_src}" "${temp_index_dest}" 2>/dev/null; then
+                    mv -f "${temp_index_dest}" "${final_index_dest}" 2>/dev/null || true
+                    CURRENT_LOCAL_TEMP_INDEX=""
+                    log_message "Local file list index mirrored: ${file_name}.files.gz"
+                else
+                    rm -f "${temp_index_dest}" 2>/dev/null || true
+                    CURRENT_LOCAL_TEMP_INDEX=""
+                    log_message "WARNING: Failed to mirror file list index to local backup drive."
+                fi
+            fi
             
             # Local Rotation
             local -a local_files_to_delete=()
@@ -1666,6 +1689,7 @@ handle_local_backup() {
                 rm -f "${local_backup_path}/${old_file}"
                 rm -f "${local_backup_path}/${old_file}.sha256"
                 rm -f "${local_backup_path}/${old_file}.manifest.json"
+                rm -f "${local_backup_path}/${old_file}.files.gz"
             done
             sync -f "${local_backup_path}" 2>/dev/null || sync
 
@@ -1674,10 +1698,11 @@ handle_local_backup() {
 
             return 0
         else
-            rm -f "${temp_dest}" "${final_dest}" "${local_backup_path}/${file_name}.sha256"* "${local_backup_path}/${file_name}.manifest.json"* 2>/dev/null
+            rm -f "${temp_dest}" "${final_dest}" "${local_backup_path}/${file_name}.sha256"* "${local_backup_path}/${file_name}.manifest.json"* "${local_backup_path}/${file_name}.files.gz"* 2>/dev/null
             CURRENT_LOCAL_TEMP_ARCHIVE=""
             CURRENT_LOCAL_TEMP_SHA256=""
             CURRENT_LOCAL_TEMP_MANIFEST=""
+            CURRENT_LOCAL_TEMP_INDEX=""
             log_message "ERROR: Failed to copy backup to local drive. Cleaned up incomplete archive."
             echo "Local copy failed! Incomplete archive cleaned up." >&2
             return 1
@@ -1746,11 +1771,15 @@ upload_preserved_archive() {
         if [ -f "$target_manifest" ]; then
             rclone copy --retries 3 --low-level-retries 5 --timeout 5m "$target_manifest" "${BACKUP_DIR}" >> "$rclone_log" 2>&1 || true
         fi
+        local target_index="${target_file}.files.gz"
+        if [ -f "$target_index" ]; then
+            rclone copy --retries 3 --low-level-retries 5 --timeout 5m "$target_index" "${BACKUP_DIR}" >> "$rclone_log" 2>&1 || true
+        fi
         local duration_str
         duration_str=$(format_duration $(( SECONDS - upload_start_time )))
         log_message "Preserved archive upload completed successfully: ${target_name} (${target_hr} in ${duration_str})"
         echo "Upload of ${target_name} succeeded in ${duration_str}!"
-        rm -f "${target_file}" "${target_sha256}" "${target_manifest}"
+        rm -f "${target_file}" "${target_sha256}" "${target_manifest}" "${target_index}"
         run_rotation
         send_notification "normal" "Backup Upload Succeeded" "Preserved archive ${target_name} (${target_hr}) successfully uploaded in ${duration_str}." "drive-harddisk"
         return 0
@@ -1801,7 +1830,7 @@ manage_preserved_archives() {
             echo "Deleting all ${count} preserved failed-upload archive(s)..."
             for p in "${preserved_archives[@]}"; do
                 log_message "Deleting preserved archive: $(basename "$p")"
-                rm -f "$p" "${p}.sha256" "${p}.manifest.json"
+                rm -f "$p" "${p}.sha256" "${p}.manifest.json" "${p}.files.gz"
             done
             echo "All preserved archive(s) deleted."
             return 0
@@ -1897,7 +1926,7 @@ manage_preserved_archives() {
                 if [[ "$del_confirm" =~ ^[Yy]$ ]]; then
                     for p in "${preserved_archives[@]}"; do
                         log_message "Deleting preserved archive: $(basename "$p")"
-                        rm -f "$p" "${p}.sha256" "${p}.manifest.json"
+                        rm -f "$p" "${p}.sha256" "${p}.manifest.json" "${p}.files.gz"
                     done
                     echo "All preserved archive(s) deleted."
                     return 0
@@ -1921,7 +1950,7 @@ manage_preserved_archives() {
                     read -r -p "Permanently delete ${sel_name}? (y/N): " del_one
                     if [[ "$del_one" =~ ^[Yy]$ ]]; then
                         log_message "Deleting preserved archive: ${sel_name}"
-                        rm -f "${SOURCE_DIR}/${sel_name}" "${SOURCE_DIR}/${sel_name}.sha256" "${SOURCE_DIR}/${sel_name}.manifest.json"
+                        rm -f "${SOURCE_DIR}/${sel_name}" "${SOURCE_DIR}/${sel_name}.sha256" "${SOURCE_DIR}/${sel_name}.manifest.json" "${SOURCE_DIR}/${sel_name}.files.gz"
                         echo "Deleted ${sel_name}."
                     else
                         echo "Deletion cancelled."
@@ -2735,7 +2764,13 @@ run_backup() {
     local gpg_err_file="${backup_tmp_dir}/gpg.err"
     local tar_err_file="${backup_tmp_dir}/tar.err"
     local tar_fifo="${backup_tmp_dir}/tar.fifo"
+    local tar_index_raw="${backup_tmp_dir}/tar.index.raw"
     mkfifo "$tar_fifo"
+
+    local tar_index_opts=()
+    if [ "$GENERATE_FILE_INDEX" = true ] || [ "$GENERATE_FILE_INDEX" = "1" ]; then
+        tar_index_opts=("-vv" "--index-file=${tar_index_raw}")
+    fi
 
     tee "$tar_err_file" < "$tar_fifo" >&2 &
     local tee_pid=$!
@@ -2747,7 +2782,7 @@ run_backup() {
             gpg_encrypt_args+=(-r "$r")
         done
         gpg_encrypt_args+=(-z 0 --encrypt -o "${FULL_ENCRYPTED_PATH}")
-        tar "${tar_fs_opts[@]}" --totals --sparse --exclude-caches-all "${tar_tag_opts[@]}" "${tar_ignore_opts[@]}" -l --acls --xattrs --xattrs-include='*' -I "${zstd_compress_cmd}" "${tar_checkpoint_opts[@]}" -cpf - "${TAR_EXCLUDE_OPTS[@]}" "${tar_staging_opts[@]}" -C "${SOURCE_DIR}" . 2>"$tar_fifo" \
+        tar "${tar_fs_opts[@]}" "${tar_index_opts[@]}" --totals --sparse --exclude-caches-all "${tar_tag_opts[@]}" "${tar_ignore_opts[@]}" -l --acls --xattrs --xattrs-include='*' -I "${zstd_compress_cmd}" "${tar_checkpoint_opts[@]}" -cpf - "${TAR_EXCLUDE_OPTS[@]}" "${tar_staging_opts[@]}" -C "${SOURCE_DIR}" . 2>"$tar_fifo" \
             | gpg "${gpg_encrypt_args[@]}" 2>"$gpg_err_file"
     elif [ "$ENCRYPTION_MODE" = "hybrid" ]; then
         gpg_encrypt_args+=(--pinentry-mode loopback --trust-model always)
@@ -2755,11 +2790,11 @@ run_backup() {
             gpg_encrypt_args+=(-r "$r")
         done
         gpg_encrypt_args+=(--encrypt --symmetric --cipher-algo AES256 -z 0 --s2k-mode 3 --s2k-count 65011712 --s2k-digest-algo SHA512 --passphrase-fd 3 -o "${FULL_ENCRYPTED_PATH}")
-        tar "${tar_fs_opts[@]}" --totals --sparse --exclude-caches-all "${tar_tag_opts[@]}" "${tar_ignore_opts[@]}" -l --acls --xattrs --xattrs-include='*' -I "${zstd_compress_cmd}" "${tar_checkpoint_opts[@]}" -cpf - "${TAR_EXCLUDE_OPTS[@]}" "${tar_staging_opts[@]}" -C "${SOURCE_DIR}" . 2>"$tar_fifo" \
+        tar "${tar_fs_opts[@]}" "${tar_index_opts[@]}" --totals --sparse --exclude-caches-all "${tar_tag_opts[@]}" "${tar_ignore_opts[@]}" -l --acls --xattrs --xattrs-include='*' -I "${zstd_compress_cmd}" "${tar_checkpoint_opts[@]}" -cpf - "${TAR_EXCLUDE_OPTS[@]}" "${tar_staging_opts[@]}" -C "${SOURCE_DIR}" . 2>"$tar_fifo" \
             | gpg "${gpg_encrypt_args[@]}" 3<<< "$ENCRYPTION_PASSWORD" 2>"$gpg_err_file"
     else
         # Default: symmetric
-        tar "${tar_fs_opts[@]}" --totals --sparse --exclude-caches-all "${tar_tag_opts[@]}" "${tar_ignore_opts[@]}" -l --acls --xattrs --xattrs-include='*' -I "${zstd_compress_cmd}" "${tar_checkpoint_opts[@]}" -cpf - "${TAR_EXCLUDE_OPTS[@]}" "${tar_staging_opts[@]}" -C "${SOURCE_DIR}" . 2>"$tar_fifo" \
+        tar "${tar_fs_opts[@]}" "${tar_index_opts[@]}" --totals --sparse --exclude-caches-all "${tar_tag_opts[@]}" "${tar_ignore_opts[@]}" -l --acls --xattrs --xattrs-include='*' -I "${zstd_compress_cmd}" "${tar_checkpoint_opts[@]}" -cpf - "${TAR_EXCLUDE_OPTS[@]}" "${tar_staging_opts[@]}" -C "${SOURCE_DIR}" . 2>"$tar_fifo" \
             | gpg --batch --yes --no-tty --pinentry-mode loopback --symmetric --cipher-algo AES256 \
                   -z 0 --s2k-mode 3 --s2k-count 65011712 --s2k-digest-algo SHA512 \
                   --passphrase-fd 3 -o "${FULL_ENCRYPTED_PATH}" 3<<< "$ENCRYPTION_PASSWORD" 2>"$gpg_err_file"
@@ -2787,6 +2822,25 @@ run_backup() {
             uncompressed_size_hr=$(numfmt --to=iec --suffix=B "${uncompressed_bytes}" 2>/dev/null || echo "${uncompressed_bytes}B")
         else
             uncompressed_bytes=0
+        fi
+    fi
+
+    # Generate companion file list index (.files.gz) from tar index output
+    local ENCRYPTED_FILES_INDEX_NAME="${ENCRYPTED_TARBALL_NAME}.files.gz"
+    local FULL_INDEX_PATH="${SCRATCH_DIR}/${ENCRYPTED_FILES_INDEX_NAME}"
+    CURRENT_FILE_INDEX_FILE=""
+    if [ "$GENERATE_FILE_INDEX" = true ] || [ "$GENERATE_FILE_INDEX" = "1" ]; then
+        if [ -s "$tar_index_raw" ]; then
+            echo "Compressing companion file list index..."
+            if gzip -9 -c "$tar_index_raw" > "$FULL_INDEX_PATH" 2>/dev/null; then
+                CURRENT_FILE_INDEX_FILE="$FULL_INDEX_PATH"
+                local index_bytes index_hr
+                index_bytes=$(stat -c %s "$FULL_INDEX_PATH" 2>/dev/null || echo 0)
+                index_hr=$(numfmt --to=iec --suffix=B "$index_bytes" 2>/dev/null || echo "${index_bytes}B")
+                log_message "Generated companion file index: ${ENCRYPTED_FILES_INDEX_NAME} (${index_hr})"
+            else
+                log_message "WARNING: Failed to compress companion file index with gzip."
+            fi
         fi
     fi
 
@@ -2835,8 +2889,9 @@ run_backup() {
         log_message "$ERROR_MSG: ${gpg_err_msg}"
         echo "$ERROR_MSG" >&2
         [ -n "$gpg_err_msg" ] && echo "$gpg_err_msg" >&2
-        rm -f "${FULL_ENCRYPTED_PATH}" # Clean up partial file
+        rm -f "${FULL_ENCRYPTED_PATH}" "${FULL_INDEX_PATH:-}" # Clean up partial file
         CURRENT_ENCRYPTED_ARCHIVE=""
+        CURRENT_FILE_INDEX_FILE=""
         SCRATCH_FILES_CREATED=0
         rmdir "${SCRATCH_DIR}" 2>/dev/null || true
         send_notification "critical" "Backup Failed" "Could not encrypt the local backup archive (GPG error ${gpg_exit_code})."
@@ -2861,8 +2916,9 @@ run_backup() {
                 echo "  ${_err}" >&2
             done
         fi
-        rm -f "${FULL_ENCRYPTED_PATH}" # Clean up partial file
+        rm -f "${FULL_ENCRYPTED_PATH}" "${FULL_INDEX_PATH:-}" # Clean up partial file
         CURRENT_ENCRYPTED_ARCHIVE=""
+        CURRENT_FILE_INDEX_FILE=""
         SCRATCH_FILES_CREATED=0
         rmdir "${SCRATCH_DIR}" 2>/dev/null || true
         send_notification "critical" "Backup Failed" "Could not create the local backup archive (tar exit code ${tar_exit_code})."
@@ -2886,8 +2942,9 @@ run_backup() {
                 echo "  ${_err}" >&2
             done
         fi
-        rm -f "${FULL_ENCRYPTED_PATH}"
+        rm -f "${FULL_ENCRYPTED_PATH}" "${FULL_INDEX_PATH:-}"
         CURRENT_ENCRYPTED_ARCHIVE=""
+        CURRENT_FILE_INDEX_FILE=""
         SCRATCH_FILES_CREATED=0
         rmdir "${SCRATCH_DIR}" 2>/dev/null || true
         send_notification "critical" "Backup Failed" "Archive creation pipeline failed."
@@ -3038,6 +3095,10 @@ run_backup() {
                     mv -f "${FULL_MANIFEST_PATH}" "${SOURCE_DIR}/${ENCRYPTED_MANIFEST_NAME}" 2>/dev/null || true
                     CURRENT_MANIFEST_FILE="${SOURCE_DIR}/${ENCRYPTED_MANIFEST_NAME}"
                 fi
+                if [ -f "${FULL_INDEX_PATH}" ]; then
+                    mv -f "${FULL_INDEX_PATH}" "${SOURCE_DIR}/${ENCRYPTED_FILES_INDEX_NAME}" 2>/dev/null || true
+                    CURRENT_FILE_INDEX_FILE="${SOURCE_DIR}/${ENCRYPTED_FILES_INDEX_NAME}"
+                fi
             else
                 local ERROR_MSG="Failed to upload archive. Local encrypted tarball preserved at: ${FULL_ENCRYPTED_PATH}"
                 PRESERVED_PATH="${FULL_ENCRYPTED_PATH}"
@@ -3077,6 +3138,12 @@ run_backup() {
             rclone copy --retries 3 --low-level-retries 5 --timeout 5m "${FULL_MANIFEST_PATH}" "${BACKUP_DIR}" >> "$rclone_log" 2>&1 || log_message "WARNING: Failed to upload backup manifest to cloud storage."
         fi
 
+        # Also upload the companion file list index to cloud
+        if [ -f "${FULL_INDEX_PATH}" ]; then
+            echo "Uploading file list index to ${BACKUP_DIR}..."
+            rclone copy --retries 3 --low-level-retries 5 --timeout 5m "${FULL_INDEX_PATH}" "${BACKUP_DIR}" >> "$rclone_log" 2>&1 || log_message "WARNING: Failed to upload file list index to cloud storage."
+        fi
+
         # Also mirror disaster recovery cheatsheet and standalone script to cloud if enabled
         if [ "$MIRROR_SCRIPT_TO_CLOUD" = true ] || [ "$MIRROR_SCRIPT_TO_CLOUD" = "1" ]; then
             mirror_script_and_cheatsheet_to_cloud "${BACKUP_DIR}" "${SCRATCH_DIR}" "$rclone_log"
@@ -3086,10 +3153,11 @@ run_backup() {
         echo "Upload completed successfully."
 
         # --- Step 5: Clean up local encrypted tarball and rotate ---
-        rm -f "${FULL_ENCRYPTED_PATH}" "${FULL_SHA256_PATH}" "${FULL_MANIFEST_PATH}"
+        rm -f "${FULL_ENCRYPTED_PATH}" "${FULL_SHA256_PATH}" "${FULL_MANIFEST_PATH}" "${FULL_INDEX_PATH}"
         CURRENT_ENCRYPTED_ARCHIVE=""
         CURRENT_SHA256_FILE=""
         CURRENT_MANIFEST_FILE=""
+        CURRENT_FILE_INDEX_FILE=""
         rmdir "${SCRATCH_DIR}" 2>/dev/null || true
         SCRATCH_FILES_CREATED=0
         run_rotation
@@ -3123,13 +3191,18 @@ run_backup() {
                     mv -f "${FULL_MANIFEST_PATH}" "${SOURCE_DIR}/${ENCRYPTED_MANIFEST_NAME}" 2>/dev/null || true
                     CURRENT_MANIFEST_FILE="${SOURCE_DIR}/${ENCRYPTED_MANIFEST_NAME}"
                 fi
+                if [ -f "${FULL_INDEX_PATH}" ]; then
+                    mv -f "${FULL_INDEX_PATH}" "${SOURCE_DIR}/${ENCRYPTED_FILES_INDEX_NAME}" 2>/dev/null || true
+                    CURRENT_FILE_INDEX_FILE="${SOURCE_DIR}/${ENCRYPTED_FILES_INDEX_NAME}"
+                fi
                 echo "Archive preserved at: ${PRESERVED_PATH}"
             fi
         else
-            rm -f "${FULL_ENCRYPTED_PATH}" "${FULL_SHA256_PATH}" "${FULL_MANIFEST_PATH}"
+            rm -f "${FULL_ENCRYPTED_PATH}" "${FULL_SHA256_PATH}" "${FULL_MANIFEST_PATH}" "${FULL_INDEX_PATH}"
             CURRENT_ENCRYPTED_ARCHIVE=""
             CURRENT_SHA256_FILE=""
             CURRENT_MANIFEST_FILE=""
+            CURRENT_FILE_INDEX_FILE=""
         fi
         rmdir "${SCRATCH_DIR}" 2>/dev/null || true
         SCRATCH_FILES_CREATED=0
@@ -6120,6 +6193,114 @@ list_archive_contents() {
         fi
     fi
 
+    # Check if a lightweight companion file list index exists (.files.gz)
+    local local_index_file=""
+    if [ -n "$direct_archive_file" ]; then
+        if [ -f "${direct_archive_file}.files.gz" ]; then
+            local_index_file="${direct_archive_file}.files.gz"
+        elif [[ "$direct_archive_file" == *.files.gz ]] && [ -f "$direct_archive_file" ]; then
+            local_index_file="$direct_archive_file"
+        fi
+    elif [ "$archive_source" = "local" ]; then
+        if [ -f "${local_backup_path}/${backup_choice}.files.gz" ]; then
+            local_index_file="${local_backup_path}/${backup_choice}.files.gz"
+        fi
+    fi
+
+    local cloud_index_available=false
+    if [ -z "$local_index_file" ] && [ "$archive_source" = "cloud" ]; then
+        if rclone lsf "${BACKUP_DIR}${backup_choice}.files.gz" &>/dev/null; then
+            cloud_index_available=true
+        fi
+    fi
+
+    if [ -n "$local_index_file" ] || [ "$cloud_index_available" = true ]; then
+        local pager_cmd=()
+        if [ "$use_pager" = true ]; then
+            if [ -n "${ARCHIVE_LIST_PAGER:-}" ]; then
+                read -r -a pager_cmd <<< "$ARCHIVE_LIST_PAGER"
+            elif [ -n "${PAGER:-}" ]; then
+                read -r -a pager_cmd <<< "$PAGER"
+            elif command -v less &>/dev/null; then
+                pager_cmd=(less -FRX)
+            elif command -v more &>/dev/null; then
+                pager_cmd=(more)
+            fi
+        fi
+        if [ ${#pager_cmd[@]} -eq 0 ] || ! command -v "${pager_cmd[0]}" &>/dev/null; then
+            pager_cmd=(cat)
+        fi
+
+        local grep_color="auto"
+        [ "$use_pager" = true ] && grep_color="always"
+
+        if [ -n "$local_index_file" ]; then
+            echo "Querying companion file index: $(basename "$local_index_file") (instant/zero decryption)..."
+        else
+            echo "Querying cloud companion file index: ${backup_choice}.files.gz (instant/zero decryption)..."
+        fi
+        echo "Listing contents of: ${backup_choice} (${archive_source})..."
+        [ -n "$pattern_filter" ] && echo "Filtering for pattern: '${pattern_filter}'"
+        echo "-------------------------------------------------------------------------------"
+
+        local index_query_failed=false
+        if [ -n "$local_index_file" ]; then
+            if [ "$long_format" = true ]; then
+                if [ -n "$pattern_filter" ]; then
+                    gzip -dc "$local_index_file" 2>/dev/null \
+                        | grep --color="$grep_color" -E -i "$pattern_filter" \
+                        | "${pager_cmd[@]}" || true
+                else
+                    gzip -dc "$local_index_file" 2>/dev/null \
+                        | "${pager_cmd[@]}" || true
+                fi
+            else
+                if [ -n "$pattern_filter" ]; then
+                    gzip -dc "$local_index_file" 2>/dev/null \
+                        | sed -E 's/^([^[:space:]]+[[:space:]]+){5}//' \
+                        | grep --color="$grep_color" -E -i "$pattern_filter" \
+                        | "${pager_cmd[@]}" || true
+                else
+                    gzip -dc "$local_index_file" 2>/dev/null \
+                        | sed -E 's/^([^[:space:]]+[[:space:]]+){5}//' \
+                        | "${pager_cmd[@]}" || true
+                fi
+            fi
+        else
+            if [ "$long_format" = true ]; then
+                if [ -n "$pattern_filter" ]; then
+                    rclone cat "${BACKUP_DIR}${backup_choice}.files.gz" 2>/dev/null \
+                        | gzip -dc 2>/dev/null \
+                        | grep --color="$grep_color" -E -i "$pattern_filter" \
+                        | "${pager_cmd[@]}" || index_query_failed=true
+                else
+                    rclone cat "${BACKUP_DIR}${backup_choice}.files.gz" 2>/dev/null \
+                        | gzip -dc 2>/dev/null \
+                        | "${pager_cmd[@]}" || index_query_failed=true
+                fi
+            else
+                if [ -n "$pattern_filter" ]; then
+                    rclone cat "${BACKUP_DIR}${backup_choice}.files.gz" 2>/dev/null \
+                        | gzip -dc 2>/dev/null \
+                        | sed -E 's/^([^[:space:]]+[[:space:]]+){5}//' \
+                        | grep --color="$grep_color" -E -i "$pattern_filter" \
+                        | "${pager_cmd[@]}" || index_query_failed=true
+                else
+                    rclone cat "${BACKUP_DIR}${backup_choice}.files.gz" 2>/dev/null \
+                        | gzip -dc 2>/dev/null \
+                        | sed -E 's/^([^[:space:]]+[[:space:]]+){5}//' \
+                        | "${pager_cmd[@]}" || index_query_failed=true
+                fi
+            fi
+        fi
+
+        if [ "$index_query_failed" = false ]; then
+            echo "-------------------------------------------------------------------------------"
+            return 0
+        fi
+        echo "WARNING: Failed to read companion file index; falling back to full archive stream..."
+    fi
+
     # Detect encryption type of target archive
     local archive_enc_type="symmetric"
     if [ -n "$direct_archive_file" ]; then
@@ -6284,6 +6465,226 @@ list_archive_contents() {
         echo "ERROR: Cloud streaming error (exit code ${rclone_exit_code}): ${rclone_err_msg}" >&2
         return 1
     fi
+
+    return 0
+}
+
+#---
+#   FUNCTION:  find_file()
+#  DESCRIPTION:  Searches for files matching a pattern across all available backup
+#                archives using their lightweight companion file list indices (.files.gz).
+#                Usage: find-file <pattern> [--source <auto|local|cloud|all>] [--long|-l] [--limit <N>]
+#---
+find_file() {
+    local search_pattern=""
+    local source_filter="auto"
+    local long_format=false
+    local match_limit=0
+    local use_pager=false
+    if [ -t 1 ] && [ "${TERM:-dumb}" != "dumb" ] && [ -n "${ARCHIVE_LIST_PAGER:-}" ]; then
+        use_pager=true
+    fi
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --source|-s)
+                if [ -n "${2:-}" ]; then
+                    source_filter="$2"
+                    shift 2
+                else
+                    shift
+                fi
+                ;;
+            --long|-l|-v|--verbose)
+                long_format=true
+                shift
+                ;;
+            --limit|-n)
+                if [[ "${2:-}" =~ ^[0-9]+$ ]]; then
+                    match_limit="$2"
+                    shift 2
+                else
+                    shift
+                fi
+                ;;
+            --no-pager)
+                use_pager=false
+                shift
+                ;;
+            --pager)
+                use_pager=true
+                shift
+                ;;
+            help|-h|--help)
+                echo "Usage: $0 find-file <pattern> [options]"
+                echo
+                echo "Searches for files matching a pattern across all backup archives"
+                echo "instantly using their lightweight companion file list indices (.files.gz)."
+                echo
+                echo "Options:"
+                echo "  <pattern>                         Text, filename, or regex pattern to search"
+                echo "  --source, -s <auto|local|cloud|all> Target archive locations (default: auto)"
+                echo "  --long, -l, -v                    Show detailed permissions, owner, size, and date"
+                echo "  --limit, -n <count>               Limit matching lines displayed per archive (0: unlimited)"
+                echo "  --no-pager                        Disable terminal pager"
+                echo "  --pager                           Force terminal pager"
+                return 0
+                ;;
+            *)
+                if [ -z "$search_pattern" ]; then
+                    search_pattern="$1"
+                else
+                    search_pattern="${search_pattern} $1"
+                fi
+                shift
+                ;;
+        esac
+    done
+
+    if [ -z "$search_pattern" ]; then
+        if [ -t 0 ]; then
+            echo
+            read -r -p "Enter filename or regex pattern to search for: " search_pattern
+        fi
+        if [ -z "$search_pattern" ]; then
+            echo "ERROR: Search pattern is required. Run '$0 find-file --help' for usage." >&2
+            return 1
+        fi
+    fi
+
+    local local_backup_path
+    local_backup_path=$(get_local_backup_path 2>/dev/null || echo "")
+
+    # Collect indices to query: map of archive_name -> "source_type|index_path_or_identifier"
+    local -A archive_indices=()
+    local -a archive_order=()
+
+    # 1. Local drive backups
+    if [[ "$source_filter" =~ ^(auto|local|all)$ ]] && [ -n "$local_backup_path" ] && [ -d "$local_backup_path" ]; then
+        local local_idx_files=()
+        mapfile -t local_idx_files < <(find "${local_backup_path}" -maxdepth 1 -type f -name "${TARBALL_BASENAME}_*.files.gz" 2>/dev/null | sort -r)
+        for idx_file in "${local_idx_files[@]}"; do
+            [ -z "$idx_file" ] && continue
+            local arc_name
+            arc_name=$(basename "$idx_file" .files.gz)
+            if [ -z "${archive_indices[$arc_name]+x}" ]; then
+                archive_indices["$arc_name"]="local|${idx_file}"
+                archive_order+=("$arc_name")
+            fi
+        done
+    fi
+
+    # 2. Preserved archives in SOURCE_DIR
+    if [[ "$source_filter" =~ ^(auto|local|all)$ ]]; then
+        local pres_idx_files=()
+        mapfile -t pres_idx_files < <(find "${SOURCE_DIR}" -maxdepth 1 -type f -name "${TARBALL_BASENAME}_*.files.gz" 2>/dev/null | sort -r)
+        for idx_file in "${pres_idx_files[@]}"; do
+            [ -z "$idx_file" ] && continue
+            local arc_name
+            arc_name=$(basename "$idx_file" .files.gz)
+            if [ -z "${archive_indices[$arc_name]+x}" ]; then
+                archive_indices["$arc_name"]="preserved|${idx_file}"
+                archive_order+=("$arc_name")
+            fi
+        done
+    fi
+
+    # 3. Cloud backups
+    if [[ "$source_filter" =~ ^(auto|cloud|all)$ ]]; then
+        if [ "$source_filter" != "auto" ] || [ ${#archive_order[@]} -eq 0 ]; then
+            echo "Querying cloud file indices (${BACKUP_DIR})..." >&2
+            local cloud_indices=()
+            mapfile -t cloud_indices < <(rclone lsf --fast-list "${BACKUP_DIR}" 2>/dev/null | grep -E "${TARBALL_BASENAME}_.*\.files\.gz$" | sort -r)
+            for c_idx in "${cloud_indices[@]}"; do
+                [ -z "$c_idx" ] && continue
+                local arc_name="${c_idx%.files.gz}"
+                if [ -z "${archive_indices[$arc_name]+x}" ]; then
+                    archive_indices["$arc_name"]="cloud|${c_idx}"
+                    archive_order+=("$arc_name")
+                fi
+            done
+        fi
+    fi
+
+    if [ ${#archive_order[@]} -eq 0 ]; then
+        echo "No backup companion file indices (.files.gz) found." >&2
+        echo "Note: Companion file indices are automatically generated during backup creation." >&2
+        echo "      To list files in older archives, use: $0 list-files [archive]" >&2
+        return 1
+    fi
+
+    local pager_cmd=()
+    if [ "$use_pager" = true ]; then
+        if [ -n "${ARCHIVE_LIST_PAGER:-}" ]; then
+            read -r -a pager_cmd <<< "$ARCHIVE_LIST_PAGER"
+        elif [ -n "${PAGER:-}" ]; then
+            read -r -a pager_cmd <<< "$PAGER"
+        elif command -v less &>/dev/null; then
+            pager_cmd=(less -FRX)
+        elif command -v more &>/dev/null; then
+            pager_cmd=(more)
+        fi
+    fi
+    if [ ${#pager_cmd[@]} -eq 0 ] || ! command -v "${pager_cmd[0]}" &>/dev/null; then
+        pager_cmd=(cat)
+    fi
+
+    local grep_color="auto"
+    [ "$use_pager" = true ] && grep_color="always"
+
+    echo "Searching for '${search_pattern}' across ${#archive_order[@]} backup index(es)..."
+    echo "==============================================================================="
+
+    (
+        local total_archives_matched=0
+        local total_files_matched=0
+
+        for arc_name in "${archive_order[@]}"; do
+            local meta="${archive_indices[$arc_name]}"
+            local src_type="${meta%%|*}"
+            local src_target="${meta#*|}"
+
+            local matches=""
+            if [ "$src_type" = "cloud" ]; then
+                if [ "$long_format" = true ]; then
+                    matches=$(rclone cat "${BACKUP_DIR}${src_target}" 2>/dev/null | gzip -dc 2>/dev/null | grep -E -i "$search_pattern" || true)
+                else
+                    matches=$(rclone cat "${BACKUP_DIR}${src_target}" 2>/dev/null | gzip -dc 2>/dev/null | sed -E 's/^([^[:space:]]+[[:space:]]+){5}//' | grep -E -i "$search_pattern" || true)
+                fi
+            else
+                if [ "$long_format" = true ]; then
+                    matches=$(gzip -dc "$src_target" 2>/dev/null | grep -E -i "$search_pattern" || true)
+                else
+                    matches=$(gzip -dc "$src_target" 2>/dev/null | sed -E 's/^([^[:space:]]+[[:space:]]+){5}//' | grep -E -i "$search_pattern" || true)
+                fi
+            fi
+
+            if [ -n "$matches" ]; then
+                ((total_archives_matched++))
+                local match_count
+                match_count=$(wc -l <<< "$matches")
+                total_files_matched=$(( total_files_matched + match_count ))
+
+                echo
+                echo "-------------------------------------------------------------------------------"
+                echo " Archive : ${arc_name}"
+                echo " Source  : ${src_type} ($(basename "$src_target"))"
+                echo " Matches : ${match_count} file(s)"
+                echo "-------------------------------------------------------------------------------"
+                if [ "$match_limit" -gt 0 ] && [ "$match_count" -gt "$match_limit" ]; then
+                    head -n "$match_limit" <<< "$matches" | grep --color="$grep_color" -E -i "$search_pattern" || true
+                    echo "  ... [showing first ${match_limit} of ${match_count} matches]"
+                else
+                    grep --color="$grep_color" -E -i "$search_pattern" <<< "$matches" || true
+                fi
+            fi
+        done
+
+        echo
+        echo "==============================================================================="
+        echo "Search complete: ${total_files_matched} matching file(s) across ${total_archives_matched} archive(s) (scanned ${#archive_order[@]} index(es))."
+        echo "==============================================================================="
+    ) | "${pager_cmd[@]}"
 
     return 0
 }
@@ -6919,6 +7320,10 @@ cleanup() {
             rm -f "$CURRENT_LOCAL_TEMP_MANIFEST" 2>/dev/null
             CURRENT_LOCAL_TEMP_MANIFEST=""
         fi
+        if [ -n "$CURRENT_LOCAL_TEMP_INDEX" ]; then
+            rm -f "$CURRENT_LOCAL_TEMP_INDEX" 2>/dev/null
+            CURRENT_LOCAL_TEMP_INDEX=""
+        fi
 
         # Clean up any temporary verification, backup, or restore directory
         if [ -n "$CURRENT_VERIFY_TMP_DIR" ]; then
@@ -6948,12 +7353,13 @@ cleanup() {
             # Clean up partial backup/restore archives in SCRATCH_DIR
             if [ -d "${SCRATCH_DIR}" ]; then
                 if [ "$PRESERVE_ARCHIVE" = true ]; then
-                    local keep_name="" keep_sha="" keep_manifest=""
+                    local keep_name="" keep_sha="" keep_manifest="" keep_index=""
                     [ -n "$CURRENT_ENCRYPTED_ARCHIVE" ] && keep_name=$(basename "$CURRENT_ENCRYPTED_ARCHIVE")
                     [ -n "$CURRENT_SHA256_FILE" ] && keep_sha=$(basename "$CURRENT_SHA256_FILE")
                     [ -n "$CURRENT_MANIFEST_FILE" ] && keep_manifest=$(basename "$CURRENT_MANIFEST_FILE")
+                    [ -n "$CURRENT_FILE_INDEX_FILE" ] && keep_index=$(basename "$CURRENT_FILE_INDEX_FILE")
                     if [ -n "$keep_name" ]; then
-                        find "${SCRATCH_DIR}" -maxdepth 1 \( -name "${TARBALL_BASENAME}_*" ! -name "$keep_name" ${keep_sha:+! -name "$keep_sha"} ${keep_manifest:+! -name "$keep_manifest"} \) -delete 2>/dev/null
+                        find "${SCRATCH_DIR}" -maxdepth 1 \( -name "${TARBALL_BASENAME}_*" ! -name "$keep_name" ${keep_sha:+! -name "$keep_sha"} ${keep_manifest:+! -name "$keep_manifest"} ${keep_index:+! -name "$keep_index"} \) -delete 2>/dev/null
                     fi
                     rmdir "${SCRATCH_DIR}" 2>/dev/null || true
                 else
@@ -6961,6 +7367,7 @@ cleanup() {
                     [ -n "$CURRENT_ENCRYPTED_ARCHIVE" ] && rm -f "$CURRENT_ENCRYPTED_ARCHIVE" 2>/dev/null
                     [ -n "$CURRENT_SHA256_FILE" ] && rm -f "$CURRENT_SHA256_FILE" 2>/dev/null
                     [ -n "$CURRENT_MANIFEST_FILE" ] && rm -f "$CURRENT_MANIFEST_FILE" 2>/dev/null
+                    [ -n "$CURRENT_FILE_INDEX_FILE" ] && rm -f "$CURRENT_FILE_INDEX_FILE" 2>/dev/null
                     # Fallback in case archive tracking was unset
                     if [ -z "$CURRENT_TEMP_ARCHIVE" ] && [ -z "$CURRENT_ENCRYPTED_ARCHIVE" ]; then
                         rm -f "${SCRATCH_DIR}/${TARBALL_BASENAME}_"* 2>/dev/null
@@ -6998,6 +7405,7 @@ execute_with_inhibit() {
         restore) why_msg="Restoring home directory" ;;
         verify)  why_msg="Verifying backup archive integrity" ;;
         list-files|view-archive|list-contents) why_msg="Listing backup archive contents" ;;
+        find-file|find_file|search-file|search_file) why_msg="Searching files across backup archives" ;;
         manage-preserved|clean-preserved) why_msg="Managing preserved backup archives" ;;
     esac
 
@@ -7057,6 +7465,7 @@ execute_with_inhibit() {
             restore) run_restore "$@" || ret=$? ;;
             verify)  run_verify "$@" || ret=$? ;;
             list-files|view-archive|list-contents) list_archive_contents "$@" || ret=$? ;;
+            find-file|find_file|search-file|search_file) find_file "$@" || ret=$? ;;
             manage-preserved|clean-preserved) manage_preserved_archives "$@" || ret=$? ;;
             *)       echo "Unknown action: $action" >&2; ret=1 ;;
         esac
@@ -7650,6 +8059,12 @@ init_config() {
 # without downloading or decrypting multi-gigabyte archives.
 # Default: true
 #GENERATE_MANIFEST="true"
+
+# Generate lightweight companion file list index (.files.gz) alongside archive and checksum.
+# Enables instant, zero-bandwidth file search (find-file) and archive listing (list-files)
+# without downloading or decrypting multi-gigabyte encrypted payloads.
+# Default: true
+#GENERATE_FILE_INDEX="true"
 
 #------------------------------------------------------------------------------
 # 9. Compression
@@ -8487,6 +8902,18 @@ check_config() {
         fi
     fi
 
+    if [ "$GENERATE_MANIFEST" = true ] || [ "$GENERATE_MANIFEST" = "1" ]; then
+        report_ok "Manifest Generation" "Enabled (.manifest.json companion metadata)"
+    else
+        report_info "Manifest Generation" "Disabled (GENERATE_MANIFEST=${GENERATE_MANIFEST})"
+    fi
+
+    if [ "$GENERATE_FILE_INDEX" = true ] || [ "$GENERATE_FILE_INDEX" = "1" ]; then
+        report_ok "File List Indexing" "Enabled (.files.gz sidecars for fast find-file/list-files)"
+    else
+        report_info "File List Indexing" "Disabled (GENERATE_FILE_INDEX=${GENERATE_FILE_INDEX})"
+    fi
+
     # Post-Backup Auto-Verification Mode
     case "$AUTO_VERIFY_BACKUP" in
         checksum|quick)
@@ -8758,7 +9185,7 @@ show_main_menu() {
         local preserved_count
         preserved_count=$(get_preserved_archives | wc -l)
         if [ "$preserved_count" -gt 0 ]; then
-            echo "* NOTICE: ${preserved_count} preserved archive(s) from failed upload(s) in ~ (Select 8 to manage)"
+            echo "* NOTICE: ${preserved_count} preserved archive(s) from failed upload(s) in ~ (Select 9 to manage)"
         fi
         echo "1. Backup Home Directory"
         echo "2. Restore Home Directory"
@@ -8766,17 +9193,18 @@ show_main_menu() {
         echo "4. List Available Backups"
         echo "5. View Backup Manifest / Summary"
         echo "6. Backup Trends & Storage Analytics"
-        echo "7. View / Search Files Inside Archive"
+        echo "7. View Files Inside Archive (list-files)"
+        echo "8. Search Across All Backups (find-file)"
         if [ "$preserved_count" -gt 0 ]; then
-            echo "8. Manage Preserved Archives (* ${preserved_count} pending *)"
+            echo "9. Manage Preserved Archives (* ${preserved_count} pending *)"
         else
-            echo "8. Manage Preserved Archives"
+            echo "9. Manage Preserved Archives"
         fi
-        echo "9. Systemd Backup Timer (Schedule/Status)"
-        echo "10. Check Configuration & Environment"
-        echo "11. Initialize Configuration File"
-        echo "12. Exit"
-        if ! read -r -p "Please enter your choice [1-12]: " choice; then
+        echo "10. Systemd Backup Timer (Schedule/Status)"
+        echo "11. Check Configuration & Environment"
+        echo "12. Initialize Configuration File"
+        echo "13. Exit"
+        if ! read -r -p "Please enter your choice [1-13]: " choice; then
             echo -e "\nExiting."
             break
         fi
@@ -8789,11 +9217,12 @@ show_main_menu() {
             5) display_manifest ;;
             6) show_backup_stats ;;
             7) execute_with_inhibit list-files ;;
-            8) execute_with_inhibit manage-preserved ;;
-            9) manage_systemd_timer ;;
-            10) check_config ;;
-            11) init_config ;;
-            12) echo "Exiting."; break ;;
+            8) execute_with_inhibit find-file ;;
+            9) execute_with_inhibit manage-preserved ;;
+            10) manage_systemd_timer ;;
+            11) check_config ;;
+            12) init_config ;;
+            13) echo "Exiting."; break ;;
             *) echo "Invalid option." ;;
         esac
     done
@@ -8869,6 +9298,12 @@ case "${1:-}" in
         echo "                                [pat] is an optional pattern to filter files (e.g. '.bashrc', '*.pdf')."
         echo "                                Options: --long, -l (detailed listing with permissions, owner, size)"
         echo "                                         --no-pager (disable pager)"
+        echo "  find-file <pat> [opts]        Search for files across ALL backup archives using fast companion indexes"
+        echo "                                [pat] is the pattern or regex to search (e.g. 'resume.docx', '*.kdbx')."
+        echo "                                Options: --source, -s <auto|local|cloud|all>"
+        echo "                                         --long, -l (detailed listing with permissions, owner, size)"
+        echo "                                         --limit, -n <count> (limit matches per archive)"
+        echo "                                         --no-pager (disable pager)"
         echo "  manage-preserved [opt]        Manage, retry upload, or delete preserved failed-upload archives"
         echo "                                [opt] can be: '--retry' (or -r), '--delete' (or -d), or '--list' (or -l)."
         echo "                                Runs interactively if no option is specified."
@@ -8919,6 +9354,10 @@ if [ -n "$1" ]; then
             ;;
         list-files|list_files|view-archive|view_archive|list-contents|list_contents)
             execute_with_inhibit list-files "${@:2}"
+            exit $?
+            ;;
+        find-file|find_file|search-file|search_file)
+            execute_with_inhibit find-file "${@:2}"
             exit $?
             ;;
         install-timer|install_timer)
