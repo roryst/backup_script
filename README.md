@@ -66,7 +66,7 @@ A robust, enterprise-grade Bash backup, verification, and disaster-recovery solu
 - **Application Consistency Guard**: Detects running database-heavy applications (Vivaldi, Chrome, Firefox, Thunderbird) and gracefully terminates them with `SIGTERM` and filesystem `sync` before archiving.
 - **Concurrency Locking**: Uses kernel `flock` to prevent overlapping runs.
 - **Graceful Cleanup**: Traps `SIGINT`, `SIGTERM`, and script exit to clean up scratch paths and named pipes safely.
-- **Failure Alerts**: Dispatches email alerts on backup failure using local MTAs (`msmtp`, `sendmail`, `mailx`).
+- **Failure Alerts**: Dispatches email alerts on backup failure using local MTAs (`msmtp`, `mailx`).
 
 ---
 
@@ -94,7 +94,7 @@ Ensure the following tools are installed on your Linux system:
 | :--- | :--- |
 | `apt-mark` | Capturing manually installed APT packages on Debian/Ubuntu/Mint |
 | `dnf` | Capturing user-installed RPM packages on Fedora/RHEL/CentOS/Rocky/Alma |
-| `msmtp` / `sendmail` / `mailx` | Email notification alerts on backup failure |
+| `msmtp` / `mailx` | Email notification alerts on backup failure |
 | `flatpak` | Capturing installed Flatpak apps and remotes |
 | `pipx` | Capturing installed standalone Python CLI tools |
 | `dconf` | Exporting GNOME/desktop settings snapshot |
