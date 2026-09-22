@@ -18,6 +18,8 @@ A robust, enterprise-grade Bash backup, verification, and disaster-recovery solu
   - [Environment & Health Check (`check-config`)](#environment--health-check-check-config)
   - [Creating Backups (`backup`)](#creating-backups-backup)
   - [Listing Available Backups (`list`)](#listing-available-backups-list)
+  - [Viewing Archive Files (`list-files`)](#viewing-archive-files-list-files)
+  - [Searching Files Across Backups (`find-file`)](#searching-files-across-backups-find-file)
   - [Inspecting Backup Manifests (`manifest`)](#inspecting-backup-manifests-manifest)
   - [Historical Trends & Analytics (`stats`)](#historical-trends--analytics-stats)
   - [Integrity Verification (`verify`)](#integrity-verification-verify)
@@ -55,9 +57,10 @@ A robust, enterprise-grade Bash backup, verification, and disaster-recovery solu
 - **Inline Single-Pass Verification**: Verifies checksums on-the-fly during cloud streaming via named pipes and `tee`.
 - **Full Tar Stream Validation**: Thoroughly validates encryption integrity and tar archive block structure without writing files to disk.
 
-### 📦 System State Snapshots & Lightweight Manifests
+### 📦 System State Snapshots, Manifests & File Indexing
 - **OS Environment Capture**: Exports lists of installed system packages (APT or DNF), Flatpaks, Pipx packages, enabled systemd user units, desktop `dconf` configurations, crontabs, and repository/GPG keyrings into the backup.
 - **Companion JSON Manifests (`.manifest.json`)**: Instantly inspect archive metadata, compression ratios, package counts, and checksums without downloading or decrypting the archive.
+- **Zero-Bandwidth Companion File Indexes (`.files.gz`)**: Captures full file tables during archive creation (`tar -vv --index-file`) with zero extra disk passes, enabling instant file search (`find-file`) and zero-download archive exploration (`list-files`) across all local and remote snapshots.
 
 ### ⚙️ Reliability & Safety
 - **Application Consistency Guard**: Detects running database-heavy applications (Vivaldi, Chrome, Firefox, Thunderbird) and gracefully terminates them with `SIGTERM` and filesystem `sync` before archiving.
@@ -81,6 +84,7 @@ Ensure the following tools are installed on your Linux system:
 | `gpg` | Asymmetric & symmetric AES-256 encryption | GnuPG 2.x |
 | `rclone` | Cloud storage transfer & streaming | Recent stable release |
 | `sha256sum` | Cryptographic checksum generation & validation | GNU coreutils |
+| `gzip` | Fast compression for companion `.files.gz` index sidecars | Any modern version |
 | `flock` | Script execution locking | `util-linux` |
 | `lsblk` / `blkid` | Local external drive UUID discovery | `util-linux` |
 
@@ -100,12 +104,12 @@ Ensure the following tools are installed on your Linux system:
 To install common dependencies on Debian/Ubuntu/Mint:
 ```bash
 sudo apt update
-sudo apt install -y bash tar zstd gnupg rclone coreutils util-linux msmtp
+sudo apt install -y bash tar zstd gnupg rclone coreutils util-linux gzip msmtp
 ```
 
 To install common dependencies on Fedora/RHEL/CentOS Stream/Rocky/AlmaLinux:
 ```bash
-sudo dnf install -y bash tar zstd gnupg2 rclone coreutils util-linux msmtp
+sudo dnf install -y bash tar zstd gnupg2 rclone coreutils util-linux gzip msmtp
 ```
 
 ---
@@ -266,6 +270,79 @@ Available cloud backups for this host (hp) on googledrive:backup/:
   7.6GB     2026-09-20 01:01:36  rory_home_backup_hp_2026-09-20_005952.tar.zst.gpg
   7.6GB     2026-09-19 00:49:26  rory_home_backup_hp_2026-09-19_004752.tar.zst.gpg
   7.8GB     2026-09-18 01:00:21  rory_home_backup_hp_2026-09-18_005852.tar.zst.gpg
+```
+
+---
+
+### Viewing Archive Files (`list-files`)
+
+Explore file listings inside any local, cloud, or explicit archive snapshot without downloading the full archive payload or running decryption:
+
+```bash
+# View files in the latest backup
+$ ./backup_script.sh list-files latest
+
+# Filter files within a specific backup by pattern or path
+$ ./backup_script.sh list-files latest "\.ssh/"
+
+# Show full permissions, owner, file size, and timestamps
+$ ./backup_script.sh list-files latest "Documents/" --long
+```
+
+```text
+Querying companion file index: rory_home_backup_hp_2026-09-21_005151.tar.zst.gpg.files.gz (instant/zero decryption)...
+Listing contents of: rory_home_backup_hp_2026-09-21_005151.tar.zst.gpg (local)...
+Filtering for pattern: 'Documents/'
+-------------------------------------------------------------------------------
+home/rory/Documents/
+home/rory/Documents/Projects/
+home/rory/Documents/Projects/important_notes.txt
+home/rory/Documents/taxes_2025.pdf
+-------------------------------------------------------------------------------
+```
+
+---
+
+### Searching Files Across Backups (`find-file`)
+
+Instantly locate any file across **all** historical backup archives (local external drive, cloud storage, or both) using lightweight `.files.gz` companion indexes—without downloading multi-gigabyte payloads or decrypting archives:
+
+```bash
+# Search across all backups (auto-discovers local and cloud snapshots)
+$ ./backup_script.sh find-file "important_notes.txt"
+
+# Search with regular expressions across both local and cloud
+$ ./backup_script.sh find-file ".*\.kdbx" --source all
+
+# Display detailed metadata (permissions, owner, size, timestamps)
+$ ./backup_script.sh find-file "wireguard\.conf" --long
+
+# Limit output to 5 matches per archive
+$ ./backup_script.sh find-file "id_ed25519" --limit 5
+```
+
+```text
+Searching for 'important_notes.txt' across 4 backup index(es)...
+===============================================================================
+
+-------------------------------------------------------------------------------
+ Archive : rory_home_backup_hp_2026-09-21_005151.tar.zst.gpg
+ Source  : local (rory_home_backup_hp_2026-09-21_005151.tar.zst.gpg.files.gz)
+ Matches : 2 file(s)
+-------------------------------------------------------------------------------
+home/rory/Documents/Projects/important_notes.txt
+home/rory/Work/Archive/important_notes.txt
+
+-------------------------------------------------------------------------------
+ Archive : rory_home_backup_hp_2026-09-20_005952.tar.zst.gpg
+ Source  : local (rory_home_backup_hp_2026-09-20_005952.tar.zst.gpg.files.gz)
+ Matches : 1 file(s)
+-------------------------------------------------------------------------------
+home/rory/Documents/Projects/important_notes.txt
+
+===============================================================================
+Search complete: 3 matching file(s) across 2 archive(s) (scanned 4 index(es)).
+===============================================================================
 ```
 
 ---
@@ -581,6 +658,8 @@ Key variables configurable in `~/.config/backup_script/config`:
 | `RUNNING_APPS_ACTION` | `close` | Policy for running apps (`close`, `prompt`, `sync`, `ignore`) |
 | `STREAM_CLOUD_RESTORE`| `auto` | Cloud restore streaming policy (`auto`, `true`, `false`) |
 | `RESTORE_VERIFY_CHECKSUM`| `true` | Verify SHA-256 sidecar checksum before restoring |
+| `GENERATE_MANIFEST` | `true` | Generate companion JSON manifest (`.manifest.json`) with metadata and inventory |
+| `GENERATE_FILE_INDEX` | `true` | Generate companion file index (`.files.gz`) for fast zero-download search & listing |
 | `ALERT_EMAIL` | `""` | Destination email address for failure alerts |
 | `APT_PACKAGES_FILE` | `apt_packages_manual.txt` | Filename for exported manual APT packages |
 | `APT_REPOS_FILE` | `apt_repos_keys.tar.gz` | Archive for APT repository sources and keyrings |
