@@ -23,6 +23,7 @@ A robust, enterprise-grade Bash backup, verification, and disaster-recovery solu
   - [Integrity Verification (`verify`)](#integrity-verification-verify)
   - [Restoring Data (`restore`)](#restoring-data-restore)
   - [Automated Scheduling (`systemd` Timer)](#automated-scheduling-systemd-timer)
+- [Retention Policies & GFS Pruning](#retention-policies--gfs-pruning)
 - [Exclusion Rules](#exclusion-rules)
 - [Disaster Recovery Bootstrapping](#disaster-recovery-bootstrapping)
 - [Configuration Reference](#configuration-reference)
@@ -44,7 +45,9 @@ A robust, enterprise-grade Bash backup, verification, and disaster-recovery solu
 
 ### 🔄 Dual-Destination Synchronization & Retention
 - **Hybrid Storage**: Concurrently synchronizes to local external partitions (auto-discovered via filesystem UUID) and cloud remotes via `rclone` (Google Drive, Backblaze B2, AWS S3, etc.).
-- **Independent Retention Policies**: Automatically prunes older backups according to configurable keep counts (default: retain 10 newest archives on both local drive and cloud).
+- **Flexible Retention (Count-Based or GFS Tiered)**:
+  - **Count-based** (default): Retains the `N` newest archives on local drive and cloud remote (default: 10).
+  - **Grandfather-Father-Son (GFS) Tiered Retention**: Automatically maintains a timeline of daily, weekly, monthly, and yearly archives (default: 7 daily, 4 weekly, 6 monthly, 1 yearly) for months or years of recovery coverage without extra storage bloat.
 - **Preserved Archive Management**: If network or remote connectivity fails, encrypted archives can be preserved locally to avoid data loss and re-uploaded later using `manage-preserved`.
 
 ### 🔍 Verification & Integrity
@@ -444,6 +447,44 @@ Service Status (Last Run):
 
 ---
 
+## Retention Policies & GFS Pruning
+
+The backup suite supports two distinct pruning strategies for local external drives and cloud storage:
+
+### 1. Count-Based Retention (Default)
+Retains the most recent `N` backup archives on each destination and deletes older ones:
+```bash
+# In ~/.config/backup_script/config:
+RETENTION_MODE="count"
+CLOUD_KEEP_COUNT=10
+LOCAL_KEEP_COUNT=10
+```
+
+### 2. Grandfather-Father-Son (GFS) Tiered Retention
+Provides structured historical protection across days, weeks, months, and years without consuming massive storage:
+- **Daily**: Retains the newest backup for each of the last `N` days (default: 7).
+- **Weekly**: Retains the newest backup for each of the last `N` calendar weeks (default: 4).
+- **Monthly**: Retains the newest backup for each of the last `N` months (default: 6).
+- **Yearly**: Retains the newest backup for each of the last `N` years (default: 1).
+- **Minimum Keep Floor (`RETENTION_MIN_KEEP`)**: Ensures the `N` most recent backups are never pruned, even if multiple backups were taken on the same day.
+
+To activate GFS Tiered Retention, configure in `~/.config/backup_script/config`:
+```bash
+# Enable GFS tiered retention
+RETENTION_MODE="tiered"       # or "gfs"
+
+# Number of historical buckets to preserve
+RETENTION_DAILY=7             # Last 7 days
+RETENTION_WEEKLY=4            # Last 4 weeks
+RETENTION_MONTHLY=6           # Last 6 months
+RETENTION_YEARLY=1            # Last 1 year
+
+# Optional safety floor (default: 0)
+RETENTION_MIN_KEEP=0
+```
+
+---
+
 ## Exclusion Rules
 
 To ensure compact archives and avoid backing up transient caches, sockets, and virtual disks, the suite employs three layers of exclusions:
@@ -527,8 +568,14 @@ Key variables configurable in `~/.config/backup_script/config`:
 | `ENCRYPTION_MODE` | `symmetric` | Encryption method: `symmetric`, `asymmetric`, or `hybrid` |
 | `PASSWORD_FILE` | `~/.config/backup_script/passphrase` | Path to symmetric encryption passphrase file |
 | `GPG_RECIPIENT` | `""` | Recipient email or fingerprint for asymmetric GPG |
-| `CLOUD_KEEP_COUNT` | `10` | Number of recent archives to keep on cloud remote |
-| `LOCAL_KEEP_COUNT` | `10` | Number of recent archives to keep on local drive |
+| `CLOUD_KEEP_COUNT` | `10` | Number of recent archives to keep on cloud remote (in `count` mode) |
+| `LOCAL_KEEP_COUNT` | `10` | Number of recent archives to keep on local drive (in `count` mode) |
+| `RETENTION_MODE` | `count` | Retention mode: `count` (fixed count) or `tiered` / `gfs` (Grandfather-Father-Son) |
+| `RETENTION_DAILY` | `7` | Number of daily archives to retain in `tiered` mode |
+| `RETENTION_WEEKLY` | `4` | Number of weekly archives to retain in `tiered` mode |
+| `RETENTION_MONTHLY` | `6` | Number of monthly archives to retain in `tiered` mode |
+| `RETENTION_YEARLY` | `1` | Number of yearly archives to retain in `tiered` mode |
+| `RETENTION_MIN_KEEP` | `0` | Minimum newest archives to always preserve regardless of buckets |
 | `ZSTD_LEVEL` | `6` | Zstd compression level (1-19, or up to 22 with ultra) |
 | `ZSTD_LONG` | `27` | Long-distance matching window log (128MB window) |
 | `RUNNING_APPS_ACTION` | `close` | Policy for running apps (`close`, `prompt`, `sync`, `ignore`) |
