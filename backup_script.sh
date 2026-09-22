@@ -1969,6 +1969,49 @@ manage_preserved_archives() {
 }
 
 #---
+#   FUNCTION:  get_active_app_pids()
+#  DESCRIPTION:  Returns active (non-zombie, non-defunct) PIDs matching a process
+#                name for the current user. Lingering zombie processes (state Z) left
+#                by desktop environments (e.g. Cinnamon, GNOME) are filtered out so
+#                they do not trigger false-positive running detections or shutdown timeouts.
+#---
+get_active_app_pids() {
+    local app="$1"
+    [ -z "$app" ] && return 1
+
+    local pids=()
+    local rc=0
+
+    # Try pgrep filtering out zombie state (matching active states D, R, S, I, T, t)
+    mapfile -t pids < <(pgrep -u "$CURRENT_USER" -r D,R,S,I,T,t -x "$app" 2>/dev/null)
+    rc=$?
+
+    # If pgrep exited with code >1 (e.g. older procps lacking -r support), inspect /proc status
+    if [ "$rc" -gt 1 ]; then
+        pids=()
+        local raw_pids=()
+        mapfile -t raw_pids < <(pgrep -u "$CURRENT_USER" -x "$app" 2>/dev/null)
+        for pid in "${raw_pids[@]}"; do
+            [ -z "$pid" ] && continue
+            if [ -r "/proc/$pid/status" ]; then
+                local state
+                state=$(grep -E '^State:' "/proc/$pid/status" 2>/dev/null | awk '{print $2}')
+                case "$state" in
+                    Z|z|X|x) continue ;;
+                    *) pids+=("$pid") ;;
+                esac
+            fi
+        done
+    fi
+
+    if [ ${#pids[@]} -gt 0 ]; then
+        printf "%s\n" "${pids[@]}"
+        return 0
+    fi
+    return 1
+}
+
+#---
 #   FUNCTION:  handle_running_applications()
 #  DESCRIPTION:  Detects active applications with open databases or write activity (e.g. browsers,
 #                email clients) prior to archiving. Depending on RUNNING_APPS_ACTION ('prompt',
@@ -2002,11 +2045,11 @@ handle_running_applications() {
         target_apps=("${DEFAULT_TARGET_RUNNING_APPS[@]}")
     fi
 
-    # Find running processes matching target applications for current user
+    # Find running processes matching target applications for current user (excluding defunct zombies)
     local running_detected=()
     for app in "${target_apps[@]}"; do
         [ -z "$app" ] && continue
-        if pgrep -u "$CURRENT_USER" -x "$app" &>/dev/null; then
+        if get_active_app_pids "$app" &>/dev/null; then
             running_detected+=("$app")
         fi
     done
@@ -2023,7 +2066,7 @@ handle_running_applications() {
                 echo "  The following application(s) with active databases are currently running:"
                 for a in "${running_detected[@]}"; do
                     local p_count
-                    p_count=$(pgrep -u "$CURRENT_USER" -x "$a" 2>/dev/null | wc -l | tr -d '[:space:]')
+                    p_count=$(get_active_app_pids "$a" 2>/dev/null | wc -l | tr -d '[:space:]')
                     echo "    - $a (${p_count:-1} process(es))"
                 done
                 echo
@@ -2062,8 +2105,12 @@ handle_running_applications() {
             local any_closed=false
             for app in "${running_detected[@]}"; do
                 log_message "Sending SIGTERM to process '$app'..."
-                if pkill -u "$CURRENT_USER" -TERM -x "$app" 2>/dev/null; then
-                    any_closed=true
+                local app_pids=()
+                mapfile -t app_pids < <(get_active_app_pids "$app")
+                if [ ${#app_pids[@]} -gt 0 ]; then
+                    if kill -TERM "${app_pids[@]}" 2>/dev/null; then
+                        any_closed=true
+                    fi
                 fi
             done
 
@@ -2073,7 +2120,7 @@ handle_running_applications() {
                 while [ "$waited" -lt "$settle_timeout" ]; do
                     local still_running=0
                     for app in "${running_detected[@]}"; do
-                        if pgrep -u "$CURRENT_USER" -x "$app" &>/dev/null; then
+                        if get_active_app_pids "$app" &>/dev/null; then
                             still_running=1
                             break
                         fi
@@ -2086,7 +2133,7 @@ handle_running_applications() {
                 # Check if any stubborn processes remain
                 local remaining=()
                 for app in "${running_detected[@]}"; do
-                    if pgrep -u "$CURRENT_USER" -x "$app" &>/dev/null; then
+                    if get_active_app_pids "$app" &>/dev/null; then
                         remaining+=("$app")
                     fi
                 done
@@ -8988,13 +9035,13 @@ check_config() {
             ;;
     esac
 
-    # Check which target applications are currently active
+    # Check which target applications are currently active (excluding defunct zombies)
     local active_target_apps=()
     local check_apps=("${TARGET_RUNNING_APPS[@]}")
     [ ${#check_apps[@]} -eq 0 ] && check_apps=("${DEFAULT_TARGET_RUNNING_APPS[@]}")
     for a in "${check_apps[@]}"; do
         [ -z "$a" ] && continue
-        if pgrep -u "$CURRENT_USER" -x "$a" &>/dev/null; then
+        if get_active_app_pids "$a" &>/dev/null; then
             active_target_apps+=("$a")
         fi
     done
