@@ -297,6 +297,7 @@ DEFAULT_EXCLUDE_PATTERNS=(
     "./tmp"
     "./cache"
     "./.cache"
+    "./.encrypted_data"
     "./Downloads"
     "./external_drive"
     "./sensitive"
