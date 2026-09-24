@@ -24,7 +24,7 @@
 #                 Usage: ./backup_script.sh [backup|restore|verify|list|stats|manifest|manage-preserved|init-config|check-config|help]
 #
 #        AUTHOR:  Rory Mobley, rorymobley5@gmail.com
-#       VERSION:  10.0
+#       VERSION:  10.1
 #==============================================================================
 
 #------------------------------------------------------------------------------
@@ -259,7 +259,7 @@ MAIL_COMMAND="${MAIL_COMMAND:-auto}"
 EMAIL_ALERT_SENT=0
 
 # Script version identifier
-SCRIPT_VERSION="10.0.0"
+SCRIPT_VERSION="10.1.0"
 
 # Path to this script for self-invocation
 SCRIPT_PATH="$(realpath "${BASH_SOURCE[0]}")"
@@ -6521,7 +6521,8 @@ list_archive_contents() {
 #   FUNCTION:  find_file()
 #  DESCRIPTION:  Searches for files matching a pattern across all available backup
 #                archives using their lightweight companion file list indices (.files.gz).
-#                Usage: find-file <pattern> [--source <auto|local|cloud|all>] [--long|-l] [--limit <N>]
+#                Supports interactive file selection and one-step restoration.
+#                Usage: find-file <pattern> [--restore|-r] [--dest <dir>] [--source <auto|local|cloud|all>] [--long|-l] [--limit <N>]
 #---
 find_file() {
     local search_pattern=""
@@ -6529,12 +6530,32 @@ find_file() {
     local long_format=false
     local match_limit=0
     local use_pager=false
+    local do_restore=false
+    local restore_dest=""
+    local cli_yes=false
     if [ -t 1 ] && [ "${TERM:-dumb}" != "dumb" ] && [ -n "${ARCHIVE_LIST_PAGER:-}" ]; then
         use_pager=true
     fi
 
     while [ $# -gt 0 ]; do
         case "$1" in
+            --restore|-r)
+                do_restore=true
+                shift
+                ;;
+            --dest|-d|--target)
+                if [ -n "${2:-}" ]; then
+                    restore_dest="$2"
+                    do_restore=true
+                    shift 2
+                else
+                    shift
+                fi
+                ;;
+            --yes|-y|--batch)
+                cli_yes=true
+                shift
+                ;;
             --source|-s)
                 if [ -n "${2:-}" ]; then
                     source_filter="$2"
@@ -6571,11 +6592,14 @@ find_file() {
                 echo
                 echo "Options:"
                 echo "  <pattern>                         Text, filename, or regex pattern to search"
+                echo "  --restore, -r                     Select and restore a matching file directly"
+                echo "  --dest, -d, --target <dir>        Destination directory for restore (default: prompt)"
                 echo "  --source, -s <auto|local|cloud|all> Target archive locations (default: auto)"
                 echo "  --long, -l, -v                    Show detailed permissions, owner, size, and date"
                 echo "  --limit, -n <count>               Limit matching lines displayed per archive (0: unlimited)"
                 echo "  --no-pager                        Disable terminal pager"
                 echo "  --pager                           Force terminal pager"
+                echo "  --yes, -y, --batch                Non-interactive batch mode (auto-confirm single match restore)"
                 return 0
                 ;;
             *)
@@ -6588,6 +6612,13 @@ find_file() {
                 ;;
         esac
     done
+
+    # Normalize restore destination if provided
+    if [ -n "$restore_dest" ]; then
+        if [[ "$restore_dest" =~ ^~(/.*)?$ ]]; then
+            restore_dest="${HOME}${BASH_REMATCH[1]}"
+        fi
+    fi
 
     if [ -z "$search_pattern" ]; then
         if [ -t 0 ]; then
@@ -6683,58 +6714,245 @@ find_file() {
     echo "Searching for '${search_pattern}' across ${#archive_order[@]} backup index(es)..."
     echo "==============================================================================="
 
-    (
-        local total_archives_matched=0
-        local total_files_matched=0
+    local results_tmp=""
+    results_tmp=$(mktemp) || {
+        echo "ERROR: Failed to allocate temporary file for search results." >&2
+        return 1
+    }
 
-        for arc_name in "${archive_order[@]}"; do
-            local meta="${archive_indices[$arc_name]}"
-            local src_type="${meta%%|*}"
-            local src_target="${meta#*|}"
+    local -a matched_archives=()
+    local -a matched_sources=()
+    local -a matched_paths=()
+    local -a matched_raw_lines=()
+    local total_archives_matched=0
+    local global_match_idx=0
 
-            local matches=""
-            if [ "$src_type" = "cloud" ]; then
-                if [ "$long_format" = true ]; then
-                    matches=$(rclone cat "${BACKUP_DIR}${src_target}" 2>/dev/null | gzip -dc 2>/dev/null | grep -E -i "$search_pattern" || true)
-                else
-                    matches=$(rclone cat "${BACKUP_DIR}${src_target}" 2>/dev/null | gzip -dc 2>/dev/null | sed -E 's/^([^[:space:]]+[[:space:]]+){5}//' | grep -E -i "$search_pattern" || true)
-                fi
-            else
-                if [ "$long_format" = true ]; then
-                    matches=$(gzip -dc "$src_target" 2>/dev/null | grep -E -i "$search_pattern" || true)
-                else
-                    matches=$(gzip -dc "$src_target" 2>/dev/null | sed -E 's/^([^[:space:]]+[[:space:]]+){5}//' | grep -E -i "$search_pattern" || true)
-                fi
-            fi
+    for arc_name in "${archive_order[@]}"; do
+        local meta="${archive_indices[$arc_name]}"
+        local src_type="${meta%%|*}"
+        local src_target="${meta#*|}"
 
-            if [ -n "$matches" ]; then
-                ((total_archives_matched++))
-                local match_count
-                match_count=$(wc -l <<< "$matches")
-                total_files_matched=$(( total_files_matched + match_count ))
+        local raw_matches=()
+        if [ "$src_type" = "cloud" ]; then
+            mapfile -t raw_matches < <(rclone cat "${BACKUP_DIR}${src_target}" 2>/dev/null | gzip -dc 2>/dev/null | grep -E -i "$search_pattern" || true)
+        else
+            mapfile -t raw_matches < <(gzip -dc "$src_target" 2>/dev/null | grep -E -i "$search_pattern" || true)
+        fi
 
+        if [ ${#raw_matches[@]} -gt 0 ]; then
+            ((total_archives_matched++))
+            local arc_match_count=${#raw_matches[@]}
+
+            {
                 echo
                 echo "-------------------------------------------------------------------------------"
                 echo " Archive : ${arc_name}"
                 echo " Source  : ${src_type} ($(basename "$src_target"))"
-                echo " Matches : ${match_count} file(s)"
+                echo " Matches : ${arc_match_count} file(s)"
                 echo "-------------------------------------------------------------------------------"
-                if [ "$match_limit" -gt 0 ] && [ "$match_count" -gt "$match_limit" ]; then
-                    head -n "$match_limit" <<< "$matches" | grep --color="$grep_color" -E -i "$search_pattern" || true
-                    echo "  ... [showing first ${match_limit} of ${match_count} matches]"
-                else
-                    grep --color="$grep_color" -E -i "$search_pattern" <<< "$matches" || true
-                fi
-            fi
-        done
+            } >> "$results_tmp"
 
+            local line_idx=0
+            for raw_line in "${raw_matches[@]}"; do
+                [ -z "$raw_line" ] && continue
+                ((line_idx++))
+
+                if [ "$match_limit" -gt 0 ] && [ "$line_idx" -gt "$match_limit" ]; then
+                    if [ "$line_idx" -eq $(( match_limit + 1 )) ]; then
+                        echo "  ... [showing first ${match_limit} of ${arc_match_count} matches in this archive]" >> "$results_tmp"
+                    fi
+                    continue
+                fi
+
+                ((global_match_idx++))
+
+                # Strip 5 leading whitespace-delimited columns (permissions, owner, size, date, time)
+                local path_part
+                path_part=$(sed -E 's/^([^[:space:]]+[[:space:]]+){5}//' <<< "$raw_line")
+                local clean_path
+                clean_path=$(sed -E 's/ (->|link to) .*$//' <<< "$path_part")
+
+                matched_archives+=("$arc_name")
+                matched_sources+=("$src_type")
+                matched_paths+=("$clean_path")
+                matched_raw_lines+=("$raw_line")
+
+                local display_line
+                if [ "$long_format" = true ]; then
+                    display_line="$raw_line"
+                else
+                    display_line="$path_part"
+                fi
+
+                local formatted_line
+                formatted_line=$(printf " [%d] %s" "$global_match_idx" "$display_line")
+                if [ "$use_pager" = true ]; then
+                    grep --color="$grep_color" -E -i "$search_pattern" <<< "$formatted_line" >> "$results_tmp" 2>/dev/null || echo "$formatted_line" >> "$results_tmp"
+                else
+                    echo "$formatted_line" >> "$results_tmp"
+                fi
+            done
+        fi
+    done
+
+    {
         echo
         echo "==============================================================================="
-        echo "Search complete: ${total_files_matched} matching file(s) across ${total_archives_matched} archive(s) (scanned ${#archive_order[@]} index(es))."
+        if [ "$global_match_idx" -gt 0 ]; then
+            echo "Search complete: ${global_match_idx} match(es) across ${total_archives_matched} archive(s) (scanned ${#archive_order[@]} index(es))."
+        else
+            echo "Search complete: No files matching '${search_pattern}' found across ${#archive_order[@]} backup index(es)."
+        fi
         echo "==============================================================================="
-    ) | "${pager_cmd[@]}"
+    } >> "$results_tmp"
 
-    return 0
+    if [ "$use_pager" = true ] && [ "$global_match_idx" -gt 0 ]; then
+        "${pager_cmd[@]}" "$results_tmp"
+    else
+        cat "$results_tmp"
+    fi
+    rm -f "$results_tmp"
+
+    if [ "$global_match_idx" -eq 0 ]; then
+        if [ "$do_restore" = true ]; then
+            echo "ERROR: No matching files found to restore." >&2
+            return 1
+        fi
+        return 0
+    fi
+
+    # Interactive restore handling
+    local selected_idx=""
+    if [ "$do_restore" = true ]; then
+        if [ "$cli_yes" = true ] && [ "$global_match_idx" -eq 1 ]; then
+            selected_idx=1
+        elif [ "$global_match_idx" -eq 1 ] && [ -t 0 ]; then
+            echo
+            echo "Found 1 match: [1] ${matched_paths[0]} (${matched_archives[0]})"
+            local confirm_one=""
+            read -r -p "Restore this file? (Y/n): " confirm_one
+            if [[ "$confirm_one" =~ ^[Nn]$ ]]; then
+                echo "Restore cancelled."
+                return 0
+            fi
+            selected_idx=1
+        elif [ -t 0 ]; then
+            echo
+            echo "-------------------------------------------------------------------------------"
+            echo "  Restore from Search Results"
+            echo "-------------------------------------------------------------------------------"
+            while true; do
+                local user_input=""
+                read -r -p "Enter match number to restore [1-${global_match_idx}, or 'q' to cancel]: " user_input
+                if [[ "$user_input" =~ ^[Qq]|exit|cancel$ ]]; then
+                    echo "Restore cancelled."
+                    return 0
+                fi
+                if [[ "$user_input" =~ ^[0-9]+$ ]] && [ "$user_input" -ge 1 ] && [ "$user_input" -le "$global_match_idx" ]; then
+                    selected_idx="$user_input"
+                    break
+                fi
+                echo "Invalid selection. Please enter an integer between 1 and ${global_match_idx}."
+            done
+        else
+            echo "ERROR: Multiple matches found (${global_match_idx}). Please run interactively or specify a more specific search pattern." >&2
+            return 1
+        fi
+    elif [ -t 0 ] && [ -t 1 ]; then
+        # Interactive session without explicit --restore flag: offer restore prompt
+        echo
+        echo "-------------------------------------------------------------------------------"
+        echo "  Restore Search Result"
+        echo "-------------------------------------------------------------------------------"
+        local user_input=""
+        read -r -p "Enter match number to restore [1-${global_match_idx}, or Enter to skip]: " user_input
+        if [ -n "$user_input" ]; then
+            if [[ "$user_input" =~ ^[Qq]|exit|cancel|no|[Nn]$ ]]; then
+                return 0
+            elif [[ "$user_input" =~ ^[0-9]+$ ]] && [ "$user_input" -ge 1 ] && [ "$user_input" -le "$global_match_idx" ]; then
+                selected_idx="$user_input"
+            else
+                echo "Invalid selection '${user_input}'. Skipping restore."
+                return 0
+            fi
+        else
+            return 0
+        fi
+    fi
+
+    if [ -z "$selected_idx" ]; then
+        return 0
+    fi
+
+    local chosen_arr_idx=$(( selected_idx - 1 ))
+    local chosen_archive="${matched_archives[$chosen_arr_idx]}"
+    local chosen_source="${matched_sources[$chosen_arr_idx]}"
+    local chosen_path="${matched_paths[$chosen_arr_idx]}"
+
+    local target_dest="$restore_dest"
+    if [ -z "$target_dest" ]; then
+        if [ -t 0 ]; then
+            echo
+            echo "Selected : [${selected_idx}] ${chosen_path}"
+            echo "Archive  : ${chosen_archive} (${chosen_source})"
+            echo
+            echo "Choose restore destination:"
+            echo "  1) Current working directory (${PWD})"
+            echo "  2) Original location (${SOURCE_DIR})"
+            echo "  3) Custom directory"
+            local dest_choice=""
+            read -r -p "Please select destination [1-3, default: 1]: " dest_choice
+            case "$dest_choice" in
+                2)
+                    target_dest="$SOURCE_DIR"
+                    ;;
+                3)
+                    local custom_input=""
+                    read -r -e -p "Enter destination directory path: " custom_input
+                    if [ -n "$custom_input" ]; then
+                        [[ "$custom_input" =~ ^~(/.*)?$ ]] && custom_input="${HOME}${BASH_REMATCH[1]}"
+                        target_dest="$custom_input"
+                    else
+                        target_dest="$PWD"
+                    fi
+                    ;;
+                *)
+                    target_dest="$PWD"
+                    ;;
+            esac
+        else
+            target_dest="$PWD"
+        fi
+    fi
+
+    if [ ! -d "$target_dest" ]; then
+        mkdir -p "$target_dest" 2>/dev/null || {
+            echo "ERROR: Destination directory '${target_dest}' could not be created." >&2
+            return 1
+        }
+    fi
+
+    local restore_source_arg="cloud"
+    local restore_archive_arg="$chosen_archive"
+    if [ "$chosen_source" = "local" ]; then
+        restore_source_arg="local"
+    elif [ "$chosen_source" = "preserved" ]; then
+        restore_source_arg="local"
+        restore_archive_arg="${SOURCE_DIR}/${chosen_archive}"
+    fi
+
+    echo
+    echo "Restoring '${chosen_path}' from ${chosen_archive} to ${target_dest}..."
+    local restore_cmd_args=(
+        "--archive" "$restore_archive_arg"
+        "--source" "$restore_source_arg"
+        "--dest" "$target_dest"
+        "--path" "$chosen_path"
+    )
+    [ "$cli_yes" = true ] && restore_cmd_args+=("--yes")
+
+    run_restore "${restore_cmd_args[@]}"
+    return $?
 }
 
 #---
@@ -9348,10 +9566,13 @@ case "${1:-}" in
         echo "                                         --no-pager (disable pager)"
         echo "  find-file <pat> [opts]        Search for files across ALL backup archives using fast companion indexes"
         echo "                                [pat] is the pattern or regex to search (e.g. 'resume.docx', '*.kdbx')."
-        echo "                                Options: --source, -s <auto|local|cloud|all>"
-        echo "                                         --long, -l (detailed listing with permissions, owner, size)"
-        echo "                                         --limit, -n <count> (limit matches per archive)"
-        echo "                                         --no-pager (disable pager)"
+        echo "                                Options: --restore, -r             Select and restore a matching file directly"
+        echo "                                         --dest, -d, --target <dir> Destination directory (default: prompt)"
+        echo "                                         --source, -s <auto|local|cloud|all>"
+        echo "                                         --long, -l                (detailed listing with permissions, owner, size)"
+        echo "                                         --limit, -n <count>       (limit matches per archive)"
+        echo "                                         --no-pager                (disable pager)"
+        echo "                                         --yes, -y, --batch        (auto-confirm single match restore)"
         echo "  manage-preserved [opt]        Manage, retry upload, or delete preserved failed-upload archives"
         echo "                                [opt] can be: '--retry' (or -r), '--delete' (or -d), or '--list' (or -l)."
         echo "                                Runs interactively if no option is specified."
