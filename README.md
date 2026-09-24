@@ -303,13 +303,19 @@ home/rory/Documents/taxes_2025.pdf
 
 ---
 
-### Searching Files Across Backups (`find-file`)
+### Searching & Restoring Files Across Backups (`find-file`)
 
-Instantly locate any file across **all** historical backup archives (local external drive, cloud storage, or both) using lightweight `.files.gz` companion indexes—without downloading multi-gigabyte payloads or decrypting archives:
+Instantly locate any file across **all** historical backup archives (local external drive, cloud storage, or both) using lightweight `.files.gz` companion indexes—without downloading multi-gigabyte payloads or decrypting archives. Each search result is numbered, allowing direct one-step extraction:
 
 ```bash
 # Search across all backups (auto-discovers local and cloud snapshots)
 $ ./backup_script.sh find-file "important_notes.txt"
+
+# Directly select and restore a matching file interactively
+$ ./backup_script.sh find-file "important_notes.txt" --restore
+
+# Restore directly to a specific destination directory
+$ ./backup_script.sh find-file "important_notes.txt" --restore --dest /tmp/restored
 
 # Search with regular expressions across both local and cloud
 $ ./backup_script.sh find-file ".*\.kdbx" --source all
@@ -330,19 +336,36 @@ Searching for 'important_notes.txt' across 4 backup index(es)...
  Source  : local (rory_home_backup_hp_2026-09-21_005151.tar.zst.gpg.files.gz)
  Matches : 2 file(s)
 -------------------------------------------------------------------------------
-home/rory/Documents/Projects/important_notes.txt
-home/rory/Work/Archive/important_notes.txt
+ [1] ./Documents/Projects/important_notes.txt
+ [2] ./Work/Archive/important_notes.txt
 
 -------------------------------------------------------------------------------
  Archive : rory_home_backup_hp_2026-09-20_005952.tar.zst.gpg
- Source  : local (rory_home_backup_hp_2026-09-20_005952.tar.zst.gpg.files.gz)
+ Source  : cloud (rory_home_backup_hp_2026-09-20_005952.tar.zst.gpg.files.gz)
  Matches : 1 file(s)
 -------------------------------------------------------------------------------
-home/rory/Documents/Projects/important_notes.txt
+ [3] ./Documents/Projects/important_notes.txt
 
 ===============================================================================
-Search complete: 3 matching file(s) across 2 archive(s) (scanned 4 index(es)).
+Search complete: 3 match(es) across 2 archive(s) (scanned 4 index(es)).
 ===============================================================================
+
+-------------------------------------------------------------------------------
+  Restore Search Result
+-------------------------------------------------------------------------------
+Enter match number [1-3, or Enter to skip]: 1
+
+Selected : [1] ./Documents/Projects/important_notes.txt
+Archive  : rory_home_backup_hp_2026-09-21_005151.tar.zst.gpg (local)
+
+Choose restore destination:
+  1) Current working directory (/home/rory)
+  2) Original location (~/Documents/Projects/important_notes.txt)
+  3) Custom directory
+Please select destination [1-3, default: 1]: 1
+
+Restoring './Documents/Projects/important_notes.txt' from rory_home_backup_hp_2026-09-21_005151.tar.zst.gpg to /home/rory...
+Selective restore complete!
 ```
 
 ---
