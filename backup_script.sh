@@ -24,7 +24,7 @@
 #                 Usage: ./backup_script.sh [backup|restore|verify|list|stats|manifest|manage-preserved|init-config|check-config|help]
 #
 #        AUTHOR:  Rory Mobley, rorymobley5@gmail.com
-#       VERSION:  10.1
+#       VERSION:  10.1.0
 #==============================================================================
 
 #------------------------------------------------------------------------------
@@ -248,7 +248,14 @@ RUNNING_APPS_SETTLE_TIMEOUT="${RUNNING_APPS_SETTLE_TIMEOUT:-10}"
 # Leave empty or unset to disable failure email alerts.
 ALERT_EMAIL="${ALERT_EMAIL:-${NOTIFICATION_EMAIL:-}}"
 
-# Configurable sender email address for outgoing failure alert emails.
+# Send email notification when backup operations complete successfully.
+# Can be enabled via config (ALERT_ON_SUCCESS="true" or EMAIL_ON_SUCCESS="true") or CLI (--email-on-success).
+ALERT_ON_SUCCESS="${ALERT_ON_SUCCESS:-${EMAIL_ON_SUCCESS:-false}}"
+
+# Optional recipient email address specifically for success notifications (defaults to ALERT_EMAIL).
+SUCCESS_EMAIL="${SUCCESS_EMAIL:-${ALERT_EMAIL:-${NOTIFICATION_EMAIL:-}}}"
+
+# Configurable sender email address for outgoing alert and notification emails.
 # If unset, auto-detects from msmtp account configuration or falls back to user@host.
 ALERT_FROM="${ALERT_FROM:-${NOTIFICATION_FROM:-${MAIL_FROM:-}}}"
 
@@ -306,13 +313,19 @@ DEFAULT_EXCLUDE_PATTERNS=(
     "./.config/chromium"
     "./.config/vivaldi-snapshot"
     "./.mozilla"
-    # Browser transient state, internal caches, and IPC/process locks (Vivaldi & Chromium)
+    # Browser transient state, internal caches, and IPC/process locks (Vivaldi, Chromium, Firefox, Thunderbird)
     "SingletonLock"
     "*/SingletonLock"
     "SingletonCookie"
     "*/SingletonCookie"
     "SingletonSocket"
     "*/SingletonSocket"
+    "parent.lock"
+    "*/parent.lock"
+    ".parentlock"
+    "*/.parentlock"
+    "*/.mozilla/*/lock"
+    "*/.thunderbird/*/lock"
     "Crashpad"
     "*/Crashpad"
     "GPUCache"
@@ -648,35 +661,24 @@ format_duration() {
 }
 
 #---
-#   FUNCTION:  send_failure_email()
-#  DESCRIPTION:  Dispatches an automated email notification with detailed failure context
-#                and diagnostic log snippets to ALERT_EMAIL. Includes duplicate suppression.
+#   FUNCTION:  send_email_message()
+#  DESCRIPTION:  Low-level MTA dispatcher. Formats and sends an email using
+#                msmtp, mailx, mail, or a custom mail command.
 #---
-send_failure_email() {
-    local error_title="${1:-Backup Operation Failed}"
-    local error_msg="${2:-An unexpected error occurred during the backup process.}"
-    local recipient="${ALERT_EMAIL:-${NOTIFICATION_EMAIL:-}}"
+send_email_message() {
+    local subject="$1"
+    local email_body="$2"
+    local recipient="${3:-${ALERT_EMAIL:-${NOTIFICATION_EMAIL:-}}}"
+    local sender="${4:-${ALERT_FROM:-${NOTIFICATION_FROM:-${MAIL_FROM:-}}}}"
 
     if [ -z "$recipient" ]; then
         return 0
     fi
 
-    if [ "${EMAIL_ALERT_SENT:-0}" -eq 1 ]; then
-        log_message "Failure alert email already sent for this run. Suppressing duplicate."
-        return 0
-    fi
-
-    log_message "Dispatching failure alert email to ${recipient}..."
-
-    local timestamp_str
-    timestamp_str=$(date '+%Y-%m-%d %H:%M:%S %Z')
-    local subject="[BACKUP FAILED] ${HOSTNAME}: ${error_title} (${timestamp_str})"
-
     # Resolve sender email address:
     # 1. Explicitly configured ALERT_FROM (or NOTIFICATION_FROM / MAIL_FROM)
     # 2. Auto-detect from msmtp account configuration (avoids SMTP 550 forged sender errors)
     # 3. Fallback to local user@hostname
-    local sender="${ALERT_FROM:-${NOTIFICATION_FROM:-${MAIL_FROM:-}}}"
     if [ -z "$sender" ] && command -v msmtp &>/dev/null; then
         local detected_from
         detected_from=$(msmtp -P -a default </dev/null 2>/dev/null | awk -F' = ' '$1 == "from" && $2 != "(not set)" {print $2; exit}')
@@ -687,62 +689,6 @@ send_failure_email() {
     if [ -z "$sender" ]; then
         sender="${CURRENT_USER}@${HOSTNAME}"
     fi
-
-    # Extract recent log entries (last 35 lines)
-    local log_snippet=""
-    if [ -f "$LOG_FILE" ]; then
-        log_snippet=$(tail -n 35 "$LOG_FILE" 2>/dev/null)
-    fi
-
-    # Extract any rclone error entries if present
-    local rclone_snippet=""
-    local rclone_log="${LOG_FILE}.rclone"
-    if [ -f "$rclone_log" ]; then
-        rclone_snippet=$(grep -E "(ERROR|Failed to|fatal)" "$rclone_log" 2>/dev/null | tail -n 15)
-        [ -z "$rclone_snippet" ] && rclone_snippet=$(tail -n 15 "$rclone_log" 2>/dev/null)
-    fi
-
-    # Build plain-text email message
-    local email_body
-    email_body=$(cat << EOF
-================================================================================
-  AUTOMATED BACKUP FAILURE NOTIFICATION
-================================================================================
-Host:             ${HOSTNAME}
-User:             ${CURRENT_USER}
-Date & Time:      ${timestamp_str}
-Source Directory: ${SOURCE_DIR}
-Cloud Remote:     ${BACKUP_DIR}
-Script Version:   ${SCRIPT_VERSION}
-Log File:         ${LOG_FILE}
-================================================================================
-
-FAILURE DETAILS:
-  Event:   ${error_title}
-  Message: ${error_msg}
-
-===============================================================================
-RECENT APPLICATION LOG (${LOG_FILE}):
-===============================================================================
-${log_snippet:-No log entries available.}
-EOF
-)
-
-    if [ -n "$rclone_snippet" ]; then
-        email_body="${email_body}
-
-================================================================================
-RECENT RCLONE TRANSFER LOG (${rclone_log}):
-================================================================================
-${rclone_snippet}"
-    fi
-
-    email_body="${email_body}
-
-================================================================================
-This notification was automatically generated by backup_script.sh on ${HOSTNAME}.
-================================================================================
-"
 
     local send_rc=0
     local mailer="${MAIL_COMMAND:-auto}"
@@ -786,7 +732,7 @@ This notification was automatically generated by backup_script.sh on ${HOSTNAME}
             printf "%s\n" "$email_body" | mail -s "$subject" "$recipient" 2>> "$LOG_FILE" || send_rc=$?
             ;;
         none)
-            log_message "WARNING: No mail agent found (msmtp, mailx, mail not installed). Failure email not sent."
+            log_message "WARNING: No mail agent found (msmtp, mailx, mail not installed). Email not sent."
             echo "WARNING: Could not send alert email: no mail agent found (msmtp, mailx, mail)." >&2
             return 1
             ;;
@@ -795,12 +741,185 @@ This notification was automatically generated by backup_script.sh on ${HOSTNAME}
             ;;
     esac
 
+    return "$send_rc"
+}
+
+#---
+#   FUNCTION:  send_failure_email()
+#  DESCRIPTION:  Dispatches an automated email notification with detailed failure context
+#                and diagnostic log snippets to ALERT_EMAIL. Includes duplicate suppression.
+#---
+send_failure_email() {
+    local error_title="${1:-Backup Operation Failed}"
+    local error_msg="${2:-An unexpected error occurred during the backup process.}"
+    local recipient="${ALERT_EMAIL:-${NOTIFICATION_EMAIL:-}}"
+
+    if [ -z "$recipient" ]; then
+        return 0
+    fi
+
+    if [ "${EMAIL_ALERT_SENT:-0}" -eq 1 ]; then
+        log_message "Failure alert email already sent for this run. Suppressing duplicate."
+        return 0
+    fi
+
+    log_message "Dispatching failure alert email to ${recipient}..."
+
+    local timestamp_str
+    timestamp_str=$(date '+%Y-%m-%d %H:%M:%S %Z')
+    local subject="[BACKUP FAILED] ${HOSTNAME}: ${error_title} (${timestamp_str})"
+
+    # Extract recent log entries (last 35 lines)
+    local log_snippet=""
+    if [ -f "$LOG_FILE" ]; then
+        log_snippet=$(tail -n 35 "$LOG_FILE" 2>/dev/null)
+    fi
+
+    # Extract any rclone error entries if present
+    local rclone_snippet=""
+    local rclone_log="${LOG_FILE}.rclone"
+    if [ -f "$rclone_log" ]; then
+        rclone_snippet=$(grep -E "(ERROR|Failed to|fatal)" "$rclone_log" 2>/dev/null | tail -n 15)
+        [ -z "$rclone_snippet" ] && rclone_snippet=$(tail -n 15 "$rclone_log" 2>/dev/null)
+    fi
+
+    # Build plain-text email message
+    local email_body
+    email_body=$(cat << EOF
+================================================================================
+  AUTOMATED BACKUP FAILURE NOTIFICATION
+================================================================================
+Host:             ${HOSTNAME}
+User:             ${CURRENT_USER}
+Date & Time:      ${timestamp_str}
+Source Directory: ${SOURCE_DIR}
+Cloud Remote:     ${BACKUP_DIR}
+Script Version:   ${SCRIPT_VERSION}
+Log File:         ${LOG_FILE}
+================================================================================
+
+FAILURE DETAILS:
+  Event:   ${error_title}
+  Message: ${error_msg}
+
+================================================================================
+RECENT APPLICATION LOG (${LOG_FILE}):
+================================================================================
+${log_snippet:-No log entries available.}
+EOF
+)
+
+    if [ -n "$rclone_snippet" ]; then
+        email_body="${email_body}
+
+================================================================================
+RECENT RCLONE TRANSFER LOG (${rclone_log}):
+================================================================================
+${rclone_snippet}"
+    fi
+
+    email_body="${email_body}
+
+================================================================================
+This notification was automatically generated by backup_script.sh on ${HOSTNAME}.
+================================================================================
+"
+
+    send_email_message "$subject" "$email_body" "$recipient"
+    local send_rc=$?
+
     if [ "$send_rc" -eq 0 ]; then
-        log_message "Backup failure email alert successfully dispatched to ${recipient} via ${mailer}."
+        log_message "Backup failure email alert successfully dispatched to ${recipient}."
         EMAIL_ALERT_SENT=1
     else
-        log_message "WARNING: Failed to send backup failure email to ${recipient} via ${mailer} (exit code ${send_rc})."
+        log_message "WARNING: Failed to send backup failure email to ${recipient} (exit code ${send_rc})."
         echo "WARNING: Failed to send failure alert email to ${recipient} (mailer exit code ${send_rc})." >&2
+    fi
+
+    return "$send_rc"
+}
+
+#---
+#   FUNCTION:  send_success_email()
+#  DESCRIPTION:  Dispatches an automated email notification with detailed summary
+#                of a successful backup operation to SUCCESS_EMAIL / ALERT_EMAIL.
+#---
+send_success_email() {
+    local archive_name="${1:-${ENCRYPTED_TARBALL_NAME:-unknown}}"
+    local archive_size="${2:-${archive_size_hr:-unknown}}"
+    local duration="${3:-${duration_str:-unknown}}"
+    local verify_result="${4:-${verify_status:-None}}"
+    local cloud_result="${5:-${cloud_backup_status:-None}}"
+    local local_result="${6:-${local_backup_status:-None}}"
+    local compression_info="${7:-}"
+    local uncompressed_info="${8:-}"
+    local recipient="${SUCCESS_EMAIL:-${ALERT_EMAIL:-${NOTIFICATION_EMAIL:-}}}"
+
+    if [ -z "$recipient" ]; then
+        return 0
+    fi
+
+    log_message "Dispatching backup success notification email to ${recipient}..."
+
+    local timestamp_str
+    timestamp_str=$(date '+%Y-%m-%d %H:%M:%S %Z')
+    local subject="[BACKUP SUCCESSFUL] ${HOSTNAME}: Backup Completed (${archive_name})"
+
+    # Extract recent log entries (last 30 lines) for summary context
+    local log_snippet=""
+    if [ -f "$LOG_FILE" ]; then
+        log_snippet=$(tail -n 30 "$LOG_FILE" 2>/dev/null)
+    fi
+
+    local compression_line=""
+    if [ -n "$compression_info" ] && [ "$compression_info" != "unknown" ]; then
+        compression_line="  Compression:        ${compression_info}"
+        if [ -n "$uncompressed_info" ] && [ "$uncompressed_info" != "unknown" ]; then
+            compression_line="${compression_line} (from ${uncompressed_info})"
+        fi
+        compression_line="${compression_line}"$'\n'
+    fi
+
+    local email_body
+    email_body=$(cat << EOF
+================================================================================
+  AUTOMATED BACKUP SUCCESS NOTIFICATION
+================================================================================
+Host:                 ${HOSTNAME}
+User:                 ${CURRENT_USER}
+Date & Time:          ${timestamp_str}
+Source Directory:     ${SOURCE_DIR}
+Script Version:       ${SCRIPT_VERSION}
+Log File:             ${LOG_FILE}
+================================================================================
+
+BACKUP SUMMARY:
+  Archive:            ${archive_name}
+  Archive Size:       ${archive_size}
+${compression_line}  Duration:           ${duration}
+  Cloud Remote:       ${BACKUP_DIR} (${cloud_result})
+  Local Drive:        ${local_result}
+  Verification:       ${verify_result}
+
+================================================================================
+RECENT APPLICATION LOG (${LOG_FILE}):
+================================================================================
+${log_snippet:-No log entries available.}
+
+================================================================================
+This notification was automatically generated by backup_script.sh on ${HOSTNAME}.
+================================================================================
+EOF
+)
+
+    send_email_message "$subject" "$email_body" "$recipient"
+    local send_rc=$?
+
+    if [ "$send_rc" -eq 0 ]; then
+        log_message "Backup success email notification successfully dispatched to ${recipient}."
+    else
+        log_message "WARNING: Failed to send backup success email to ${recipient} (exit code ${send_rc})."
+        echo "WARNING: Failed to send success notification email to ${recipient} (exit code ${send_rc})." >&2
     fi
 
     return "$send_rc"
@@ -2189,6 +2308,24 @@ run_backup() {
                     return 1
                 fi
                 ;;
+            --email-on-success|--alert-on-success)
+                ALERT_ON_SUCCESS="true"
+                shift
+                ;;
+            --no-email-on-success|--no-alert-on-success)
+                ALERT_ON_SUCCESS="false"
+                shift
+                ;;
+            --success-email|-se)
+                if [ -n "${2:-}" ]; then
+                    SUCCESS_EMAIL="$2"
+                    ALERT_ON_SUCCESS="true"
+                    shift 2
+                else
+                    echo "ERROR: Missing email address for --success-email." >&2
+                    return 1
+                fi
+                ;;
             --alert-from|-af)
                 if [ -n "${2:-}" ]; then
                     ALERT_FROM="$2"
@@ -3378,6 +3515,10 @@ run_backup() {
 
     if [ "$backup_overall_status" = "failure" ]; then
         send_failure_email "Backup Verification or Storage Failure" "Backup concluded with errors: verification=${verify_status}, cloud=${cloud_backup_status}, local=${local_backup_status}."
+    elif [ "$backup_overall_status" = "success" ]; then
+        if [[ "${ALERT_ON_SUCCESS}" =~ ^([Tt][Rr][Uu][Ee]|1|[Yy][Ee][Ss]|[Oo][Nn])$ ]]; then
+            send_success_email "${ENCRYPTED_TARBALL_NAME}" "${archive_size_hr}" "${duration_str}" "${verify_status}" "${cloud_backup_status}" "${local_backup_status}" "${compression_ratio:-}" "${uncompressed_size_hr:-}"
+        fi
     fi
 
     if [ "$verify_exit_code" -ne 0 ]; then
@@ -8424,13 +8565,19 @@ init_config() {
 #    "./.config/chromium"
 #    "./.config/vivaldi-snapshot"
 #    "./.mozilla"
-#    # Browser transient state, internal caches, and IPC/process locks (Vivaldi & Chromium)
+#    # Browser transient state, internal caches, and IPC/process locks (Vivaldi, Chromium, Firefox, Thunderbird)
 #    "SingletonLock"
 #    "*/SingletonLock"
 #    "SingletonCookie"
 #    "*/SingletonCookie"
 #    "SingletonSocket"
 #    "*/SingletonSocket"
+#    "parent.lock"
+#    "*/parent.lock"
+#    ".parentlock"
+#    "*/.parentlock"
+#    "*/.mozilla/*/lock"
+#    "*/.thunderbird/*/lock"
 #    "Crashpad"
 #    "*/Crashpad"
 #    "GPUCache"
@@ -8559,7 +8706,7 @@ init_config() {
 #RUNNING_APPS_SETTLE_TIMEOUT=10
 
 #------------------------------------------------------------------------------
-# 15. Email Alerts on Backup Failure
+# 15. Email Alerts & Notifications
 #------------------------------------------------------------------------------
 # Recipient email address to notify if backup operations encounter fatal errors
 # or post-backup verification failure.
@@ -8568,7 +8715,18 @@ init_config() {
 # Default: ""
 #ALERT_EMAIL=""
 
-# Sender email address for outgoing failure alert emails.
+# Send an email notification when a backup completes successfully.
+# Options: true, false
+# Default: false
+#ALERT_ON_SUCCESS="false"
+
+# Optional recipient email address specifically for success notifications.
+# If unset or empty, defaults to ALERT_EMAIL.
+# Example: SUCCESS_EMAIL="success@domain.com"
+# Default: "" (uses ALERT_EMAIL)
+#SUCCESS_EMAIL=""
+
+# Sender email address for outgoing alert and notification emails.
 # If unset, automatically detects sender from msmtp account configuration (e.g. /etc/msmtprc)
 # or falls back to user@host. Note: Authenticated SMTP relays (Vivaldi, Gmail, etc.)
 # require From to match the authenticated account to prevent '550 forged sender' rejection.
@@ -9307,6 +9465,22 @@ check_config() {
         report_info "Failure Email Alert" "Disabled (ALERT_EMAIL not set; configure to receive error emails)"
     fi
 
+    # Success Email Notification Check
+    if [[ "${ALERT_ON_SUCCESS}" =~ ^([Tt][Rr][Uu][Ee]|1|[Yy][Ee][Ss]|[Oo][Nn])$ ]]; then
+        local success_recip="${SUCCESS_EMAIL:-${ALERT_EMAIL:-${NOTIFICATION_EMAIL:-}}}"
+        if [ -n "$success_recip" ]; then
+            if [[ "$success_recip" =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$ ]]; then
+                report_ok "Success Email Alert" "Enabled: ${success_recip}"
+            else
+                report_warn "Success Email Alert" "Enabled, but unusual email format: ${success_recip}"
+            fi
+        else
+            report_warn "Success Email Alert" "Enabled (ALERT_ON_SUCCESS=true), but neither SUCCESS_EMAIL nor ALERT_EMAIL is configured"
+        fi
+    else
+        report_info "Success Email Alert" "Disabled (set ALERT_ON_SUCCESS=\"true\" in config or use --email-on-success)"
+    fi
+
     # 7. Dependencies
     print_section "Tools & Dependencies:"
     local req_tools=("tar" "rclone" "gpg" "pkill" "pgrep" "hostname" "zstd" "findmnt" "flock" "df" "awk" "numfmt" "sha256sum")
@@ -9409,7 +9583,7 @@ check_config() {
 #  DESCRIPTION:  Dispatches a test notification to verify MTA delivery and recipient reachability.
 #---
 test_email() {
-    local recipient="${1:-${ALERT_EMAIL:-${NOTIFICATION_EMAIL:-}}}"
+    local recipient="${1:-${SUCCESS_EMAIL:-${ALERT_EMAIL:-${NOTIFICATION_EMAIL:-}}}}"
     local custom_sender="${2:-}"
     if [ -z "$recipient" ]; then
         echo "ERROR: No recipient email address specified." >&2
@@ -9426,7 +9600,32 @@ test_email() {
     [ -n "$custom_sender" ] && ALERT_FROM="$custom_sender"
     EMAIL_ALERT_SENT=0
 
-    if send_failure_email "Test Notification" "This is an automated test from backup_script.sh on ${HOSTNAME} to verify email alert delivery."; then
+    local timestamp_str
+    timestamp_str=$(date '+%Y-%m-%d %H:%M:%S %Z')
+    local subject="[BACKUP TEST] ${HOSTNAME}: Test Notification (${timestamp_str})"
+    local test_body
+    test_body=$(cat << EOF
+================================================================================
+  AUTOMATED BACKUP TEST NOTIFICATION
+================================================================================
+Host:             ${HOSTNAME}
+User:             ${CURRENT_USER}
+Date & Time:      ${timestamp_str}
+Script Version:   ${SCRIPT_VERSION}
+Log File:         ${LOG_FILE}
+================================================================================
+
+This is an automated test from backup_script.sh on ${HOSTNAME} to verify
+email delivery configuration (MTA, credentials, and recipient reachability).
+
+If you are receiving this message, your backup email alerting system is
+configured and working properly!
+
+================================================================================
+EOF
+)
+
+    if send_email_message "$subject" "$test_body" "$recipient" "${custom_sender:-$ALERT_FROM}"; then
         echo "Test email successfully dispatched to ${recipient}."
         ALERT_EMAIL="$old_alert_email"
         ALERT_FROM="$old_alert_from"
@@ -9507,7 +9706,10 @@ case "${1:-}" in
         echo "  backup [opts]                 Create and upload an encrypted backup of the home directory"
         echo "                                Options:"
         echo "                                  --alert-email, -ae <email>        Recipient email address to notify if backup fails"
-        echo "                                  --alert-from, -af <email>         Sender email address for failure notifications"
+        echo "                                  --email-on-success                Send email notification on successful backup"
+        echo "                                  --no-email-on-success             Do not send email notification on successful backup"
+        echo "                                  --success-email, -se <email>      Recipient email address for success notifications"
+        echo "                                  --alert-from, -af <email>         Sender email address for failure/success notifications"
         echo "                                  --apps-action, -aa <mode>         Running applications consistency action"
         echo "                                                                    ('close', 'prompt', 'sync', or 'ignore')"
         echo "                                  --close-apps                      Gracefully terminate running target apps (default)"
