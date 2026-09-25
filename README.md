@@ -66,7 +66,7 @@ A robust, enterprise-grade Bash backup, verification, and disaster-recovery solu
 - **Application Consistency Guard**: Detects running database-heavy applications (Vivaldi, Chrome, Firefox, Thunderbird) and gracefully terminates them with `SIGTERM` and filesystem `sync` before archiving.
 - **Concurrency Locking**: Uses kernel `flock` to prevent overlapping runs.
 - **Graceful Cleanup**: Traps `SIGINT`, `SIGTERM`, and script exit to clean up scratch paths and named pipes safely.
-- **Failure Alerts**: Dispatches email alerts on backup failure using local MTAs (`msmtp`, `mailx`).
+- **Failure & Success Alerts**: Dispatches email alerts on backup failure or success using local MTAs (`msmtp`, `mailx`).
 
 ---
 
@@ -247,6 +247,8 @@ Execute a manual backup immediately:
 - `--no-verify`: Skip post-backup verification for faster completion.
 - `--asymmetric [key]`: Encrypt with GPG public key.
 - `--alert-email <email>`: Override failure notification address.
+- `--email-on-success`: Send email notification upon successful backup completion.
+- `--success-email <email>`: Specify recipient address for success notifications (enables success email).
 
 ---
 
@@ -684,6 +686,8 @@ Key variables configurable in `~/.config/backup_script/config`:
 | `GENERATE_MANIFEST` | `true` | Generate companion JSON manifest (`.manifest.json`) with metadata and inventory |
 | `GENERATE_FILE_INDEX` | `true` | Generate companion file index (`.files.gz`) for fast zero-download search & listing |
 | `ALERT_EMAIL` | `""` | Destination email address for failure alerts |
+| `ALERT_ON_SUCCESS` | `false` | Send email notification on successful backup completion (`true`/`false`) |
+| `SUCCESS_EMAIL` | `""` | Optional dedicated recipient email address for success notifications |
 | `APT_PACKAGES_FILE` | `apt_packages_manual.txt` | Filename for exported manual APT packages |
 | `APT_REPOS_FILE` | `apt_repos_keys.tar.gz` | Archive for APT repository sources and keyrings |
 | `DNF_PACKAGES_FILE` | `dnf_packages_userinstalled.txt` | Filename for exported user-installed DNF packages |
