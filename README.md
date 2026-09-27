@@ -24,6 +24,7 @@ A robust, enterprise-grade Bash backup, verification, and disaster-recovery solu
   - [Historical Trends & Analytics (`stats`)](#historical-trends--analytics-stats)
   - [Integrity Verification (`verify`)](#integrity-verification-verify)
   - [Restoring Data (`restore`)](#restoring-data-restore)
+  - [System Packages & State Restore (`restore-system`)](#system-packages--state-restore-restore-system)
   - [Automated Scheduling (`systemd` Timer)](#automated-scheduling-systemd-timer)
 - [Retention Policies & GFS Pruning](#retention-policies--gfs-pruning)
 - [Exclusion Rules](#exclusion-rules)
@@ -58,14 +59,16 @@ A robust, enterprise-grade Bash backup, verification, and disaster-recovery solu
 - **Full Tar Stream Validation**: Thoroughly validates encryption integrity and tar archive block structure without writing files to disk.
 
 ### 📦 System State Snapshots, Manifests & File Indexing
-- **OS Environment Capture**: Exports lists of installed system packages (APT or DNF), Flatpaks, Pipx packages, enabled systemd user units, desktop `dconf` configurations, crontabs, and repository/GPG keyrings into the backup.
+- **OS Environment Capture**: Exports lists of installed system packages (APT or DNF), package hold selections, Flatpaks, Pipx packages, enabled systemd user units, desktop `dconf` configurations, crontabs, and repository/GPG keyrings into the backup.
+- **Modular System State Restore (`restore-system`)**: Dedicated subcommand that re-applies packages, repositories, desktop settings, systemd user units, and crontabs directly from unpacked directories or extracts manifests from an archive in a single pass without downloading or unpacking the entire home directory.
+- **Interactive Archive File Browser**: Search and browse files inside archives using companion `.files.gz` indexes, multi-select items with number ranges (`1, 3-5`), and restore selectively without full downloads.
 - **Companion JSON Manifests (`.manifest.json`)**: Instantly inspect archive metadata, compression ratios, package counts, and checksums without downloading or decrypting the archive.
 - **Zero-Bandwidth Companion File Indexes (`.files.gz`)**: Captures full file tables during archive creation (`tar -vv --index-file`) with zero extra disk passes, enabling instant file search (`find-file`) and zero-download archive exploration (`list-files`) across all local and remote snapshots.
 
 ### ⚙️ Reliability & Safety
-- **Application Consistency Guard**: Detects running database-heavy applications (Vivaldi, Chrome, Firefox, Thunderbird) and gracefully terminates them with `SIGTERM` and filesystem `sync` before archiving.
-- **Concurrency Locking**: Uses kernel `flock` to prevent overlapping runs.
-- **Graceful Cleanup**: Traps `SIGINT`, `SIGTERM`, and script exit to clean up scratch paths and named pipes safely.
+- **Application Consistency Guard & Automatic Relaunch**: Detects running database-heavy applications (Vivaldi, Chrome, Firefox, Thunderbird) and gracefully terminates them with `SIGTERM` and filesystem `sync` before archiving. When `RESTART_CLOSED_APPS=true` (or `--restart-apps`), the script automatically relaunches closed applications as soon as archive creation finishes.
+- **Concurrency Locking & Sleep Inhibition**: Uses kernel `flock` and `systemd-inhibit` to prevent overlapping runs and ensure systems do not suspend during backup or restoration.
+- **Graceful Cleanup**: Traps `SIGINT`, `SIGTERM`, and script exit to clean up scratch paths and named pipes safely, and reliably relaunches any closed apps.
 - **Failure & Success Alerts**: Dispatches email alerts on backup failure or success using local MTAs (`msmtp`, `mailx`).
 
 ---
@@ -220,11 +223,16 @@ Cloud Remote Destination (rclone):
  [  OK  ]  Cloud Connectivity           Remote 'googledrive:backup/' is reachable and authenticated
  [  OK  ]  Rclone Chunk Size            256M (upload cutoff: 256M)
 
+Compression & Applications:
+ [  OK  ]  Apps Consistency             Auto-close mode (SIGTERM graceful termination with 10s timeout)
+ [  OK  ]  Apps Relaunch                Enabled (closed applications will be automatically relaunched after archive creation)
+ [ INFO ]  Active Applications          Currently running: vivaldi-bin
+
 ===============================================================================
   Diagnostic Summary
 ===============================================================================
-  Total Checks : 38
-  Passed       : 38
+  Total Checks : 40
+  Passed       : 40
   Warnings     : 0
   Failures     : 0
 -------------------------------------------------------------------------------
@@ -242,8 +250,12 @@ Execute a manual backup immediately:
 ```
 
 #### Common Options:
-- `--no-close-apps`: Skip closing open browsers; flushes buffers via `sync`.
-- `--verify-checksum`: Run fast SHA-256 bit-rot validation immediately after upload.
+- `--close-apps`: Gracefully terminate running target applications (default).
+- `--prompt-apps`: Interactively prompt whether to close running applications.
+- `--no-close-apps`: Skip closing open applications; flushes filesystem buffers via `sync`.
+- `--restart-apps`, `-ra`: Automatically relaunch closed applications as soon as archive creation and checksum calculation complete (before cloud upload).
+- `--no-restart-apps`, `-nra`: Do not relaunch closed applications after backup completes.
+- `--verify-checksum`, `-vc`: Run fast SHA-256 bit-rot validation immediately after creation.
 - `--no-verify`: Skip post-backup verification for faster completion.
 - `--asymmetric [key]`: Encrypt with GPG public key.
 - `--alert-email <email>`: Override failure notification address.
@@ -481,16 +493,54 @@ Streams and decrypts the archive to test tar headers and block consistency witho
 
 ### Restoring Data (`restore`)
 
-The script supports both full and selective restores.
+The script supports full restores, granular pattern restores, and an interactive file browser powered by companion indexes.
 
 #### 1. Interactive Menu Restore
 ```bash
 ./backup_script.sh restore
 ```
-Guides you through selecting local or cloud backups, confirms target directories, and verifies checksums prior to extraction.
+Guides you through selecting local or cloud backups, confirms target directories, and verifies checksums prior to extraction. When restoring, you can choose between full home restoration, manual pattern entry, or browsing files directly from the archive index.
 
-#### 2. Selective Extraction (`--pattern`)
-Restore a single configuration file, directory, or wildcard pattern into an alternate target:
+#### 2. Interactive Archive File Browser (`--interactive` / `-i`)
+Search, browse, and multi-select individual files or directories directly from the `.files.gz` companion index without downloading or decrypting multi-gigabyte archives:
+
+```bash
+# Launch interactive file browser on the latest backup
+./backup_script.sh restore latest --interactive
+
+# Specify custom restore destination with interactive browsing
+./backup_script.sh restore latest -i --dest /tmp/restored
+```
+
+```text
+===============================================================================
+  Interactive Archive File Browser
+===============================================================================
+Archive : rory_home_backup_hp_2026-09-21_005151.tar.zst.gpg (local)
+Index   : rory_home_backup_hp_2026-09-21_005151.tar.zst.gpg.files.gz (187,421 files indexed)
+
+Enter search pattern (wildcards/regex supported), or:
+  'dirs'   to list top-level directories
+  'list'   to show currently selected files
+  'done'   to proceed with restoring selected files
+  'cancel' to abort
+Search query: *.pdf
+
+Matching Files (showing 4 matches):
+-------------------------------------------------------------------------------
+  [1] Documents/Financial/taxes_2025.pdf (142KB)
+  [2] Documents/Manuals/motherboard.pdf (4.2MB)
+  [3] Downloads/receipt.pdf (48KB)
+  [4] Work/Reports/quarterly_summary.pdf (1.8MB)
+-------------------------------------------------------------------------------
+Enter selection [numbers/ranges like '1, 3-4', 'all', or 'none']: 1, 4
+Added 2 file(s) to selection (total selected: 2).
+Search query: done
+Restoring 2 selected file(s)...
+```
+
+#### 3. Selective Extraction via Pattern (`--pattern` / `-p`)
+Restore specific files, directories, or wildcard patterns directly into the current directory or an alternate target:
 ```bash
 # Restore specific .bashrc to current directory
 ./backup_script.sh restore latest --pattern ".bashrc" --dest ./recovered/
@@ -499,10 +549,55 @@ Restore a single configuration file, directory, or wildcard pattern into an alte
 ./backup_script.sh restore latest --pattern "*.pdf" --source cloud --stream
 ```
 
-#### 3. Restoring to Alternate Directory
+#### 4. Restoring to Alternate Directory
 Always protect existing working trees by restoring to a staging directory first:
 ```bash
 ./backup_script.sh restore latest --dest /tmp/restore_test
+```
+
+---
+
+### System Packages & State Restore (`restore-system`)
+
+The standalone `restore-system` subcommand enables rapid recovery of your operating system configuration, package manifests, desktop settings, and scheduled tasks—either directly from an encrypted backup archive or from an existing directory.
+
+When restoring from an archive, it performs a **fast, single-pass extraction of only the system state manifest files** into an isolated staging directory, eliminating the need to download or unpack full multi-gigabyte user data archives.
+
+#### 1. Restore Directly from Backup Archive
+```bash
+# Restore system state from the latest available backup (interactive)
+./backup_script.sh restore-system latest
+
+# Non-interactive automated deployment from cloud archive
+./backup_script.sh restore-system latest --source cloud --yes
+```
+
+#### 2. Restore from an Unpacked State Directory
+If you have already restored your home directory or unpacked `~/.system_state`:
+```bash
+./backup_script.sh restore-system --dir ~/.system_state
+```
+
+#### 3. Subsystem-Targeted Restorations
+You can selectively restore specific layers of the system:
+```bash
+# Reinstall only APT/DNF system packages and import repository GPG keys
+./backup_script.sh restore-system latest --packages-only
+
+# Reinstall only Flatpak remotes and user applications
+./backup_script.sh restore-system latest --flatpaks-only
+
+# Reinstall only Python CLI tools managed by pipx
+./backup_script.sh restore-system latest --pipx-only
+
+# Reload only GNOME / desktop dconf settings
+./backup_script.sh restore-system latest --desktop-only
+
+# Re-enable saved systemd user units
+./backup_script.sh restore-system latest --systemd-only
+
+# Restore user crontab jobs
+./backup_script.sh restore-system latest --crontab-only
 ```
 
 ---
@@ -635,7 +730,17 @@ gpg --decrypt "rory_home_backup_hp_2026-09-21_005151.tar.zst.gpg" \
 
 #### Replaying Package Managers & System State
 
-After archive extraction, the root of the restored directory contains exported system manifests:
+> [!TIP]
+> If `backup_script.sh` is mirrored or installed, you can replay all package manager manifests, Flatpaks, pipx packages, desktop settings, systemd user units, and crontabs automatically with a single command:
+> ```bash
+> # Restore state directly from an archive without unpacking the entire home directory:
+> ./backup_script.sh restore-system latest
+> 
+> # Or point to an unpacked state directory:
+> ./backup_script.sh restore-system --dir /target/restore/dir/.system_state
+> ```
+
+If performing manual bare-metal recovery without `backup_script.sh`, the exported manifests located in the archive root or `.system_state/` directory can be replayed manually:
 
 - **APT (Debian / Ubuntu / Mint)**:
   ```bash
@@ -681,8 +786,10 @@ Key variables configurable in `~/.config/backup_script/config`:
 | `ZSTD_LEVEL` | `6` | Zstd compression level (1-19, or up to 22 with ultra) |
 | `ZSTD_LONG` | `27` | Long-distance matching window log (128MB window) |
 | `RUNNING_APPS_ACTION` | `close` | Policy for running apps (`close`, `prompt`, `sync`, `ignore`) |
+| `RESTART_CLOSED_APPS` | `false` | Automatically relaunch closed applications after archive creation completes (`true`/`false`) |
 | `STREAM_CLOUD_RESTORE`| `auto` | Cloud restore streaming policy (`auto`, `true`, `false`) |
 | `RESTORE_VERIFY_CHECKSUM`| `true` | Verify SHA-256 sidecar checksum before restoring |
+| `ARCHIVE_LIST_PAGER` | `${PAGER:-less -FRX}` | Preferred pager command for viewing archive file listings |
 | `GENERATE_MANIFEST` | `true` | Generate companion JSON manifest (`.manifest.json`) with metadata and inventory |
 | `GENERATE_FILE_INDEX` | `true` | Generate companion file index (`.files.gz`) for fast zero-download search & listing |
 | `ALERT_EMAIL` | `""` | Destination email address for failure alerts |
