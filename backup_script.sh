@@ -244,6 +244,15 @@ fi
 # Timeout (in seconds) to wait for applications to gracefully exit after SIGTERM (when action is 'close')
 RUNNING_APPS_SETTLE_TIMEOUT="${RUNNING_APPS_SETTLE_TIMEOUT:-10}"
 
+# Automatically relaunch applications that were gracefully closed by the consistency guard
+# after archive creation finishes. (e.g. browsers, email clients)
+# Options: true, false
+# Default: false
+RESTART_CLOSED_APPS="${RESTART_CLOSED_APPS:-false}"
+
+# Tracking array for applications closed during pre-flight consistency checks
+ACTUALLY_CLOSED_APPS=()
+
 # Configurable recipient email address to notify if backup operations fail.
 # Leave empty or unset to disable failure email alerts.
 ALERT_EMAIL="${ALERT_EMAIL:-${NOTIFICATION_EMAIL:-}}"
@@ -266,7 +275,7 @@ MAIL_COMMAND="${MAIL_COMMAND:-auto}"
 EMAIL_ALERT_SENT=0
 
 # Script version identifier
-SCRIPT_VERSION="10.1.0"
+SCRIPT_VERSION="10.2.0"
 
 # Path to this script for self-invocation
 SCRIPT_PATH="$(realpath "${BASH_SOURCE[0]}")"
@@ -290,6 +299,7 @@ CURRENT_LOCAL_TEMP_INDEX=""
 CURRENT_VERIFY_TMP_DIR=""
 CURRENT_BACKUP_TMP_DIR=""
 CURRENT_RESTORE_TMP_DIR=""
+CURRENT_SYSTEM_STATE_TMP_DIR=""
 EXPECTED_RESTORE_SHA256=""
 
 # Flag to manage log file overwriting on the first log event.
@@ -2230,6 +2240,11 @@ handle_running_applications() {
                 if [ ${#app_pids[@]} -gt 0 ]; then
                     if kill -TERM "${app_pids[@]}" 2>/dev/null; then
                         any_closed=true
+                        local already_tracked=false
+                        for ca in "${ACTUALLY_CLOSED_APPS[@]}"; do
+                            [ "$ca" = "$app" ] && already_tracked=true && break
+                        done
+                        [ "$already_tracked" = false ] && ACTUALLY_CLOSED_APPS+=("$app")
                     fi
                 fi
             done
@@ -2287,6 +2302,83 @@ handle_running_applications() {
 }
 
 #---
+#   FUNCTION:  relaunch_closed_applications()
+#  DESCRIPTION:  Relaunches GUI applications that were gracefully closed
+#                prior to archiving when RESTART_CLOSED_APPS is enabled.
+#---
+relaunch_closed_applications() {
+    if [ "${#ACTUALLY_CLOSED_APPS[@]}" -eq 0 ]; then
+        return 0
+    fi
+    local restart_enabled="${RESTART_CLOSED_APPS:-false}"
+    if [ "$restart_enabled" != true ] && [ "$restart_enabled" != "1" ]; then
+        ACTUALLY_CLOSED_APPS=()
+        return 0
+    fi
+
+    echo "Relaunching application(s) closed prior to backup..."
+    log_message "Relaunching closed applications: ${ACTUALLY_CLOSED_APPS[*]}"
+    local launched=()
+    for app in "${ACTUALLY_CLOSED_APPS[@]}"; do
+        local bin="$app"
+        case "$app" in
+            vivaldi-bin) bin="vivaldi" ;;
+            firefox-bin) bin="firefox" ;;
+            chrome)
+                if command -v google-chrome &>/dev/null; then
+                    bin="google-chrome"
+                elif command -v chrome &>/dev/null; then
+                    bin="chrome"
+                elif command -v chromium &>/dev/null; then
+                    bin="chromium"
+                fi
+                ;;
+            brave)
+                if command -v brave-browser &>/dev/null; then
+                    bin="brave-browser"
+                fi
+                ;;
+            chromium)
+                if command -v chromium &>/dev/null; then
+                    bin="chromium"
+                elif command -v chromium-browser &>/dev/null; then
+                    bin="chromium-browser"
+                fi
+                ;;
+        esac
+
+        local already_done=false
+        for done_app in "${launched[@]}"; do
+            [ "$done_app" = "$bin" ] && already_done=true && break
+        done
+        [ "$already_done" = true ] && continue
+
+        if command -v "$bin" &>/dev/null; then
+            echo "  Relaunching: $bin..."
+            if command -v gtk-launch &>/dev/null && [ -n "${DISPLAY:-${WAYLAND_DISPLAY:-}}" ] && gtk-launch "$bin" &>/dev/null; then
+                launched+=("$bin")
+                log_message "Relaunched $bin via gtk-launch."
+            elif command -v setsid &>/dev/null; then
+                setsid "$bin" </dev/null &>/dev/null &
+                launched+=("$bin")
+                log_message "Relaunched $bin via setsid."
+            elif command -v nohup &>/dev/null; then
+                nohup "$bin" </dev/null &>/dev/null &
+                launched+=("$bin")
+                log_message "Relaunched $bin via nohup."
+            else
+                "$bin" </dev/null &>/dev/null &
+                launched+=("$bin")
+                log_message "Relaunched $bin in background."
+            fi
+        else
+            log_message "WARNING: Could not find executable for '$bin' to relaunch."
+        fi
+    done
+    ACTUALLY_CLOSED_APPS=()
+}
+
+#---
 #   FUNCTION:  run_backup()
 #  DESCRIPTION:  Creates an encrypted tarball and uploads it using rclone.
 #---
@@ -2296,9 +2388,18 @@ run_backup() {
     local verify_forced_source=""
     local verify_checksum_only=false
     local cli_apps_action=""
+    ACTUALLY_CLOSED_APPS=()
 
     while [ $# -gt 0 ]; do
         case "$1" in
+            --restart-apps|-ra)
+                RESTART_CLOSED_APPS="true"
+                shift
+                ;;
+            --no-restart-apps|-nra)
+                RESTART_CLOSED_APPS="false"
+                shift
+                ;;
             --alert-email|-ae)
                 if [ -n "${2:-}" ]; then
                     ALERT_EMAIL="$2"
@@ -3180,6 +3281,9 @@ run_backup() {
         log_message "WARNING: Failed to generate SHA-256 sidecar checksum."
     fi
 
+    # Archive creation on local disk is finished; safely relaunch closed applications
+    relaunch_closed_applications
+
     # Record archive size before potential deletion / upload
     local archive_bytes=0 archive_size_hr="unknown"
     if [ -f "${FULL_ENCRYPTED_PATH}" ]; then
@@ -3717,6 +3821,1296 @@ verify_restore_checksum() {
 }
 
 #---
+#   FUNCTION:  interactive_browse_archive_files()
+#  DESCRIPTION:  Interactively searches, browses, and selects files from the
+#                companion file list index (.files.gz) for selective restore.
+#---
+interactive_browse_archive_files() {
+    local backup_choice="$1"
+    local restore_source="$2"
+    local direct_archive_file="$3"
+    local local_backup_path="$4"
+    local -n out_patterns="$5"
+
+    local local_index_file=""
+    local temp_index_download=""
+
+    # 1. Locate companion index file (.files.gz)
+    if [ -n "$direct_archive_file" ]; then
+        if [ -f "${direct_archive_file}.files.gz" ]; then
+            local_index_file="${direct_archive_file}.files.gz"
+        elif [[ "$direct_archive_file" == *.files.gz ]] && [ -f "$direct_archive_file" ]; then
+            local_index_file="$direct_archive_file"
+        elif [ -f "${SOURCE_DIR}/${backup_choice}.files.gz" ]; then
+            local_index_file="${SOURCE_DIR}/${backup_choice}.files.gz"
+        fi
+    elif [ "$restore_source" = "local" ] && [ -n "$local_backup_path" ]; then
+        if [ -f "${local_backup_path}/${backup_choice}.files.gz" ]; then
+            local_index_file="${local_backup_path}/${backup_choice}.files.gz"
+        fi
+    fi
+
+    if [ -z "$local_index_file" ]; then
+        if [ -f "${SCRATCH_DIR}/${backup_choice}.files.gz" ]; then
+            local_index_file="${SCRATCH_DIR}/${backup_choice}.files.gz"
+        elif [ -f "${SOURCE_DIR}/${backup_choice}.files.gz" ]; then
+            local_index_file="${SOURCE_DIR}/${backup_choice}.files.gz"
+        fi
+    fi
+
+    if [ -z "$local_index_file" ] && [ "$restore_source" = "cloud" ]; then
+        echo "Checking cloud storage for companion file index (${backup_choice}.files.gz)..."
+        if rclone lsf "${BACKUP_DIR}${backup_choice}.files.gz" &>/dev/null; then
+            echo "Downloading file index from cloud for fast zero-decryption browsing..."
+            temp_index_download=$(mktemp "${SCRATCH_DIR:-/tmp}/files_idx_XXXXXX.gz")
+            if rclone cat "${BACKUP_DIR}${backup_choice}.files.gz" > "$temp_index_download" 2>/dev/null && [ -s "$temp_index_download" ]; then
+                local_index_file="$temp_index_download"
+            else
+                rm -f "$temp_index_download" 2>/dev/null
+                temp_index_download=""
+            fi
+        fi
+    fi
+
+    if [ -z "$local_index_file" ] || [ ! -f "$local_index_file" ]; then
+        echo "Notice: Companion file index (.files.gz) not found for '${backup_choice}'."
+        echo "Please enter file/folder pattern manually."
+        return 1
+    fi
+
+    local selected_items=()
+
+    echo
+    echo "==============================================================================="
+    echo "  Interactive Archive File Browser: ${backup_choice}"
+    echo "==============================================================================="
+    echo "  Search and select files or folders to restore from this archive."
+    echo "  Commands:"
+    echo "    <text/pattern> : Search filenames, folders, or extensions (e.g. 'pdf', 'nvim')"
+    echo "    dirs           : List top-level directories in this archive"
+    echo "    list           : Show currently selected items for restore"
+    echo "    done           : Finish selection and proceed to restore"
+    echo "    cancel         : Cancel restore"
+    echo "==============================================================================="
+
+    while true; do
+        local prompt_str="Search query or command"
+        [ ${#selected_items[@]} -gt 0 ] && prompt_str="Search query or command (${#selected_items[@]} item(s) selected, 'done' to restore)"
+        echo
+        local user_query=""
+        read -r -e -p "${prompt_str}: " user_query
+        # Trim whitespace
+        user_query="${user_query#"${user_query%%[![:space:]]*}"}"
+        user_query="${user_query%"${user_query##*[![:space:]]}"}"
+
+        [ -z "$user_query" ] && continue
+
+        case "$user_query" in
+            done|finish|proceed|ok)
+                if [ ${#selected_items[@]} -eq 0 ]; then
+                    echo "No files or folders selected. Enter a search query to pick items, or 'cancel' to abort."
+                    continue
+                fi
+                break
+                ;;
+            cancel|quit|exit|q)
+                echo "Interactive selection cancelled."
+                [ -n "$temp_index_download" ] && rm -f "$temp_index_download" 2>/dev/null
+                return 1
+                ;;
+            list)
+                if [ ${#selected_items[@]} -eq 0 ]; then
+                    echo "No items currently selected."
+                else
+                    echo -e "\nCurrently selected items for restore (${#selected_items[@]}):"
+                    local s_idx=1
+                    for si in "${selected_items[@]}"; do
+                        echo "  [$s_idx] $si"
+                        ((s_idx++))
+                    done
+                fi
+                continue
+                ;;
+            dirs|folders)
+                echo -e "\nTop-level directories in archive:"
+                local top_dirs=()
+                mapfile -t top_dirs < <(gzip -dc "$local_index_file" 2>/dev/null \
+                    | sed -E 's/^([^[:space:]]+[[:space:]]+){5}//' \
+                    | awk -F'/' '{
+                        p = $1;
+                        if (p == "." || p == "") p = $2;
+                        if (p != "") print p;
+                    }' \
+                    | sort -u \
+                    | head -n 40)
+                if [ ${#top_dirs[@]} -gt 0 ]; then
+                    for td in "${top_dirs[@]}"; do
+                        echo "  - ${td}/"
+                    done
+                else
+                    echo "  (No top-level directories found)"
+                fi
+                continue
+                ;;
+            *)
+                # Perform search
+                local matches=()
+                mapfile -t matches < <(gzip -dc "$local_index_file" 2>/dev/null \
+                    | grep -i -E "$user_query" \
+                    | head -n 35)
+
+                if [ ${#matches[@]} -eq 0 ]; then
+                    echo "No matches found for '${user_query}'."
+                    continue
+                fi
+
+                echo -e "\nMatching items in archive (showing up to 35):"
+                local idx=1
+                local match_paths=()
+                for line in "${matches[@]}"; do
+                    local full_path
+                    full_path=$(sed -E 's/^([^[:space:]]+[[:space:]]+){5}//' <<< "$line")
+                    match_paths+=("$full_path")
+                    local perms size_str dt
+                    perms=$(awk '{print $1}' <<< "$line")
+                    size_str=$(awk '{print $3}' <<< "$line")
+                    dt=$(awk '{print $4, $5}' <<< "$line")
+                    local hr_size
+                    if [[ "$perms" == d* ]]; then
+                        hr_size="[dir]"
+                    else
+                        hr_size=$(numfmt --to=iec --suffix=B "$size_str" 2>/dev/null || echo "${size_str}B")
+                    fi
+                    printf "  [%2d] %-8s %-16s %s\n" "$idx" "$hr_size" "$dt" "$full_path"
+                    ((idx++))
+                done
+
+                echo
+                local pick_input=""
+                read -r -p "Enter number(s) to add (e.g. 1, 3-5, 'all', or press Enter to search again): " pick_input
+                [ -z "$pick_input" ] && continue
+
+                local picks_to_add=()
+                if [ "$pick_input" = "all" ]; then
+                    picks_to_add=("${match_paths[@]}")
+                else
+                    local token=""
+                    for token in ${pick_input//,/ }; do
+                        if [[ "$token" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+                            local r_start="${BASH_REMATCH[1]}"
+                            local r_end="${BASH_REMATCH[2]}"
+                            for ((i=r_start; i<=r_end; i++)); do
+                                if [ "$i" -ge 1 ] && [ "$i" -le "${#match_paths[@]}" ]; then
+                                    picks_to_add+=("${match_paths[$((i-1))]}")
+                                fi
+                            done
+                        elif [[ "$token" =~ ^[0-9]+$ ]]; then
+                            local i="$token"
+                            if [ "$i" -ge 1 ] && [ "$i" -le "${#match_paths[@]}" ]; then
+                                picks_to_add+=("${match_paths[$((i-1))]}")
+                            fi
+                        fi
+                    done
+                fi
+
+                local added_count=0
+                for item in "${picks_to_add[@]}"; do
+                    local norm_item
+                    if norm_item=$(normalize_restore_pattern "$item"); then
+                        local already_has=false
+                        for existing in "${selected_items[@]}"; do
+                            [ "$existing" = "$norm_item" ] && already_has=true && break
+                        done
+                        if [ "$already_has" = false ]; then
+                            selected_items+=("$norm_item")
+                            ((added_count++))
+                        fi
+                    fi
+                done
+
+                if [ "$added_count" -gt 0 ]; then
+                    echo "Added ${added_count} item(s) to restore list (Total selected: ${#selected_items[@]})."
+                else
+                    echo "No new items added."
+                fi
+                ;;
+        esac
+    done
+
+    [ -n "$temp_index_download" ] && rm -f "$temp_index_download" 2>/dev/null
+
+    if [ ${#selected_items[@]} -gt 0 ]; then
+        echo -e "\nFinal list of patterns for selective restore (${#selected_items[@]}):"
+        for si in "${selected_items[@]}"; do
+            echo "  - $si"
+        done
+        out_patterns=("${selected_items[@]}")
+        return 0
+    fi
+    return 1
+}
+
+#---
+#   FUNCTION:  apply_system_state()
+#  DESCRIPTION:  Applies system-level configurations, package manifests, flatpaks,
+#                desktop configuration, crontab, and systemd user services from a directory
+#                containing manifest files.
+#                Usage: apply_system_state <state_dir> [options]
+#---
+apply_system_state() {
+    local state_dir="$1"
+    shift
+    local cli_yes=false
+    local opt_packages=true
+    local opt_flatpaks=true
+    local opt_pipx=true
+    local opt_dconf=true
+    local opt_systemd=true
+    local opt_crontab=true
+    local filter_applied=false
+    local clean_manifests=false
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --yes|-y|--batch)
+                cli_yes=true
+                shift
+                ;;
+            --packages-only)
+                if [ "$filter_applied" = false ]; then
+                    opt_packages=true; opt_flatpaks=false; opt_pipx=false; opt_dconf=false; opt_systemd=false; opt_crontab=false
+                    filter_applied=true
+                else
+                    opt_packages=true
+                fi
+                shift
+                ;;
+            --flatpaks-only)
+                if [ "$filter_applied" = false ]; then
+                    opt_packages=false; opt_flatpaks=true; opt_pipx=false; opt_dconf=false; opt_systemd=false; opt_crontab=false
+                    filter_applied=true
+                else
+                    opt_flatpaks=true
+                fi
+                shift
+                ;;
+            --pipx-only)
+                if [ "$filter_applied" = false ]; then
+                    opt_packages=false; opt_flatpaks=false; opt_pipx=true; opt_dconf=false; opt_systemd=false; opt_crontab=false
+                    filter_applied=true
+                else
+                    opt_pipx=true
+                fi
+                shift
+                ;;
+            --desktop-only|--dconf-only)
+                if [ "$filter_applied" = false ]; then
+                    opt_packages=false; opt_flatpaks=false; opt_pipx=false; opt_dconf=true; opt_systemd=false; opt_crontab=false
+                    filter_applied=true
+                else
+                    opt_dconf=true
+                fi
+                shift
+                ;;
+            --systemd-only)
+                if [ "$filter_applied" = false ]; then
+                    opt_packages=false; opt_flatpaks=false; opt_pipx=false; opt_dconf=false; opt_systemd=true; opt_crontab=false
+                    filter_applied=true
+                else
+                    opt_systemd=true
+                fi
+                shift
+                ;;
+            --crontab-only)
+                if [ "$filter_applied" = false ]; then
+                    opt_packages=false; opt_flatpaks=false; opt_pipx=false; opt_dconf=false; opt_systemd=false; opt_crontab=true
+                    filter_applied=true
+                else
+                    opt_crontab=true
+                fi
+                shift
+                ;;
+            --clean-manifests)
+                clean_manifests=true
+                shift
+                ;;
+            *)
+                shift
+                ;;
+        esac
+    done
+
+    if [ ! -d "$state_dir" ]; then
+        echo "ERROR: System state directory '${state_dir}' does not exist." >&2
+        return 1
+    fi
+
+    local get_manifest_path
+    get_manifest_path() {
+        local fname="$1"
+        if [ -f "${state_dir}/${fname}" ]; then
+            echo "${state_dir}/${fname}"
+        else
+            find "${state_dir}" -maxdepth 2 -type f -name "${fname}" 2>/dev/null | head -n 1
+        fi
+    }
+
+    local apt_repos_f apt_pkgs_f dnf_repos_f dnf_pkgs_f dconf_f flatpak_remotes_f flatpak_pkgs_f pipx_f systemd_f crontab_f
+    apt_repos_f=$(get_manifest_path "${APT_REPOS_FILE}")
+    apt_pkgs_f=$(get_manifest_path "${APT_PACKAGES_FILE}")
+    dnf_repos_f=$(get_manifest_path "${DNF_REPOS_FILE}")
+    dnf_pkgs_f=$(get_manifest_path "${DNF_PACKAGES_FILE}")
+    dconf_f=$(get_manifest_path "${DCONF_SETTINGS_FILE}")
+    flatpak_remotes_f=$(get_manifest_path "${FLATPAK_REMOTES_FILE}")
+    flatpak_pkgs_f=$(get_manifest_path "${FLATPAK_PACKAGES_FILE}")
+    pipx_f=$(get_manifest_path "${PIPX_SPEC_FILE}")
+    systemd_f=$(get_manifest_path "${SYSTEMD_USER_UNITS_FILE}")
+    crontab_f=$(get_manifest_path "${CRONTAB_BACKUP_FILE}")
+
+    local total_manifests=0
+    for mf in "$apt_repos_f" "$apt_pkgs_f" "$dnf_repos_f" "$dnf_pkgs_f" "$dconf_f" "$flatpak_remotes_f" "$flatpak_pkgs_f" "$pipx_f" "$systemd_f" "$crontab_f"; do
+        [ -n "$mf" ] && [ -f "$mf" ] && ((total_manifests++))
+    done
+
+    if [ "$total_manifests" -eq 0 ]; then
+        echo "Notice: No system configuration manifests found in '${state_dir}'."
+        log_message "No system configuration manifests found in '${state_dir}'."
+        return 0
+    fi
+
+    echo -e "\n==============================================================================="
+    echo "  Applying System Configuration Manifests (${state_dir})"
+    echo "==============================================================================="
+
+    # --- Step 4: Restore APT Repository Sources and Signing Keyrings ---
+    if [ "$opt_packages" = true ] && [ -n "$apt_repos_f" ] && [ -f "$apt_repos_f" ]; then
+        if [ -s "$apt_repos_f" ]; then
+            local restore_repos_confirm=""
+            if [ "$cli_yes" = true ]; then
+                restore_repos_confirm="y"
+            elif [ -t 0 ]; then
+                read -r -p "Restore APT repository sources and signing keyrings from backup? (y/N): " restore_repos_confirm
+            fi
+            if [[ "$restore_repos_confirm" =~ ^[Yy]$ ]]; then
+                echo "Restoring APT repositories and signing keyrings..."
+                log_message "Restoring APT repositories and keyrings from ${apt_repos_f}"
+                local repos_can_sudo=false
+                if command -v sudo &> /dev/null; then
+                    if [ "$cli_yes" = true ] || [ ! -t 0 ]; then
+                        if sudo -n -v 2>/dev/null; then
+                            repos_can_sudo=true
+                        else
+                            log_message "WARNING: Sudo credentials not cached for APT repository restore in non-interactive mode. Proceeding without root privileges."
+                        fi
+                    else
+                        echo "Root privileges are required to restore APT repository sources and keyrings to /etc/apt."
+                        if sudo -v; then
+                            repos_can_sudo=true
+                        else
+                            echo "WARNING: Sudo authentication failed. Skipping APT repository restore." >&2
+                            log_message "WARNING: Sudo authentication failed for APT repository restore."
+                        fi
+                    fi
+                fi
+
+                if [ "$repos_can_sudo" = true ]; then
+                    # shellcheck disable=SC2024
+                    if sudo -n tar -xzpf "${apt_repos_f}" -C /etc/apt/ >> "$LOG_FILE" 2>&1; then
+                        log_message "APT repositories and signing keyrings restored successfully to /etc/apt/."
+                        echo "APT repositories and signing keyrings restored successfully."
+                    else
+                        log_message "WARNING: Failed to unpack APT repositories and keyrings to /etc/apt/."
+                        echo "WARNING: Failed to unpack APT repositories and keyrings to /etc/apt/." >&2
+                    fi
+                else
+                    echo "Skipping APT repository restore due to lack of sudo privileges."
+                    echo "Tip: You can manually restore them later with:"
+                    echo "  sudo tar -xzpf \"${apt_repos_f}\" -C /etc/apt/"
+                    log_message "Skipped APT repository restore (no sudo privileges)."
+                fi
+            else
+                echo "Skipping APT repositories and keyrings restore."
+                log_message "APT repositories and keyrings restore skipped by user."
+            fi
+        else
+            log_message "APT repositories backup file is empty. Skipping restore."
+        fi
+        [ "$clean_manifests" = true ] && rm -f "$apt_repos_f"
+    fi
+
+    # --- Step 4.5: Restore/Reinstall Manually Installed APT Packages ---
+    if [ "$opt_packages" = true ] && [ -n "$apt_pkgs_f" ] && [ -f "$apt_pkgs_f" ]; then
+        if [ -s "$apt_pkgs_f" ]; then
+            local apt_pkg_count
+            apt_pkg_count=$(wc -l < "$apt_pkgs_f" | tr -d '[:space:]')
+            local restore_apt_confirm=""
+            if [ "$cli_yes" = true ]; then
+                restore_apt_confirm="y"
+            elif [ -t 0 ]; then
+                read -r -p "Reinstall missing APT packages from backup (${apt_pkg_count} recorded)? (y/N): " restore_apt_confirm
+            fi
+            if [[ "$restore_apt_confirm" =~ ^[Yy]$ ]]; then
+                echo "Checking and reinstalling APT packages..."
+                log_message "Restoring APT packages from ${apt_pkgs_f} (${apt_pkg_count} packages listed)"
+                if command -v apt-get &> /dev/null; then
+                    local can_sudo=false
+                    if command -v sudo &> /dev/null; then
+                        if [ "$cli_yes" = true ] || [ ! -t 0 ]; then
+                            if sudo -n -v 2>/dev/null; then
+                                can_sudo=true
+                            else
+                                log_message "WARNING: Sudo credentials not cached for APT package install in non-interactive mode. Proceeding without root privileges."
+                            fi
+                        else
+                            echo "Root privileges are required to install APT packages."
+                            if sudo -v; then
+                                can_sudo=true
+                            else
+                                echo "WARNING: Sudo authentication failed. Skipping APT package installation." >&2
+                                log_message "WARNING: Sudo authentication failed for APT package restore."
+                            fi
+                        fi
+                    fi
+
+                    if [ "$can_sudo" = true ]; then
+                        echo "Updating package repository lists..."
+                        # shellcheck disable=SC2024
+                        sudo -n apt-get update -qq >> "$LOG_FILE" 2>&1 || true
+                        echo "Installing APT packages (this may take several minutes)..."
+                        local apt_packages_to_install=()
+                        mapfile -t apt_packages_to_install < "$apt_pkgs_f"
+                        # shellcheck disable=SC2024
+                        if sudo -n apt-get install -y --no-upgrade "${apt_packages_to_install[@]}" >> "$LOG_FILE" 2>&1; then
+                            log_message "APT packages batch installed successfully."
+                            echo "APT packages installed successfully."
+                        else
+                            log_message "Batch APT install encountered issues; attempting individual package installs."
+                            echo "Batch install encountered issues; attempting individual package installs..."
+                            local apt_success=0 apt_failed=0
+                            for pkg in "${apt_packages_to_install[@]}"; do
+                                [ -z "$pkg" ] && continue
+                                if ! dpkg -s "$pkg" &>/dev/null; then
+                                    echo "Installing APT package: $pkg..."
+                                    # shellcheck disable=SC2024
+                                    if sudo -n apt-get install -y --no-upgrade "$pkg" >> "$LOG_FILE" 2>&1; then
+                                        ((apt_success++))
+                                    else
+                                        ((apt_failed++))
+                                        log_message "WARNING: Failed to install APT package $pkg"
+                                    fi
+                                fi
+                            done
+                            log_message "Individual APT package installation completed (${apt_success} installed, ${apt_failed} failed)."
+                        fi
+                    else
+                        echo "Skipping APT installation due to lack of sudo privileges."
+                        echo "Tip: You can manually install them later with:"
+                        echo "  xargs -a \"${apt_pkgs_f}\" sudo apt-get install -y"
+                        log_message "Skipped APT package installation (no sudo privileges)."
+                    fi
+                else
+                    log_message "WARNING: apt-get command not found. Skipping APT packages restore."
+                fi
+            else
+                echo "Skipping APT packages restore."
+                log_message "APT package restore skipped by user."
+            fi
+        else
+            log_message "APT packages backup file is empty. Skipping restore."
+        fi
+        [ "$clean_manifests" = true ] && rm -f "$apt_pkgs_f"
+    fi
+
+    # --- Step 4.6: Restore DNF Repository Sources and RPM GPG Keys ---
+    if [ "$opt_packages" = true ] && [ -n "$dnf_repos_f" ] && [ -f "$dnf_repos_f" ]; then
+        if [ -s "$dnf_repos_f" ]; then
+            local restore_dnf_repos_confirm=""
+            if [ "$cli_yes" = true ]; then
+                restore_dnf_repos_confirm="y"
+            elif [ -t 0 ]; then
+                read -r -p "Restore DNF repository configurations and RPM GPG keys from backup? (y/N): " restore_dnf_repos_confirm
+            fi
+            if [[ "$restore_dnf_repos_confirm" =~ ^[Yy]$ ]]; then
+                echo "Restoring DNF repositories and RPM GPG keys..."
+                log_message "Restoring DNF repositories and RPM GPG keys from ${dnf_repos_f}"
+                local dnf_repos_can_sudo=false
+                if command -v sudo &> /dev/null; then
+                    if [ "$cli_yes" = true ] || [ ! -t 0 ]; then
+                        if sudo -n -v 2>/dev/null; then
+                            dnf_repos_can_sudo=true
+                        else
+                            log_message "WARNING: Sudo credentials not cached for DNF repository restore in non-interactive mode. Proceeding without root privileges."
+                        fi
+                    else
+                        echo "Root privileges are required to restore DNF repositories and keys to /etc/."
+                        if sudo -v; then
+                            dnf_repos_can_sudo=true
+                        else
+                            echo "WARNING: Sudo authentication failed. Skipping DNF repository restore." >&2
+                            log_message "WARNING: Sudo authentication failed for DNF repository restore."
+                        fi
+                    fi
+                fi
+
+                if [ "$dnf_repos_can_sudo" = true ]; then
+                    # shellcheck disable=SC2024
+                    if sudo -n tar -xzpf "${dnf_repos_f}" -C /etc/ >> "$LOG_FILE" 2>&1; then
+                        log_message "DNF repositories and RPM GPG keys restored successfully to /etc/."
+                        echo "DNF repositories and RPM GPG keys restored successfully."
+                    else
+                        log_message "WARNING: Failed to unpack DNF repositories and RPM GPG keys to /etc/."
+                        echo "WARNING: Failed to unpack DNF repositories and RPM GPG keys to /etc/." >&2
+                    fi
+                else
+                    echo "Skipping DNF repository restore due to lack of sudo privileges."
+                    echo "Tip: You can manually restore them later with:"
+                    echo "  sudo tar -xzpf \"${dnf_repos_f}\" -C /etc/"
+                    log_message "Skipped DNF repository restore (no sudo privileges)."
+                fi
+            else
+                echo "Skipping DNF repositories and keys restore."
+                log_message "DNF repositories and keys restore skipped by user."
+            fi
+        else
+            log_message "DNF repositories backup file is empty. Skipping restore."
+        fi
+        [ "$clean_manifests" = true ] && rm -f "$dnf_repos_f"
+    fi
+
+    # --- Step 4.7: Restore/Reinstall User-Installed DNF Packages ---
+    if [ "$opt_packages" = true ] && [ -n "$dnf_pkgs_f" ] && [ -f "$dnf_pkgs_f" ]; then
+        if [ -s "$dnf_pkgs_f" ]; then
+            local dnf_pkg_count
+            dnf_pkg_count=$(wc -l < "$dnf_pkgs_f" | tr -d '[:space:]')
+            local restore_dnf_confirm=""
+            if [ "$cli_yes" = true ]; then
+                restore_dnf_confirm="y"
+            elif [ -t 0 ]; then
+                read -r -p "Reinstall missing DNF packages from backup (${dnf_pkg_count} recorded)? (y/N): " restore_dnf_confirm
+            fi
+            if [[ "$restore_dnf_confirm" =~ ^[Yy]$ ]]; then
+                echo "Checking and reinstalling DNF packages..."
+                log_message "Restoring DNF packages from ${dnf_pkgs_f} (${dnf_pkg_count} packages listed)"
+                if command -v dnf &> /dev/null; then
+                    local dnf_can_sudo=false
+                    if command -v sudo &> /dev/null; then
+                        if [ "$cli_yes" = true ] || [ ! -t 0 ]; then
+                            if sudo -n -v 2>/dev/null; then
+                                dnf_can_sudo=true
+                            else
+                                log_message "WARNING: Sudo credentials not cached for DNF package install in non-interactive mode. Proceeding without root privileges."
+                            fi
+                        else
+                            echo "Root privileges are required to install DNF packages."
+                            if sudo -v; then
+                                dnf_can_sudo=true
+                            else
+                                echo "WARNING: Sudo authentication failed. Skipping DNF package installation." >&2
+                                log_message "WARNING: Sudo authentication failed for DNF package restore."
+                            fi
+                        fi
+                    fi
+
+                    if [ "$dnf_can_sudo" = true ]; then
+                        echo "Refreshing repository metadata cache..."
+                        # shellcheck disable=SC2024
+                        sudo -n dnf makecache >> "$LOG_FILE" 2>&1 || true
+                        echo "Installing DNF packages (this may take several minutes)..."
+                        local dnf_packages_to_install=()
+                        mapfile -t dnf_packages_to_install < "$dnf_pkgs_f"
+                        # shellcheck disable=SC2024
+                        if sudo -n dnf install -y --skip-broken "${dnf_packages_to_install[@]}" >> "$LOG_FILE" 2>&1; then
+                            log_message "DNF packages batch installed successfully."
+                            echo "DNF packages installed successfully."
+                        else
+                            log_message "Batch DNF install encountered issues; attempting individual package installs."
+                            echo "Batch install encountered issues; attempting individual package installs..."
+                            local dnf_success=0 dnf_failed=0
+                            for pkg in "${dnf_packages_to_install[@]}"; do
+                                [ -z "$pkg" ] && continue
+                                if ! rpm -q "$pkg" &>/dev/null; then
+                                    echo "Installing DNF package: $pkg..."
+                                    # shellcheck disable=SC2024
+                                    if sudo -n dnf install -y "$pkg" >> "$LOG_FILE" 2>&1; then
+                                        ((dnf_success++))
+                                    else
+                                        ((dnf_failed++))
+                                        log_message "WARNING: Failed to install DNF package $pkg"
+                                    fi
+                                fi
+                            done
+                            log_message "Individual DNF package installation completed (${dnf_success} installed, ${dnf_failed} failed)."
+                        fi
+                    else
+                        echo "Skipping DNF installation due to lack of sudo privileges."
+                        echo "Tip: You can manually install them later with:"
+                        echo "  xargs -a \"${dnf_pkgs_f}\" sudo dnf install -y --skip-broken"
+                        log_message "Skipped DNF package installation (no sudo privileges)."
+                    fi
+                else
+                    log_message "WARNING: dnf command not found. Skipping DNF packages restore."
+                fi
+            else
+                echo "Skipping DNF packages restore."
+                log_message "DNF package restore skipped by user."
+            fi
+        else
+            log_message "DNF packages backup file is empty. Skipping restore."
+        fi
+        [ "$clean_manifests" = true ] && rm -f "$dnf_pkgs_f"
+    fi
+
+    # --- Step 5: Restore Desktop (dconf) Settings ---
+    if [ "$opt_dconf" = true ] && [ -n "$dconf_f" ] && [ -f "$dconf_f" ]; then
+        if [ -s "$dconf_f" ]; then
+            local restore_dconf_confirm=""
+            if [ "$cli_yes" = true ]; then
+                restore_dconf_confirm="y"
+            elif [ -t 0 ]; then
+                read -r -p "Restore desktop (dconf) settings from backup? (y/N): " restore_dconf_confirm
+            fi
+            if [[ "$restore_dconf_confirm" =~ ^[Yy]$ ]]; then
+                echo "Restoring desktop (dconf) settings..."
+                log_message "Restoring desktop settings from ${dconf_f}"
+                if command -v dconf &> /dev/null; then
+                    if dconf load / < "$dconf_f" 2>> "$LOG_FILE"; then
+                        log_message "Desktop (dconf) settings restored successfully."
+                        echo "Desktop (dconf) settings restored successfully."
+                    else
+                        log_message "WARNING: Failed to load desktop (dconf) settings."
+                        echo "WARNING: Failed to load desktop (dconf) settings." >&2
+                    fi
+                else
+                    log_message "WARNING: dconf command not found. Skipping desktop settings restore."
+                fi
+            else
+                echo "Skipping desktop (dconf) settings restore."
+                log_message "Desktop settings restore skipped by user."
+            fi
+        else
+            log_message "Desktop (dconf) settings backup file is empty. Skipping restore."
+        fi
+        [ "$clean_manifests" = true ] && rm -f "$dconf_f"
+    fi
+
+    # --- Step 6: Restore Flatpak remotes and packages ---
+    if [ "$opt_flatpaks" = true ] && { { [ -n "$flatpak_remotes_f" ] && [ -f "$flatpak_remotes_f" ]; } || { [ -n "$flatpak_pkgs_f" ] && [ -f "$flatpak_pkgs_f" ]; }; }; then
+        local restore_flatpak_confirm=""
+        if [ "$cli_yes" = true ]; then
+            restore_flatpak_confirm="y"
+        elif [ -t 0 ]; then
+            read -r -p "Restore flatpak remotes and packages from backup? (y/N): " restore_flatpak_confirm
+        fi
+        if [[ "$restore_flatpak_confirm" =~ ^[Yy]$ ]]; then
+            echo "Restoring flatpaks..."
+            if command -v flatpak &> /dev/null; then
+                # Restore remotes if any
+                if [ -n "$flatpak_remotes_f" ] && [ -f "$flatpak_remotes_f" ]; then
+                    log_message "Restoring flatpak remotes from ${flatpak_remotes_f}"
+                    local remote_can_sudo=""
+                    while IFS=$'\t' read -r remote_name remote_url remote_options; do
+                        [ -z "$remote_name" ] || [ -z "$remote_url" ] && continue
+                        local scope_flag="--system"
+                        if [[ "$remote_options" == *"user"* ]]; then
+                            scope_flag="--user"
+                        elif [ -z "$remote_options" ]; then
+                            scope_flag="--user"
+                        fi
+                        echo "Configuring flatpak remote (${scope_flag#--}): ${remote_name}..."
+                        if ! flatpak remote-add --if-not-exists "$scope_flag" "${remote_name}" "${remote_url}" >> "$LOG_FILE" 2>&1; then
+                            if [ "$scope_flag" = "--system" ] && command -v sudo &>/dev/null; then
+                                if [ -z "$remote_can_sudo" ]; then
+                                    if [ "$cli_yes" = true ] || [ ! -t 0 ]; then
+                                        if sudo -n -v 2>/dev/null; then
+                                            remote_can_sudo=true
+                                        else
+                                            remote_can_sudo=false
+                                            log_message "WARNING: Sudo credentials not cached for system flatpak remote in non-interactive mode. Proceeding without root privileges."
+                                        fi
+                                    else
+                                        echo "Root privileges may be required to configure system flatpak remote(s)."
+                                        if sudo -v; then
+                                            remote_can_sudo=true
+                                        else
+                                            remote_can_sudo=false
+                                            echo "WARNING: Sudo authentication failed. Proceeding without root privileges." >&2
+                                            log_message "WARNING: Sudo authentication failed for system flatpak remote fallback."
+                                        fi
+                                    fi
+                                fi
+                                if [ "$remote_can_sudo" = true ]; then
+                                    sudo -n -v 2>/dev/null || true
+                                    # shellcheck disable=SC2024
+                                    if ! sudo -n flatpak remote-add --if-not-exists "$scope_flag" "${remote_name}" "${remote_url}" >> "$LOG_FILE" 2>&1; then
+                                        log_message "WARNING: Failed to configure system flatpak remote ${remote_name} with sudo."
+                                        echo "WARNING: Failed to configure system flatpak remote: ${remote_name}" >&2
+                                    fi
+                                else
+                                    log_message "WARNING: Failed to configure system flatpak remote ${remote_name} (root privileges unavailable)."
+                                fi
+                            else
+                                log_message "WARNING: Failed to configure flatpak remote ${remote_name} (${scope_flag})."
+                                echo "WARNING: Failed to configure flatpak remote: ${remote_name}" >&2
+                            fi
+                        fi
+                    done < "$flatpak_remotes_f"
+                fi
+
+                # Restore packages
+                if [ -n "$flatpak_pkgs_f" ] && [ -f "$flatpak_pkgs_f" ]; then
+                    log_message "Restoring flatpak packages from ${flatpak_pkgs_f}"
+                    local user_apps=()
+                    local system_apps=()
+
+                    while IFS=$'\t' read -r col1 _ col3 col4; do
+                        [ -z "$col1" ] && continue
+                        local app_id="$col1"
+                        local installation="system"
+                        local branch=""
+
+                        if [ -n "$col4" ]; then
+                            installation="$col3"
+                            branch="$col4"
+                        elif [ "$col3" = "user" ] || [ "$col3" = "system" ]; then
+                            installation="$col3"
+                            branch=""
+                        else
+                            installation="user"
+                            branch="$col3"
+                        fi
+
+                        local app_ref="$app_id"
+                        if [ -n "$branch" ] && [ "$branch" != "stable" ]; then
+                            app_ref="${app_id}//${branch}"
+                        fi
+
+                        if [ "$installation" = "user" ]; then
+                            user_apps+=("$app_ref")
+                        else
+                            system_apps+=("$app_ref")
+                        fi
+                    done < "$flatpak_pkgs_f"
+
+                    # Restore system flatpaks
+                    if [ ${#system_apps[@]} -gt 0 ]; then
+                        echo "Restoring ${#system_apps[@]} system flatpak(s)..."
+                        log_message "Restoring ${#system_apps[@]} system flatpaks: ${system_apps[*]}"
+                        if ! flatpak install -y --or-update --system "${system_apps[@]}" >> "$LOG_FILE" 2>&1; then
+                            log_message "Batch system flatpak install encountered issues; attempting individual installs."
+                            local can_sudo=false
+                            if command -v sudo &>/dev/null; then
+                                if [ "$cli_yes" = true ] || [ ! -t 0 ]; then
+                                    if sudo -n -v 2>/dev/null; then
+                                        can_sudo=true
+                                    else
+                                        log_message "WARNING: Sudo credentials not cached for system flatpak install in non-interactive mode. Proceeding without root privileges."
+                                    fi
+                                else
+                                    echo "Root privileges may be required to install system flatpaks."
+                                    if sudo -v; then
+                                        can_sudo=true
+                                    else
+                                        echo "WARNING: Sudo authentication failed. Proceeding without root privileges." >&2
+                                        log_message "WARNING: Sudo authentication failed for system flatpak fallback."
+                                    fi
+                                fi
+                            fi
+
+                            for app in "${system_apps[@]}"; do
+                                echo "Installing system flatpak: $app..."
+                                if ! flatpak install -y --or-update --system "$app" >> "$LOG_FILE" 2>&1; then
+                                    if [ "$can_sudo" = true ]; then
+                                        sudo -n -v 2>/dev/null || true
+                                        # shellcheck disable=SC2024
+                                        sudo -n flatpak install -y --or-update --system "$app" >> "$LOG_FILE" 2>&1 || \
+                                            log_message "WARNING: Failed to install system flatpak $app"
+                                    else
+                                        log_message "WARNING: Failed to install system flatpak $app"
+                                    fi
+                                fi
+                            done
+                        fi
+                    fi
+
+                    # Restore user flatpaks
+                    if [ ${#user_apps[@]} -gt 0 ]; then
+                        echo "Restoring ${#user_apps[@]} user flatpak(s)..."
+                        log_message "Restoring ${#user_apps[@]} user flatpaks: ${user_apps[*]}"
+                        if ! flatpak install -y --or-update --user "${user_apps[@]}" >> "$LOG_FILE" 2>&1; then
+                            log_message "Batch user flatpak install encountered issues; attempting individual installs."
+                            for app in "${user_apps[@]}"; do
+                                echo "Installing user flatpak: $app..."
+                                flatpak install -y --or-update --user "$app" >> "$LOG_FILE" 2>&1 || \
+                                    log_message "WARNING: Failed to install user flatpak $app"
+                            done
+                        fi
+                    fi
+
+                    log_message "Flatpak restore completed."
+                fi
+            else
+                log_message "WARNING: flatpak command not found. Skipping flatpak restore."
+            fi
+        else
+            echo "Skipping flatpak restore."
+            log_message "Flatpak restore skipped by user."
+        fi
+        [ "$clean_manifests" = true ] && rm -f "$flatpak_remotes_f" "$flatpak_pkgs_f"
+    fi
+
+    # --- Step 7: Restore Pipx packages ---
+    if [ "$opt_pipx" = true ] && [ -n "$pipx_f" ] && [ -f "$pipx_f" ]; then
+        local restore_pipx_confirm=""
+        if [ "$cli_yes" = true ]; then
+            restore_pipx_confirm="y"
+        elif [ -t 0 ]; then
+            read -r -p "Restore pipx packages from backup? (y/N): " restore_pipx_confirm
+        fi
+        if [[ "$restore_pipx_confirm" =~ ^[Yy]$ ]]; then
+            echo "Restoring pipx packages..."
+            log_message "Restoring pipx packages from ${pipx_f}"
+            if command -v pipx &> /dev/null; then
+                if pipx install-all "$pipx_f"; then
+                    log_message "Pipx packages restored successfully."
+                else
+                    log_message "WARNING: Failed to restore pipx packages."
+                fi
+            else
+                log_message "WARNING: pipx command not found. Skipping pipx restore."
+            fi
+        else
+            echo "Skipping pipx restore."
+            log_message "Pipx restore skipped by user."
+        fi
+        [ "$clean_manifests" = true ] && rm -f "$pipx_f"
+    fi
+
+    # --- Step 7.5: Restore/Re-enable Systemd user units ---
+    if [ "$opt_systemd" = true ] && [ -n "$systemd_f" ] && [ -f "$systemd_f" ]; then
+        if [ -s "$systemd_f" ]; then
+            local restore_systemd_confirm=""
+            if [ "$cli_yes" = true ]; then
+                restore_systemd_confirm="y"
+            elif [ -t 0 ]; then
+                read -r -p "Re-enable systemd user units from backup? (y/N): " restore_systemd_confirm
+            fi
+            if [[ "$restore_systemd_confirm" =~ ^[Yy]$ ]]; then
+                echo "Re-enabling systemd user units..."
+                log_message "Re-enabling systemd user units from ${systemd_f}"
+                if command -v systemctl &> /dev/null; then
+                    systemctl --user daemon-reload 2>/dev/null || true
+                    local unit_file _
+                    while read -r unit_file _; do
+                        [ -z "$unit_file" ] && continue
+                        echo "Enabling systemd user unit: ${unit_file}..."
+                        systemctl --user enable "$unit_file" >> "$LOG_FILE" 2>&1 || \
+                            log_message "WARNING: Failed to enable systemd user unit ${unit_file}"
+                    done < "$systemd_f"
+                    log_message "Systemd user units re-enabled."
+                else
+                    log_message "WARNING: systemctl command not found. Skipping systemd user units restore."
+                fi
+            else
+                echo "Skipping systemd user units re-enable."
+                log_message "Systemd user units restore skipped by user."
+            fi
+        else
+            log_message "Systemd user units backup file is empty. Skipping restore."
+        fi
+        [ "$clean_manifests" = true ] && rm -f "$systemd_f"
+    fi
+
+    # --- Step 7.75: Restore Crontab ---
+    if [ "$opt_crontab" = true ] && [ -n "$crontab_f" ] && [ -f "$crontab_f" ]; then
+        if [ -s "$crontab_f" ]; then
+            local restore_crontab_confirm=""
+            if [ "$cli_yes" = true ]; then
+                restore_crontab_confirm="y"
+            elif [ -t 0 ]; then
+                read -r -p "Restore crontab from backup? (y/N): " restore_crontab_confirm
+            fi
+            if [[ "$restore_crontab_confirm" =~ ^[Yy]$ ]]; then
+                echo "Restoring crontab..."
+                log_message "Restoring crontab from ${crontab_f}"
+                crontab "$crontab_f"
+                log_message "Crontab restored."
+            else
+                echo "Skipping crontab restore."
+                log_message "Crontab restore skipped by user."
+            fi
+        else
+            log_message "Crontab backup file is empty. Skipping crontab restore."
+        fi
+        [ "$clean_manifests" = true ] && rm -f "$crontab_f"
+    fi
+
+    log_message "System state configuration processing completed from ${state_dir}."
+    return 0
+}
+
+#---
+#   FUNCTION:  run_restore_system()
+#  DESCRIPTION:  Standalone restoration of system-level configurations, package lists,
+#                flatpaks, desktop configuration, crontab, and systemd services.
+#                Extracts manifests from backup archives (local or cloud) or reads
+#                directly from a directory (e.g. ~/.system_state).
+#---
+run_restore_system() {
+    local start_time=$SECONDS
+    local cli_dir=""
+    local cli_archive=""
+    local cli_source=""
+    local cli_yes=false
+    local filter_opts=()
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --dir|-d|--path)
+                if [ -n "${2:-}" ]; then
+                    cli_dir="$2"
+                    shift 2
+                else
+                    shift
+                fi
+                ;;
+            --archive|-a)
+                if [ -n "${2:-}" ]; then
+                    cli_archive="$2"
+                    shift 2
+                else
+                    shift
+                fi
+                ;;
+            --source|-s)
+                if [ -n "${2:-}" ]; then
+                    cli_source="$2"
+                    shift 2
+                else
+                    shift
+                fi
+                ;;
+            --yes|-y|--batch)
+                cli_yes=true
+                filter_opts+=("$1")
+                shift
+                ;;
+            --packages-only|--flatpaks-only|--pipx-only|--desktop-only|--dconf-only|--systemd-only|--crontab-only)
+                filter_opts+=("$1")
+                shift
+                ;;
+            help|-h|--help)
+                echo "Usage: $0 restore-system [archive|dir] [options]"
+                echo
+                echo "Restores system configurations, package lists, flatpaks, desktop"
+                echo "settings (dconf), systemd user units, and crontab from a backup."
+                echo
+                echo "Options:"
+                echo "  --dir, -d <path>                  Directory containing unpacked system state manifests"
+                echo "                                    (e.g., ~/.system_state)"
+                echo "  --archive, -a <name|path|latest>  Extract manifests from specified archive (default: latest)"
+                echo "  --source, -s <local|cloud>        Force restore source (local drive or cloud)"
+                echo "  --packages-only                   Only reinstall system packages (APT/DNF)"
+                echo "  --flatpaks-only                   Only reinstall Flatpak remotes and apps"
+                echo "  --pipx-only                       Only reinstall pipx packages"
+                echo "  --desktop-only, --dconf-only      Only reload desktop (dconf) settings"
+                echo "  --systemd-only                    Only re-enable systemd user units"
+                echo "  --crontab-only                    Only restore crontab"
+                echo "  --yes, -y, --batch                Non-interactive batch mode (auto-confirm prompts)"
+                return 0
+                ;;
+            *)
+                if [ -d "$1" ]; then
+                    cli_dir="$1"
+                elif [ -z "$cli_archive" ]; then
+                    cli_archive="$1"
+                fi
+                shift
+                ;;
+        esac
+    done
+
+    # Check for existing local system state directory
+    local default_state_dir="${SOURCE_DIR}/.system_state"
+    if [ -z "$cli_dir" ] && [ -d "$default_state_dir" ] && [ -z "$cli_archive" ]; then
+        if [ "$cli_yes" = true ]; then
+            cli_dir="$default_state_dir"
+        elif [ -t 0 ]; then
+            echo -e "\nDetected existing local system configuration directory at: ${default_state_dir}"
+            echo "1) Restore from local directory (${default_state_dir}) [Fastest]"
+            echo "2) Extract and restore from backup archive (local drive or cloud storage)"
+            local state_choice=""
+            read -r -p "Please select [1-2, default: 1]: " state_choice
+            case "${state_choice:-1}" in
+                1) cli_dir="$default_state_dir" ;;
+                *) ;;
+            esac
+        fi
+    fi
+
+    # If directory source was chosen
+    if [ -n "$cli_dir" ]; then
+        cli_dir="${cli_dir/#\~/$HOME}"
+        if [ ! -d "$cli_dir" ]; then
+            echo "ERROR: System state directory '${cli_dir}' does not exist." >&2
+            return 1
+        fi
+        log_message "Running system state restore from directory: ${cli_dir}"
+        apply_system_state "$cli_dir" "${filter_opts[@]}"
+        local rc=$?
+        local duration_str
+        duration_str=$(format_duration $(( SECONDS - start_time )))
+        echo "System restore complete in ${duration_str}."
+        log_message "System restore complete from ${cli_dir} in ${duration_str}."
+        send_notification "normal" "System Restore Complete" "System state restored in ${duration_str}." "drive-harddisk"
+        return $rc
+    fi
+
+    # Otherwise, extract from archive
+    echo "Finding backups for system state restoration..."
+    local restore_source="cloud"
+    local local_available=false
+    local local_backups=()
+    local backups=()
+    local backup_choice=""
+    local direct_archive_file=""
+    local local_backup_path
+    local_backup_path=$(get_local_backup_path 2>/dev/null || echo "")
+
+    if [ -n "$local_backup_path" ] && [ -d "${local_backup_path}" ]; then
+        mapfile -t local_backups < <(find "${local_backup_path}" -maxdepth 1 -type f \( -name "${TARBALL_BASENAME}_*.tar.zst.gpg" -o -name "${TARBALL_BASENAME}_*.tar.gz.gpg" -o -name "${TARBALL_BASENAME}_*.tar.xz.gpg" \) -printf "%f\n" 2>/dev/null | sort -r)
+        if [ ${#local_backups[@]} -gt 0 ]; then
+            local_available=true
+        fi
+    fi
+
+    local preserved_archives=()
+    mapfile -t preserved_archives < <(get_preserved_archives)
+
+    if [ -n "$cli_archive" ]; then
+        case "$cli_archive" in
+            latest)
+                if [ "$local_available" = true ] && [ "$cli_source" != "cloud" ]; then
+                    restore_source="local"
+                    backup_choice="${local_backups[0]}"
+                elif [ ${#preserved_archives[@]} -gt 0 ] && [ "$cli_source" != "cloud" ]; then
+                    restore_source="local file"
+                    direct_archive_file="${preserved_archives[0]}"
+                    backup_choice="$(basename "$direct_archive_file")"
+                else
+                    restore_source="cloud"
+                    local rclone_output
+                    rclone_output=$(rclone lsf --fast-list "${BACKUP_DIR}" 2>&1) || true
+                    mapfile -t backups < <(grep -E "${TARBALL_BASENAME}_.*\.tar\.(zst|gz|xz)\.gpg$" <<< "$rclone_output" | sort -r)
+                    if [ ${#backups[@]} -eq 0 ]; then
+                        echo "ERROR: No backups found on cloud storage." >&2
+                        return 1
+                    fi
+                    backup_choice="${backups[0]}"
+                fi
+                ;;
+            *)
+                local requested_file
+                requested_file="$(basename "$cli_archive")"
+                local direct_file=""
+                if [ -f "$cli_archive" ]; then
+                    direct_file="$cli_archive"
+                elif [[ "$cli_archive" =~ ^~(/.*)?$ ]] && [ -f "${HOME}${BASH_REMATCH[1]}" ]; then
+                    direct_file="${HOME}${BASH_REMATCH[1]}"
+                elif [ -f "${SOURCE_DIR}/${requested_file}" ]; then
+                    direct_file="${SOURCE_DIR}/${requested_file}"
+                fi
+
+                if [ -n "$direct_file" ]; then
+                    direct_archive_file=$(realpath "$direct_file" 2>/dev/null || echo "$direct_file")
+                    restore_source="local file"
+                    backup_choice="$(basename "$direct_archive_file")"
+                else
+                    local found_local=false
+                    for b in "${local_backups[@]}"; do
+                        if [ "$b" = "$requested_file" ]; then
+                            found_local=true
+                            break
+                        fi
+                    done
+                    if [ "$found_local" = true ]; then
+                        restore_source="local"
+                        backup_choice="$requested_file"
+                    else
+                        local rclone_output
+                        rclone_output=$(rclone lsf --fast-list "${BACKUP_DIR}" 2>&1) || true
+                        if grep -q -F "$requested_file" <<< "$rclone_output"; then
+                            restore_source="cloud"
+                            backup_choice="$requested_file"
+                        else
+                            echo "ERROR: Specified archive '${cli_archive}' not found locally or on cloud." >&2
+                            return 1
+                        fi
+                    fi
+                fi
+                ;;
+        esac
+    else
+        # Select archive interactively or auto-pick in batch mode
+        if [ "$cli_yes" = true ] || [ ! -t 0 ]; then
+            if [ "$local_available" = true ] && [ "$cli_source" != "cloud" ]; then
+                restore_source="local"
+                backup_choice="${local_backups[0]}"
+            elif [ ${#preserved_archives[@]} -gt 0 ] && [ "$cli_source" != "cloud" ]; then
+                restore_source="local file"
+                direct_archive_file="${preserved_archives[0]}"
+                backup_choice="$(basename "$direct_archive_file")"
+            else
+                restore_source="cloud"
+                local rclone_output
+                rclone_output=$(rclone lsf --fast-list "${BACKUP_DIR}" 2>&1) || true
+                mapfile -t backups < <(grep -E "${TARBALL_BASENAME}_.*\.tar\.(zst|gz|xz)\.gpg$" <<< "$rclone_output" | sort -r)
+                [ ${#backups[@]} -gt 0 ] && backup_choice="${backups[0]}"
+            fi
+        else
+            local source_options=()
+            [ "$local_available" = true ] && [ "$cli_source" != "cloud" ] && source_options+=("Local Drive (${local_backup_path}) [Fastest]")
+            [ ${#preserved_archives[@]} -gt 0 ] && [ "$cli_source" != "cloud" ] && source_options+=("Preserved Local Archives (${SOURCE_DIR}) [${#preserved_archives[@]} archive(s)]")
+            [ "$cli_source" != "local" ] && source_options+=("Cloud Storage (${BACKUP_DIR})")
+            source_options+=("Cancel")
+
+            if [ ${#source_options[@]} -gt 2 ]; then
+                echo -e "\nChoose restore source:"
+                local chosen_source=""
+                select chosen_source in "${source_options[@]}"; do
+                    case "$chosen_source" in
+                        "Local Drive"*) restore_source="local"; backups=("${local_backups[@]}"); break ;;
+                        "Preserved Local Archives"*) restore_source="local file"; backups=("${preserved_archives[@]}"); break ;;
+                        "Cloud Storage"*) restore_source="cloud"; break ;;
+                        "Cancel"|"") echo "Cancelled."; return 0 ;;
+                    esac
+                done
+            elif [ "$local_available" = true ] && [ "$cli_source" != "cloud" ]; then
+                restore_source="local"
+                backups=("${local_backups[@]}")
+            elif [ ${#preserved_archives[@]} -gt 0 ] && [ "$cli_source" != "cloud" ]; then
+                restore_source="local file"
+                backups=("${preserved_archives[@]}")
+            else
+                restore_source="cloud"
+            fi
+
+            if [ "$restore_source" = "cloud" ] && [ ${#backups[@]} -eq 0 ]; then
+                echo "Querying cloud storage for backups..."
+                local rclone_output
+                rclone_output=$(rclone lsf --fast-list "${BACKUP_DIR}" 2>&1) || true
+                mapfile -t backups < <(grep -E "${TARBALL_BASENAME}_.*\.tar\.(zst|gz|xz)\.gpg$" <<< "$rclone_output" | sort -r)
+            fi
+
+            if [ ${#backups[@]} -eq 0 ]; then
+                echo "ERROR: No backups found to restore." >&2
+                return 1
+            fi
+
+            echo -e "\nPlease choose a backup archive:"
+            select backup_choice in "${backups[@]}" "Cancel"; do
+                if [ "$backup_choice" = "Cancel" ] || [ -z "$backup_choice" ]; then
+                    echo "Cancelled."; return 0
+                fi
+                if [ "$restore_source" = "local file" ]; then
+                    direct_archive_file="$backup_choice"
+                    backup_choice="$(basename "$backup_choice")"
+                fi
+                break
+            done
+        fi
+    fi
+
+    if [ -z "$backup_choice" ]; then
+        echo "ERROR: No backup archive selected." >&2
+        return 1
+    fi
+
+    local archive_enc_type="symmetric"
+    if [ -n "$direct_archive_file" ]; then
+        archive_enc_type=$(detect_archive_encryption "file" "$direct_archive_file")
+    elif [ "$restore_source" = "local" ]; then
+        archive_enc_type=$(detect_archive_encryption "file" "${local_backup_path}/${backup_choice}")
+    else
+        archive_enc_type=$(detect_archive_encryption "cloud" "$backup_choice")
+    fi
+
+    if [ "$archive_enc_type" != "asymmetric" ] && [ -z "$ENCRYPTION_PASSWORD" ]; then
+        if ! get_encryption_password "restore"; then
+            echo "ERROR: Decryption password required." >&2
+            return 1
+        fi
+    fi
+
+    local staging_tmp
+    staging_tmp=$(mktemp -d "${SCRATCH_DIR:-/tmp}/sys_state_XXXXXX")
+    CURRENT_SYSTEM_STATE_TMP_DIR="$staging_tmp"
+    chmod 700 "$staging_tmp"
+
+    local manifest_patterns=(
+        "${APT_REPOS_FILE}" "${APT_PACKAGES_FILE}"
+        "${DNF_REPOS_FILE}" "${DNF_PACKAGES_FILE}"
+        "${DCONF_SETTINGS_FILE}"
+        "${FLATPAK_REMOTES_FILE}" "${FLATPAK_PACKAGES_FILE}"
+        "${PIPX_SPEC_FILE}"
+        "${SYSTEMD_USER_UNITS_FILE}"
+        "${CRONTAB_BACKUP_FILE}"
+        "./${APT_REPOS_FILE}" "./${APT_PACKAGES_FILE}"
+        "./${DNF_REPOS_FILE}" "./${DNF_PACKAGES_FILE}"
+        "./${DCONF_SETTINGS_FILE}"
+        "./${FLATPAK_REMOTES_FILE}" "./${FLATPAK_PACKAGES_FILE}"
+        "./${PIPX_SPEC_FILE}"
+        "./${SYSTEMD_USER_UNITS_FILE}"
+        "./${CRONTAB_BACKUP_FILE}"
+    )
+
+    echo "Extracting system configuration manifests from ${backup_choice} (${restore_source})..."
+    log_message "Extracting system configuration manifests from ${backup_choice} into ${staging_tmp}"
+
+    local tar_comp_opt="--zstd"
+    if [[ "$backup_choice" == *.tar.gz.gpg ]]; then
+        tar_comp_opt="--gzip"
+    elif [[ "$backup_choice" == *.tar.xz.gpg ]]; then
+        tar_comp_opt="--xz"
+    fi
+
+    if [ -n "$direct_archive_file" ] || [ "$restore_source" = "local" ]; then
+        local src_file="${direct_archive_file:-${local_backup_path}/${backup_choice}}"
+        if [ "$archive_enc_type" = "asymmetric" ] && [ -z "$ENCRYPTION_PASSWORD" ]; then
+            gpg --batch --yes --no-tty --decrypt "$src_file" 2>/dev/null \
+                | tar --wildcards --ignore-failed-read "$tar_comp_opt" -xpf - -C "$staging_tmp" "${manifest_patterns[@]}" 2>/dev/null || true
+        else
+            gpg --batch --yes --no-tty --pinentry-mode loopback --decrypt --passphrase-fd 3 "$src_file" 3<<< "$ENCRYPTION_PASSWORD" 2>/dev/null \
+                | tar --wildcards --ignore-failed-read "$tar_comp_opt" -xpf - -C "$staging_tmp" "${manifest_patterns[@]}" 2>/dev/null || true
+        fi
+    else
+        # Cloud streaming
+        echo "Streaming manifest files from cloud..."
+        if [ "$archive_enc_type" = "asymmetric" ] && [ -z "$ENCRYPTION_PASSWORD" ]; then
+            rclone cat "${BACKUP_DIR}${backup_choice}" 2>/dev/null \
+                | gpg --batch --yes --no-tty --decrypt 2>/dev/null \
+                | tar --wildcards --ignore-failed-read "$tar_comp_opt" -xpf - -C "$staging_tmp" "${manifest_patterns[@]}" 2>/dev/null || true
+        else
+            rclone cat "${BACKUP_DIR}${backup_choice}" 2>/dev/null \
+                | gpg --batch --yes --no-tty --pinentry-mode loopback --decrypt --passphrase-fd 3 3<<< "$ENCRYPTION_PASSWORD" 2>/dev/null \
+                | tar --wildcards --ignore-failed-read "$tar_comp_opt" -xpf - -C "$staging_tmp" "${manifest_patterns[@]}" 2>/dev/null || true
+        fi
+    fi
+
+    apply_system_state "$staging_tmp" "${filter_opts[@]}"
+    local rc=$?
+
+    rm -rf "$staging_tmp" 2>/dev/null
+    CURRENT_SYSTEM_STATE_TMP_DIR=""
+
+    local duration_str
+    duration_str=$(format_duration $(( SECONDS - start_time )))
+    echo "System restore complete in ${duration_str}."
+    log_message "System restore complete in ${duration_str}."
+    send_notification "normal" "System Restore Complete" "System state restored in ${duration_str}." "drive-harddisk"
+    return $rc
+}
+
+#---
 #   FUNCTION:  run_restore()
 #  DESCRIPTION:  Interactively or via CLI arguments lets user choose a backup to
 #                restore and decrypts it. Supports full home directory restore or
@@ -3731,9 +5125,14 @@ run_restore() {
     local cli_yes=false
     local cli_verify_checksum=""
     local cli_stream=""
+    local cli_interactive_select=false
 
     while [ $# -gt 0 ]; do
         case "$1" in
+            --interactive|-i|--browse)
+                cli_interactive_select=true
+                shift
+                ;;
             --yes|-y|--batch)
                 cli_yes=true
                 shift
@@ -3790,6 +5189,7 @@ run_restore() {
                 echo "Usage: $0 restore [archive|path] [options] [patterns...]"
                 echo
                 echo "Options:"
+                echo "  --interactive, -i, --browse       Search and select files interactively from archive index"
                 echo "  --path, -p, --pattern <pattern>   Specific file, folder, or wildcard pattern to restore"
                 echo "                                    (can be specified multiple times)"
                 echo "  --dest, -d, --target <dir>        Destination directory (default: ${SOURCE_DIR})"
@@ -4100,6 +5500,11 @@ run_restore() {
                 restore_patterns+=("$norm_pat")
             fi
         done
+    elif [ "$cli_interactive_select" = true ]; then
+        if ! interactive_browse_archive_files "$backup_choice" "$restore_source" "$direct_archive_file" "$local_backup_path" restore_patterns; then
+            echo "Interactive file selection cancelled or no items selected."
+            return 0
+        fi
     elif [ "$cli_yes" = true ]; then
         # In non-interactive batch mode without specified patterns, perform full restore
         :
@@ -4111,34 +5516,46 @@ run_restore() {
         read -r -p "Please select [1-2, default: 1]: " scope_choice
         case "$scope_choice" in
             2)
-                echo -e "\nEnter path(s) or wildcard pattern(s) to restore."
-                echo "Examples:"
-                echo "  - Specific file:        Documents/tax_2025.pdf"
-                echo "  - Specific directory:   .config/nvim"
-                echo "  - Directory contents:   .config/nvim/*"
-                echo "  - Global wildcard:      *.pdf or *tax_2025*"
-                echo "Note: Multiple patterns may be separated by commas."
-                local user_patterns_raw=""
-                read -r -e -p "Pattern(s) to restore: " user_patterns_raw
-                if [ -n "$user_patterns_raw" ]; then
-                    if [[ "$user_patterns_raw" == *","* ]]; then
-                        local raw_item=""
-                        while IFS= read -r raw_item; do
-                            [ -z "$raw_item" ] && continue
+                local sel_method="1"
+                echo -e "\nChoose selective restore method:"
+                echo "1) Search and browse files from archive index [Recommended]"
+                echo "2) Enter path or wildcard pattern manually"
+                read -r -p "Please select [1-2, default: 1]: " sel_method
+                if [ "${sel_method:-1}" = "1" ]; then
+                    if ! interactive_browse_archive_files "$backup_choice" "$restore_source" "$direct_archive_file" "$local_backup_path" restore_patterns; then
+                        echo "Interactive selection cancelled or no patterns selected."
+                        return 0
+                    fi
+                else
+                    echo -e "\nEnter path(s) or wildcard pattern(s) to restore."
+                    echo "Examples:"
+                    echo "  - Specific file:        Documents/tax_2025.pdf"
+                    echo "  - Specific directory:   .config/nvim"
+                    echo "  - Directory contents:   .config/nvim/*"
+                    echo "  - Global wildcard:      *.pdf or *tax_2025*"
+                    echo "Note: Multiple patterns may be separated by commas."
+                    local user_patterns_raw=""
+                    read -r -e -p "Pattern(s) to restore: " user_patterns_raw
+                    if [ -n "$user_patterns_raw" ]; then
+                        if [[ "$user_patterns_raw" == *","* ]]; then
+                            local raw_item=""
+                            while IFS= read -r raw_item; do
+                                [ -z "$raw_item" ] && continue
+                                local norm_pat
+                                if norm_pat=$(normalize_restore_pattern "$raw_item"); then
+                                    restore_patterns+=("$norm_pat")
+                                fi
+                            done < <(tr ',' '\n' <<< "$user_patterns_raw")
+                        else
                             local norm_pat
-                            if norm_pat=$(normalize_restore_pattern "$raw_item"); then
+                            if norm_pat=$(normalize_restore_pattern "$user_patterns_raw"); then
                                 restore_patterns+=("$norm_pat")
                             fi
-                        done < <(tr ',' '\n' <<< "$user_patterns_raw")
-                    else
-                        local norm_pat
-                        if norm_pat=$(normalize_restore_pattern "$user_patterns_raw"); then
-                            restore_patterns+=("$norm_pat")
                         fi
                     fi
-                fi
-                if [ ${#restore_patterns[@]} -eq 0 ]; then
-                    echo "No valid pattern entered. Defaulting to full restore."
+                    if [ ${#restore_patterns[@]} -eq 0 ]; then
+                        echo "No valid pattern entered. Defaulting to full restore."
+                    fi
                 fi
                 ;;
             *)
@@ -4715,567 +6132,7 @@ run_restore() {
         log_message "Selective restore complete for pattern(s) '${restore_patterns[*]}' into ${restore_target} in ${duration_str}."
         send_notification "normal" "Restore Complete" "Selective restore completed for ${restore_target} in ${duration_str}." "drive-harddisk"
     elif [ "$restore_target" = "$SOURCE_DIR" ]; then
-        # --- Step 4: Restore APT Repository Sources and Signing Keyrings ---
-        if [ -f "${SOURCE_DIR}/${APT_REPOS_FILE}" ]; then
-            if [ -s "${SOURCE_DIR}/${APT_REPOS_FILE}" ]; then
-                local restore_repos_confirm=""
-                if [ "$cli_yes" = true ]; then
-                    restore_repos_confirm="y"
-                elif [ -t 0 ]; then
-                    read -r -p "Restore APT repository sources and signing keyrings from backup? (y/N): " restore_repos_confirm
-                fi
-                if [[ "$restore_repos_confirm" =~ ^[Yy]$ ]]; then
-                    echo "Restoring APT repositories and signing keyrings..."
-                    log_message "Restoring APT repositories and keyrings from ${SOURCE_DIR}/${APT_REPOS_FILE}"
-                    local repos_can_sudo=false
-                    if command -v sudo &> /dev/null; then
-                        if [ "$cli_yes" = true ] || [ ! -t 0 ]; then
-                            if sudo -n -v 2>/dev/null; then
-                                repos_can_sudo=true
-                            else
-                                log_message "WARNING: Sudo credentials not cached for APT repository restore in non-interactive mode. Proceeding without root privileges."
-                            fi
-                        else
-                            echo "Root privileges are required to restore APT repository sources and keyrings to /etc/apt."
-                            if sudo -v; then
-                                repos_can_sudo=true
-                            else
-                                echo "WARNING: Sudo authentication failed. Skipping APT repository restore." >&2
-                                log_message "WARNING: Sudo authentication failed for APT repository restore."
-                            fi
-                        fi
-                    fi
-
-                    if [ "$repos_can_sudo" = true ]; then
-                        # shellcheck disable=SC2024
-                        if sudo -n tar -xzpf "${SOURCE_DIR}/${APT_REPOS_FILE}" -C /etc/apt/ >> "$LOG_FILE" 2>&1; then
-                            log_message "APT repositories and signing keyrings restored successfully to /etc/apt/."
-                            echo "APT repositories and signing keyrings restored successfully."
-                        else
-                            log_message "WARNING: Failed to unpack APT repositories and keyrings to /etc/apt/."
-                            echo "WARNING: Failed to unpack APT repositories and keyrings to /etc/apt/." >&2
-                        fi
-                    else
-                        echo "Skipping APT repository restore due to lack of sudo privileges."
-                        echo "Tip: You can manually restore them later with:"
-                        echo "  sudo tar -xzpf \"${SOURCE_DIR}/${APT_REPOS_FILE}\" -C /etc/apt/"
-                        log_message "Skipped APT repository restore (no sudo privileges)."
-                    fi
-                else
-                    echo "Skipping APT repositories and keyrings restore."
-                    log_message "APT repositories and keyrings restore skipped by user."
-                fi
-            else
-                log_message "APT repositories backup file is empty. Skipping restore."
-            fi
-            rm -f "${SOURCE_DIR}/${APT_REPOS_FILE}"
-        fi
-
-        # --- Step 4.5: Restore/Reinstall Manually Installed APT Packages ---
-        if [ -f "${SOURCE_DIR}/${APT_PACKAGES_FILE}" ]; then
-            if [ -s "${SOURCE_DIR}/${APT_PACKAGES_FILE}" ]; then
-                local apt_pkg_count
-                apt_pkg_count=$(wc -l < "${SOURCE_DIR}/${APT_PACKAGES_FILE}" | tr -d '[:space:]')
-                local restore_apt_confirm=""
-                if [ "$cli_yes" = true ]; then
-                    restore_apt_confirm="y"
-                elif [ -t 0 ]; then
-                    read -r -p "Reinstall missing APT packages from backup (${apt_pkg_count} recorded)? (y/N): " restore_apt_confirm
-                fi
-                if [[ "$restore_apt_confirm" =~ ^[Yy]$ ]]; then
-                    echo "Checking and reinstalling APT packages..."
-                    log_message "Restoring APT packages from ${SOURCE_DIR}/${APT_PACKAGES_FILE} (${apt_pkg_count} packages listed)"
-                    if command -v apt-get &> /dev/null; then
-                        local can_sudo=false
-                        if command -v sudo &> /dev/null; then
-                            if [ "$cli_yes" = true ] || [ ! -t 0 ]; then
-                                if sudo -n -v 2>/dev/null; then
-                                    can_sudo=true
-                                else
-                                    log_message "WARNING: Sudo credentials not cached for APT package install in non-interactive mode. Proceeding without root privileges."
-                                fi
-                            else
-                                echo "Root privileges are required to install APT packages."
-                                if sudo -v; then
-                                    can_sudo=true
-                                else
-                                    echo "WARNING: Sudo authentication failed. Skipping APT package installation." >&2
-                                    log_message "WARNING: Sudo authentication failed for APT package restore."
-                                fi
-                            fi
-                        fi
-
-                        if [ "$can_sudo" = true ]; then
-                            echo "Updating package repository lists..."
-                            # shellcheck disable=SC2024
-                            sudo -n apt-get update -qq >> "$LOG_FILE" 2>&1 || true
-                            echo "Installing APT packages (this may take several minutes)..."
-                            mapfile -t apt_packages_to_install < "${SOURCE_DIR}/${APT_PACKAGES_FILE}"
-                            # shellcheck disable=SC2024
-                            if sudo -n apt-get install -y --no-upgrade "${apt_packages_to_install[@]}" >> "$LOG_FILE" 2>&1; then
-                                log_message "APT packages batch installed successfully."
-                                echo "APT packages installed successfully."
-                            else
-                                log_message "Batch APT install encountered issues; attempting individual package installs."
-                                echo "Batch install encountered issues; attempting individual package installs..."
-                                local apt_success=0 apt_failed=0
-                                for pkg in "${apt_packages_to_install[@]}"; do
-                                    [ -z "$pkg" ] && continue
-                                    if ! dpkg -s "$pkg" &>/dev/null; then
-                                        echo "Installing APT package: $pkg..."
-                                        # shellcheck disable=SC2024
-                                        if sudo -n apt-get install -y --no-upgrade "$pkg" >> "$LOG_FILE" 2>&1; then
-                                            ((apt_success++))
-                                        else
-                                            ((apt_failed++))
-                                            log_message "WARNING: Failed to install APT package $pkg"
-                                        fi
-                                    fi
-                                done
-                                log_message "Individual APT package installation completed (${apt_success} installed, ${apt_failed} failed)."
-                            fi
-                        else
-                            echo "Skipping APT installation due to lack of sudo privileges."
-                            echo "Tip: You can manually install them later with:"
-                            echo "  xargs -a \"${SOURCE_DIR}/${APT_PACKAGES_FILE}\" sudo apt-get install -y"
-                            log_message "Skipped APT package installation (no sudo privileges)."
-                        fi
-                    else
-                        log_message "WARNING: apt-get command not found. Skipping APT packages restore."
-                    fi
-                else
-                    echo "Skipping APT packages restore."
-                    log_message "APT package restore skipped by user."
-                fi
-            else
-                log_message "APT packages backup file is empty. Skipping restore."
-            fi
-            rm -f "${SOURCE_DIR}/${APT_PACKAGES_FILE}"
-        fi
-
-        # --- Step 4.6: Restore DNF Repository Sources and RPM GPG Keys ---
-        if [ -f "${SOURCE_DIR}/${DNF_REPOS_FILE}" ]; then
-            if [ -s "${SOURCE_DIR}/${DNF_REPOS_FILE}" ]; then
-                local restore_dnf_repos_confirm=""
-                if [ "$cli_yes" = true ]; then
-                    restore_dnf_repos_confirm="y"
-                elif [ -t 0 ]; then
-                    read -r -p "Restore DNF repository configurations and RPM GPG keys from backup? (y/N): " restore_dnf_repos_confirm
-                fi
-                if [[ "$restore_dnf_repos_confirm" =~ ^[Yy]$ ]]; then
-                    echo "Restoring DNF repositories and RPM GPG keys..."
-                    log_message "Restoring DNF repositories and RPM GPG keys from ${SOURCE_DIR}/${DNF_REPOS_FILE}"
-                    local dnf_repos_can_sudo=false
-                    if command -v sudo &> /dev/null; then
-                        if [ "$cli_yes" = true ] || [ ! -t 0 ]; then
-                            if sudo -n -v 2>/dev/null; then
-                                dnf_repos_can_sudo=true
-                            else
-                                log_message "WARNING: Sudo credentials not cached for DNF repository restore in non-interactive mode. Proceeding without root privileges."
-                            fi
-                        else
-                            echo "Root privileges are required to restore DNF repositories and keys to /etc/."
-                            if sudo -v; then
-                                dnf_repos_can_sudo=true
-                            else
-                                echo "WARNING: Sudo authentication failed. Skipping DNF repository restore." >&2
-                                log_message "WARNING: Sudo authentication failed for DNF repository restore."
-                            fi
-                        fi
-                    fi
-
-                    if [ "$dnf_repos_can_sudo" = true ]; then
-                        # shellcheck disable=SC2024
-                        if sudo -n tar -xzpf "${SOURCE_DIR}/${DNF_REPOS_FILE}" -C /etc/ >> "$LOG_FILE" 2>&1; then
-                            log_message "DNF repositories and RPM GPG keys restored successfully to /etc/."
-                            echo "DNF repositories and RPM GPG keys restored successfully."
-                        else
-                            log_message "WARNING: Failed to unpack DNF repositories and RPM GPG keys to /etc/."
-                            echo "WARNING: Failed to unpack DNF repositories and RPM GPG keys to /etc/." >&2
-                        fi
-                    else
-                        echo "Skipping DNF repository restore due to lack of sudo privileges."
-                        echo "Tip: You can manually restore them later with:"
-                        echo "  sudo tar -xzpf \"${SOURCE_DIR}/${DNF_REPOS_FILE}\" -C /etc/"
-                        log_message "Skipped DNF repository restore (no sudo privileges)."
-                    fi
-                else
-                    echo "Skipping DNF repositories and keys restore."
-                    log_message "DNF repositories and keys restore skipped by user."
-                fi
-            else
-                log_message "DNF repositories backup file is empty. Skipping restore."
-            fi
-            rm -f "${SOURCE_DIR}/${DNF_REPOS_FILE}"
-        fi
-
-        # --- Step 4.7: Restore/Reinstall User-Installed DNF Packages ---
-        if [ -f "${SOURCE_DIR}/${DNF_PACKAGES_FILE}" ]; then
-            if [ -s "${SOURCE_DIR}/${DNF_PACKAGES_FILE}" ]; then
-                local dnf_pkg_count
-                dnf_pkg_count=$(wc -l < "${SOURCE_DIR}/${DNF_PACKAGES_FILE}" | tr -d '[:space:]')
-                local restore_dnf_confirm=""
-                if [ "$cli_yes" = true ]; then
-                    restore_dnf_confirm="y"
-                elif [ -t 0 ]; then
-                    read -r -p "Reinstall missing DNF packages from backup (${dnf_pkg_count} recorded)? (y/N): " restore_dnf_confirm
-                fi
-                if [[ "$restore_dnf_confirm" =~ ^[Yy]$ ]]; then
-                    echo "Checking and reinstalling DNF packages..."
-                    log_message "Restoring DNF packages from ${SOURCE_DIR}/${DNF_PACKAGES_FILE} (${dnf_pkg_count} packages listed)"
-                    if command -v dnf &> /dev/null; then
-                        local dnf_can_sudo=false
-                        if command -v sudo &> /dev/null; then
-                            if [ "$cli_yes" = true ] || [ ! -t 0 ]; then
-                                if sudo -n -v 2>/dev/null; then
-                                    dnf_can_sudo=true
-                                else
-                                    log_message "WARNING: Sudo credentials not cached for DNF package install in non-interactive mode. Proceeding without root privileges."
-                                fi
-                            else
-                                echo "Root privileges are required to install DNF packages."
-                                if sudo -v; then
-                                    dnf_can_sudo=true
-                                else
-                                    echo "WARNING: Sudo authentication failed. Skipping DNF package installation." >&2
-                                    log_message "WARNING: Sudo authentication failed for DNF package restore."
-                                fi
-                            fi
-                        fi
-
-                        if [ "$dnf_can_sudo" = true ]; then
-                            echo "Refreshing repository metadata cache..."
-                            # shellcheck disable=SC2024
-                            sudo -n dnf makecache >> "$LOG_FILE" 2>&1 || true
-                            echo "Installing DNF packages (this may take several minutes)..."
-                            mapfile -t dnf_packages_to_install < "${SOURCE_DIR}/${DNF_PACKAGES_FILE}"
-                            # shellcheck disable=SC2024
-                            if sudo -n dnf install -y --skip-broken "${dnf_packages_to_install[@]}" >> "$LOG_FILE" 2>&1; then
-                                log_message "DNF packages batch installed successfully."
-                                echo "DNF packages installed successfully."
-                            else
-                                log_message "Batch DNF install encountered issues; attempting individual package installs."
-                                echo "Batch install encountered issues; attempting individual package installs..."
-                                local dnf_success=0 dnf_failed=0
-                                for pkg in "${dnf_packages_to_install[@]}"; do
-                                    [ -z "$pkg" ] && continue
-                                    if ! rpm -q "$pkg" &>/dev/null; then
-                                        echo "Installing DNF package: $pkg..."
-                                        # shellcheck disable=SC2024
-                                        if sudo -n dnf install -y "$pkg" >> "$LOG_FILE" 2>&1; then
-                                            ((dnf_success++))
-                                        else
-                                            ((dnf_failed++))
-                                            log_message "WARNING: Failed to install DNF package $pkg"
-                                        fi
-                                    fi
-                                done
-                                log_message "Individual DNF package installation completed (${dnf_success} installed, ${dnf_failed} failed)."
-                            fi
-                        else
-                            echo "Skipping DNF installation due to lack of sudo privileges."
-                            echo "Tip: You can manually install them later with:"
-                            echo "  xargs -a \"${SOURCE_DIR}/${DNF_PACKAGES_FILE}\" sudo dnf install -y --skip-broken"
-                            log_message "Skipped DNF package installation (no sudo privileges)."
-                        fi
-                    else
-                        log_message "WARNING: dnf command not found. Skipping DNF packages restore."
-                    fi
-                else
-                    echo "Skipping DNF packages restore."
-                    log_message "DNF package restore skipped by user."
-                fi
-            else
-                log_message "DNF packages backup file is empty. Skipping restore."
-            fi
-            rm -f "${SOURCE_DIR}/${DNF_PACKAGES_FILE}"
-        fi
-
-        # --- Step 5: Restore Desktop (dconf) Settings ---
-        if [ -f "${SOURCE_DIR}/${DCONF_SETTINGS_FILE}" ]; then
-            if [ -s "${SOURCE_DIR}/${DCONF_SETTINGS_FILE}" ]; then
-                local restore_dconf_confirm=""
-                if [ "$cli_yes" = true ]; then
-                    restore_dconf_confirm="y"
-                elif [ -t 0 ]; then
-                    read -r -p "Restore desktop (dconf) settings from backup? (y/N): " restore_dconf_confirm
-                fi
-                if [[ "$restore_dconf_confirm" =~ ^[Yy]$ ]]; then
-                    echo "Restoring desktop (dconf) settings..."
-                    log_message "Restoring desktop settings from ${SOURCE_DIR}/${DCONF_SETTINGS_FILE}"
-                    if command -v dconf &> /dev/null; then
-                        if dconf load / < "${SOURCE_DIR}/${DCONF_SETTINGS_FILE}" 2>> "$LOG_FILE"; then
-                            log_message "Desktop (dconf) settings restored successfully."
-                            echo "Desktop (dconf) settings restored successfully."
-                        else
-                            log_message "WARNING: Failed to load desktop (dconf) settings."
-                            echo "WARNING: Failed to load desktop (dconf) settings." >&2
-                        fi
-                    else
-                        log_message "WARNING: dconf command not found. Skipping desktop settings restore."
-                    fi
-                else
-                    echo "Skipping desktop (dconf) settings restore."
-                    log_message "Desktop settings restore skipped by user."
-                fi
-            else
-                log_message "Desktop (dconf) settings backup file is empty. Skipping restore."
-            fi
-            rm -f "${SOURCE_DIR}/${DCONF_SETTINGS_FILE}"
-        fi
-
-        # --- Step 6: Restore Flatpak remotes and packages ---
-        if [ -f "${SOURCE_DIR}/${FLATPAK_REMOTES_FILE}" ] || [ -f "${SOURCE_DIR}/${FLATPAK_PACKAGES_FILE}" ]; then
-            local restore_flatpak_confirm=""
-            if [ "$cli_yes" = true ]; then
-                restore_flatpak_confirm="y"
-            elif [ -t 0 ]; then
-                read -r -p "Restore flatpak remotes and packages from backup? (y/N): " restore_flatpak_confirm
-            fi
-            if [[ "$restore_flatpak_confirm" =~ ^[Yy]$ ]]; then
-                echo "Restoring flatpaks..."
-                if command -v flatpak &> /dev/null; then
-                    # Restore remotes if any
-                    if [ -f "${SOURCE_DIR}/${FLATPAK_REMOTES_FILE}" ]; then
-                        log_message "Restoring flatpak remotes from ${SOURCE_DIR}/${FLATPAK_REMOTES_FILE}"
-                        local remote_can_sudo=""
-                        while IFS=$'\t' read -r remote_name remote_url remote_options; do
-                            [ -z "$remote_name" ] || [ -z "$remote_url" ] && continue
-                            local scope_flag="--system"
-                            if [[ "$remote_options" == *"user"* ]]; then
-                                scope_flag="--user"
-                            elif [ -z "$remote_options" ]; then
-                                scope_flag="--user"
-                            fi
-                            echo "Configuring flatpak remote (${scope_flag#--}): ${remote_name}..."
-                            if ! flatpak remote-add --if-not-exists "$scope_flag" "${remote_name}" "${remote_url}" >> "$LOG_FILE" 2>&1; then
-                                if [ "$scope_flag" = "--system" ] && command -v sudo &>/dev/null; then
-                                    if [ -z "$remote_can_sudo" ]; then
-                                        if [ "$cli_yes" = true ] || [ ! -t 0 ]; then
-                                            if sudo -n -v 2>/dev/null; then
-                                                remote_can_sudo=true
-                                            else
-                                                remote_can_sudo=false
-                                                log_message "WARNING: Sudo credentials not cached for system flatpak remote in non-interactive mode. Proceeding without root privileges."
-                                            fi
-                                        else
-                                            echo "Root privileges may be required to configure system flatpak remote(s)."
-                                            if sudo -v; then
-                                                remote_can_sudo=true
-                                            else
-                                                remote_can_sudo=false
-                                                echo "WARNING: Sudo authentication failed. Proceeding without root privileges." >&2
-                                                log_message "WARNING: Sudo authentication failed for system flatpak remote fallback."
-                                            fi
-                                        fi
-                                    fi
-                                    if [ "$remote_can_sudo" = true ]; then
-                                        sudo -n -v 2>/dev/null || true
-                                        # shellcheck disable=SC2024
-                                        if ! sudo -n flatpak remote-add --if-not-exists "$scope_flag" "${remote_name}" "${remote_url}" >> "$LOG_FILE" 2>&1; then
-                                            log_message "WARNING: Failed to configure system flatpak remote ${remote_name} with sudo."
-                                            echo "WARNING: Failed to configure system flatpak remote: ${remote_name}" >&2
-                                        fi
-                                    else
-                                        log_message "WARNING: Failed to configure system flatpak remote ${remote_name} (root privileges unavailable)."
-                                    fi
-                                else
-                                    log_message "WARNING: Failed to configure flatpak remote ${remote_name} (${scope_flag})."
-                                    echo "WARNING: Failed to configure flatpak remote: ${remote_name}" >&2
-                                fi
-                            fi
-                        done < "${SOURCE_DIR}/${FLATPAK_REMOTES_FILE}"
-                    fi
-
-                    # Restore packages
-                    if [ -f "${SOURCE_DIR}/${FLATPAK_PACKAGES_FILE}" ]; then
-                        log_message "Restoring flatpak packages from ${SOURCE_DIR}/${FLATPAK_PACKAGES_FILE}"
-                        local user_apps=()
-                        local system_apps=()
-
-                        while IFS=$'\t' read -r col1 _ col3 col4; do
-                            [ -z "$col1" ] && continue
-                            local app_id="$col1"
-                            local installation="system"
-                            local branch=""
-
-                            if [ -n "$col4" ]; then
-                                # 4 columns: app_id origin installation branch
-                                installation="$col3"
-                                branch="$col4"
-                            elif [ "$col3" = "user" ] || [ "$col3" = "system" ]; then
-                                installation="$col3"
-                                branch=""
-                            else
-                                # 3 columns: app_id origin branch (legacy user backup)
-                                installation="user"
-                                branch="$col3"
-                            fi
-
-                            local app_ref="$app_id"
-                            if [ -n "$branch" ] && [ "$branch" != "stable" ]; then
-                                app_ref="${app_id}//${branch}"
-                            fi
-
-                            if [ "$installation" = "user" ]; then
-                                user_apps+=("$app_ref")
-                            else
-                                system_apps+=("$app_ref")
-                            fi
-                        done < "${SOURCE_DIR}/${FLATPAK_PACKAGES_FILE}"
-
-                        # Restore system flatpaks
-                        if [ ${#system_apps[@]} -gt 0 ]; then
-                            echo "Restoring ${#system_apps[@]} system flatpak(s)..."
-                            log_message "Restoring ${#system_apps[@]} system flatpaks: ${system_apps[*]}"
-                            if ! flatpak install -y --or-update --system "${system_apps[@]}" >> "$LOG_FILE" 2>&1; then
-                                log_message "Batch system flatpak install encountered issues; attempting individual installs."
-                                local can_sudo=false
-                                if command -v sudo &>/dev/null; then
-                                    if [ "$cli_yes" = true ] || [ ! -t 0 ]; then
-                                        if sudo -n -v 2>/dev/null; then
-                                            can_sudo=true
-                                        else
-                                            log_message "WARNING: Sudo credentials not cached for system flatpak install in non-interactive mode. Proceeding without root privileges."
-                                        fi
-                                    else
-                                        echo "Root privileges may be required to install system flatpaks."
-                                        if sudo -v; then
-                                            can_sudo=true
-                                        else
-                                            echo "WARNING: Sudo authentication failed. Proceeding without root privileges." >&2
-                                            log_message "WARNING: Sudo authentication failed for system flatpak fallback."
-                                        fi
-                                    fi
-                                fi
-
-                                for app in "${system_apps[@]}"; do
-                                    echo "Installing system flatpak: $app..."
-                                    if ! flatpak install -y --or-update --system "$app" >> "$LOG_FILE" 2>&1; then
-                                        if [ "$can_sudo" = true ]; then
-                                            sudo -n -v 2>/dev/null || true
-                                            # shellcheck disable=SC2024
-                                            sudo -n flatpak install -y --or-update --system "$app" >> "$LOG_FILE" 2>&1 || \
-                                                log_message "WARNING: Failed to install system flatpak $app"
-                                        else
-                                            log_message "WARNING: Failed to install system flatpak $app"
-                                        fi
-                                    fi
-                                done
-                            fi
-                        fi
-
-                        # Restore user flatpaks
-                        if [ ${#user_apps[@]} -gt 0 ]; then
-                            echo "Restoring ${#user_apps[@]} user flatpak(s)..."
-                            log_message "Restoring ${#user_apps[@]} user flatpaks: ${user_apps[*]}"
-                            if ! flatpak install -y --or-update --user "${user_apps[@]}" >> "$LOG_FILE" 2>&1; then
-                                log_message "Batch user flatpak install encountered issues; attempting individual installs."
-                                for app in "${user_apps[@]}"; do
-                                    echo "Installing user flatpak: $app..."
-                                    flatpak install -y --or-update --user "$app" >> "$LOG_FILE" 2>&1 || \
-                                        log_message "WARNING: Failed to install user flatpak $app"
-                                done
-                            fi
-                        fi
-
-                        log_message "Flatpak restore completed."
-                    fi
-                else
-                    log_message "WARNING: flatpak command not found. Skipping flatpak restore."
-                fi
-            else
-                echo "Skipping flatpak restore."
-                log_message "Flatpak restore skipped by user."
-            fi
-            rm -f "${SOURCE_DIR}/${FLATPAK_REMOTES_FILE}" "${SOURCE_DIR}/${FLATPAK_PACKAGES_FILE}"
-        fi
-
-        # --- Step 7: Restore Pipx packages ---
-        if [ -f "${SOURCE_DIR}/${PIPX_SPEC_FILE}" ]; then
-            local restore_pipx_confirm=""
-            if [ "$cli_yes" = true ]; then
-                restore_pipx_confirm="y"
-            elif [ -t 0 ]; then
-                read -r -p "Restore pipx packages from backup? (y/N): " restore_pipx_confirm
-            fi
-            if [[ "$restore_pipx_confirm" =~ ^[Yy]$ ]]; then
-                echo "Restoring pipx packages..."
-                log_message "Restoring pipx packages from ${SOURCE_DIR}/${PIPX_SPEC_FILE}"
-                if command -v pipx &> /dev/null; then
-                    if (cd "${SOURCE_DIR}" && pipx install-all "${PIPX_SPEC_FILE}"); then
-                        log_message "Pipx packages restored successfully."
-                    else
-                        log_message "WARNING: Failed to restore pipx packages."
-                    fi
-                else
-                    log_message "WARNING: pipx command not found. Skipping pipx restore."
-                fi
-            else
-                echo "Skipping pipx restore."
-                log_message "Pipx restore skipped by user."
-            fi
-            rm -f "${SOURCE_DIR}/${PIPX_SPEC_FILE}"
-        fi
-
-        # --- Step 7.5: Restore/Re-enable Systemd user units ---
-        if [ -f "${SOURCE_DIR}/${SYSTEMD_USER_UNITS_FILE}" ]; then
-            if [ -s "${SOURCE_DIR}/${SYSTEMD_USER_UNITS_FILE}" ]; then
-                local restore_systemd_confirm=""
-                if [ "$cli_yes" = true ]; then
-                    restore_systemd_confirm="y"
-                elif [ -t 0 ]; then
-                    read -r -p "Re-enable systemd user units from backup? (y/N): " restore_systemd_confirm
-                fi
-                if [[ "$restore_systemd_confirm" =~ ^[Yy]$ ]]; then
-                    echo "Re-enabling systemd user units..."
-                    log_message "Re-enabling systemd user units from ${SOURCE_DIR}/${SYSTEMD_USER_UNITS_FILE}"
-                    if command -v systemctl &> /dev/null; then
-                        systemctl --user daemon-reload 2>/dev/null || true
-                        local unit_file _
-                        while read -r unit_file _; do
-                            [ -z "$unit_file" ] && continue
-                            echo "Enabling systemd user unit: ${unit_file}..."
-                            systemctl --user enable "$unit_file" >> "$LOG_FILE" 2>&1 || \
-                                log_message "WARNING: Failed to enable systemd user unit ${unit_file}"
-                        done < "${SOURCE_DIR}/${SYSTEMD_USER_UNITS_FILE}"
-                        log_message "Systemd user units re-enabled."
-                    else
-                        log_message "WARNING: systemctl command not found. Skipping systemd user units restore."
-                    fi
-                else
-                    echo "Skipping systemd user units re-enable."
-                    log_message "Systemd user units restore skipped by user."
-                fi
-            else
-                log_message "Systemd user units backup file is empty. Skipping restore."
-            fi
-            rm -f "${SOURCE_DIR}/${SYSTEMD_USER_UNITS_FILE}"
-        fi
-
-        # --- Step 7.75: Restore Crontab ---
-        if [ -f "${SOURCE_DIR}/${CRONTAB_BACKUP_FILE}" ]; then
-            if [ -s "${SOURCE_DIR}/${CRONTAB_BACKUP_FILE}" ]; then
-                local restore_crontab_confirm=""
-                if [ "$cli_yes" = true ]; then
-                    restore_crontab_confirm="y"
-                elif [ -t 0 ]; then
-                    read -r -p "Restore crontab from backup? (y/N): " restore_crontab_confirm
-                fi
-                if [[ "$restore_crontab_confirm" =~ ^[Yy]$ ]]; then
-                    echo "Restoring crontab..."
-                    log_message "Restoring crontab from ${SOURCE_DIR}/${CRONTAB_BACKUP_FILE}"
-                    crontab "${SOURCE_DIR}/${CRONTAB_BACKUP_FILE}"
-                    log_message "Crontab restored."
-                else
-                    echo "Skipping crontab restore."
-                    log_message "Crontab restore skipped by user."
-                fi
-            else
-                log_message "Crontab backup file is empty. Skipping crontab restore."
-            fi
-            rm -f "${SOURCE_DIR}/${CRONTAB_BACKUP_FILE}"
-        fi
+        apply_system_state "${SOURCE_DIR}" $([ "$cli_yes" = true ] && echo "--yes") --clean-manifests
 
         # --- Step 8: Post-Restore Permission Hardening (~/.ssh and ~/.gnupg) ---
         harden_security_permissions "${SOURCE_DIR}"
@@ -5320,6 +6177,8 @@ run_restore() {
         echo "Files successfully extracted to: ${restore_target}"
         if [ ${#found_meta[@]} -gt 0 ]; then
             echo "Note: Archived system configuration files (${#found_meta[@]} manifests) were not applied to the live system and have been consolidated in: ${restore_target}/.system_state/"
+            echo "Tip: You can apply these system configurations to the live system at any time by running:"
+            echo "  $0 restore-system --dir \"${restore_target}/.system_state\""
         else
             echo "Note: Live system configuration was not altered."
         fi
@@ -7745,6 +8604,13 @@ cleanup() {
             rm -rf "$CURRENT_RESTORE_TMP_DIR" 2>/dev/null
             CURRENT_RESTORE_TMP_DIR=""
         fi
+        if [ -n "$CURRENT_SYSTEM_STATE_TMP_DIR" ]; then
+            rm -rf "$CURRENT_SYSTEM_STATE_TMP_DIR" 2>/dev/null
+            CURRENT_SYSTEM_STATE_TMP_DIR=""
+        fi
+
+        # Relaunch applications if they were closed and not yet relaunched
+        relaunch_closed_applications
 
         # Clean up temporary metadata staging directory in SCRATCH_DIR
         if [ -n "$CURRENT_METADATA_STAGING_DIR" ] && [ -d "$CURRENT_METADATA_STAGING_DIR" ]; then
@@ -7810,6 +8676,7 @@ execute_with_inhibit() {
     case "$action" in
         backup)  why_msg="Backing up home directory" ;;
         restore) why_msg="Restoring home directory" ;;
+        restore-system|restore_system|system-restore|system_restore) why_msg="Restoring system configuration and packages" ;;
         verify)  why_msg="Verifying backup archive integrity" ;;
         list-files|view-archive|list-contents) why_msg="Listing backup archive contents" ;;
         find-file|find_file|search-file|search_file) why_msg="Searching files across backup archives" ;;
@@ -7870,6 +8737,7 @@ execute_with_inhibit() {
         case "$action" in
             backup)  run_backup "$@" || ret=$? ;;
             restore) run_restore "$@" || ret=$? ;;
+            restore-system|restore_system|system-restore|system_restore) run_restore_system "$@" || ret=$? ;;
             verify)  run_verify "$@" || ret=$? ;;
             list-files|view-archive|list-contents) list_archive_contents "$@" || ret=$? ;;
             find-file|find_file|search-file|search_file) find_file "$@" || ret=$? ;;
@@ -8697,6 +9565,13 @@ init_config() {
 # Default: close
 #RUNNING_APPS_ACTION="close"
 
+# Automatically relaunch closed applications after the backup archive has been created.
+# Remembers exactly which applications were actively running and gracefully closed by the script,
+# and restarts them once archiving and checksumming complete (before cloud upload).
+# Options: true, false
+# Default: false
+#RESTART_CLOSED_APPS="false"
+
 # Process names to check for open database activity before archiving.
 # Default: ("chrome" "chromium" "google-chrome" "firefox" "firefox-bin" "vivaldi" "vivaldi-bin" "brave" "opera" "thunderbird")
 #TARGET_RUNNING_APPS=("chrome" "chromium" "google-chrome" "firefox" "firefox-bin" "vivaldi" "vivaldi-bin" "brave" "opera" "thunderbird")
@@ -9412,6 +10287,12 @@ check_config() {
             ;;
     esac
 
+    if [ "${RESTART_CLOSED_APPS:-false}" = "true" ] || [ "${RESTART_CLOSED_APPS:-false}" = "1" ]; then
+        report_ok "Apps Relaunch" "Enabled (closed applications will be automatically relaunched after archive creation)"
+    else
+        report_info "Apps Relaunch" "Disabled (closed applications will not be automatically restarted; enable with RESTART_CLOSED_APPS=true)"
+    fi
+
     # Check which target applications are currently active (excluding defunct zombies)
     local active_target_apps=()
     local check_apps=("${TARGET_RUNNING_APPS[@]}")
@@ -9650,26 +10531,27 @@ show_main_menu() {
         local preserved_count
         preserved_count=$(get_preserved_archives | wc -l)
         if [ "$preserved_count" -gt 0 ]; then
-            echo "* NOTICE: ${preserved_count} preserved archive(s) from failed upload(s) in ~ (Select 9 to manage)"
+            echo "* NOTICE: ${preserved_count} preserved archive(s) from failed upload(s) in ~ (Select 10 to manage)"
         fi
         echo "1. Backup Home Directory"
         echo "2. Restore Home Directory"
-        echo "3. Verify Backup Integrity"
-        echo "4. List Available Backups"
-        echo "5. View Backup Manifest / Summary"
-        echo "6. Backup Trends & Storage Analytics"
-        echo "7. View Files Inside Archive (list-files)"
-        echo "8. Search Across All Backups (find-file)"
+        echo "3. Restore System Packages & State (restore-system)"
+        echo "4. Verify Backup Integrity"
+        echo "5. List Available Backups"
+        echo "6. View Backup Manifest / Summary"
+        echo "7. Backup Trends & Storage Analytics"
+        echo "8. View Files Inside Archive (list-files)"
+        echo "9. Search Across All Backups (find-file)"
         if [ "$preserved_count" -gt 0 ]; then
-            echo "9. Manage Preserved Archives (* ${preserved_count} pending *)"
+            echo "10. Manage Preserved Archives (* ${preserved_count} pending *)"
         else
-            echo "9. Manage Preserved Archives"
+            echo "10. Manage Preserved Archives"
         fi
-        echo "10. Systemd Backup Timer (Schedule/Status)"
-        echo "11. Check Configuration & Environment"
-        echo "12. Initialize Configuration File"
-        echo "13. Exit"
-        if ! read -r -p "Please enter your choice [1-13]: " choice; then
+        echo "11. Systemd Backup Timer (Schedule/Status)"
+        echo "12. Check Configuration & Environment"
+        echo "13. Initialize Configuration File"
+        echo "14. Exit"
+        if ! read -r -p "Please enter your choice [1-14]: " choice; then
             echo -e "\nExiting."
             break
         fi
@@ -9677,17 +10559,18 @@ show_main_menu() {
         case $choice in
             1) execute_with_inhibit backup ;;
             2) execute_with_inhibit restore ;;
-            3) execute_with_inhibit verify ;;
-            4) list_backups ;;
-            5) display_manifest ;;
-            6) show_backup_stats ;;
-            7) execute_with_inhibit list-files ;;
-            8) execute_with_inhibit find-file ;;
-            9) execute_with_inhibit manage-preserved ;;
-            10) manage_systemd_timer ;;
-            11) check_config ;;
-            12) init_config ;;
-            13) echo "Exiting."; break ;;
+            3) execute_with_inhibit restore-system ;;
+            4) execute_with_inhibit verify ;;
+            5) list_backups ;;
+            6) display_manifest ;;
+            7) show_backup_stats ;;
+            8) execute_with_inhibit list-files ;;
+            9) execute_with_inhibit find-file ;;
+            10) execute_with_inhibit manage-preserved ;;
+            11) manage_systemd_timer ;;
+            12) check_config ;;
+            13) init_config ;;
+            14) echo "Exiting."; break ;;
             *) echo "Invalid option." ;;
         esac
     done
@@ -9715,6 +10598,8 @@ case "${1:-}" in
         echo "                                  --close-apps                      Gracefully terminate running target apps (default)"
         echo "                                  --prompt-apps                     Prompt whether to close running apps interactively"
         echo "                                  --no-close-apps                   Keep running apps open; flush buffers via sync"
+        echo "                                  --restart-apps, -ra               Relaunch apps closed for consistency after backup"
+        echo "                                  --no-restart-apps, -nra           Do not relaunch closed apps after backup"
         echo "                                  --exclude-tag, -et <tag>          Add per-directory exclusion tag (default: .nobackup)"
         echo "                                  --no-exclude-tags                 Disable per-directory tag exclusion"
         echo "                                  --exclude-ignore, -ei <file>      Add recursive ignore pattern file (default: .backupignore)"
@@ -9734,6 +10619,7 @@ case "${1:-}" in
         echo "  restore [archive|path] [opts] Interactively select and restore a backup, or selectively extract"
         echo "                                specific files, directories, or wildcard patterns without full restore."
         echo "                                Options:"
+        echo "                                  --interactive, -i, --browse       Browse and select files from archive index interactively"
         echo "                                  --path, -p, --pattern <pattern>   Specific file, folder, or wildcard pattern"
         echo "                                                                    (can be specified multiple times)"
         echo "                                  --dest, -d, --target <dir>        Destination directory (default: $SOURCE_DIR)"
@@ -9743,6 +10629,13 @@ case "${1:-}" in
         echo "                                  --no-verify-checksum, --no-vc     Skip pre-restore SHA-256 sidecar check"
         echo "                                  --stream                          Force single-pass cloud streaming without staging to scratch"
         echo "                                  --no-stream, --stage              Force downloading archive to scratch directory before extracting"
+        echo "                                  --yes, -y, --batch                Non-interactive batch mode (auto-confirm prompts)"
+        echo "  restore-system [archive|dir]  Extract and restore system packages, flatpaks, pipx, dconf desktop"
+        echo "                                settings, systemd user units, and crontab from an archive or dir."
+        echo "                                [archive|dir] can be: 'latest', a path to an archive, or '--dir <path>'."
+        echo "                                Options:"
+        echo "                                  --dir <path>                      Path to existing state directory (e.g. ~/.system_state)"
+        echo "                                  --source, -s <local|cloud>        Force archive restore source"
         echo "                                  --yes, -y, --batch                Non-interactive batch mode (auto-confirm prompts)"
         echo "  verify [target] [source] [opts] Verify integrity of a backup archive without disk writes"
         echo "                                [target] can be: 'latest', 'local', 'cloud', a filename, or a direct file path."
@@ -9859,7 +10752,7 @@ if [ -n "$1" ]; then
             test_email "${@:2}"
             exit $?
             ;;
-        backup|restore|verify|manage-preserved|clean-preserved)
+        backup|restore|restore-system|restore_system|system-restore|system_restore|verify|manage-preserved|clean-preserved)
             execute_with_inhibit "$1" "${@:2}"
             exit $?
             ;;
