@@ -1562,8 +1562,9 @@ Each backup includes exported system configuration manifests in the root of the
 archive:
 
 1. APT Repositories & Signing Keyrings (${APT_REPOS_FILE}):
-   sudo tar -xzvf ${APT_REPOS_FILE} -C /etc/apt/
+   sudo tar -xzvf ${APT_REPOS_FILE} -C /
    sudo apt update
+   (Note: For legacy archives created with paths relative to /etc/apt, use -C /etc/apt/)
 
 2. Manually Installed APT Packages (${APT_PACKAGES_FILE}):
    xargs -a ${APT_PACKAGES_FILE} sudo apt install -y
@@ -2912,16 +2913,70 @@ run_backup() {
     log_message "Backing up APT repository sources and keyrings to ${staging_dir}/${APT_REPOS_FILE}"
     if [ -d /etc/apt ]; then
         local apt_items_to_backup=()
-        [ -f /etc/apt/sources.list ] && apt_items_to_backup+=("sources.list")
-        [ -d /etc/apt/sources.list.d ] && apt_items_to_backup+=("sources.list.d")
-        [ -d /etc/apt/keyrings ] && apt_items_to_backup+=("keyrings")
-        [ -d /etc/apt/trusted.gpg.d ] && apt_items_to_backup+=("trusted.gpg.d")
+        [ -f /etc/apt/sources.list ] && apt_items_to_backup+=("etc/apt/sources.list")
+        [ -d /etc/apt/sources.list.d ] && apt_items_to_backup+=("etc/apt/sources.list.d")
+        [ -d /etc/apt/keyrings ] && apt_items_to_backup+=("etc/apt/keyrings")
+        [ -f /etc/apt/trusted.gpg ] && apt_items_to_backup+=("etc/apt/trusted.gpg")
+        [ -d /etc/apt/trusted.gpg.d ] && apt_items_to_backup+=("etc/apt/trusted.gpg.d")
+        [ -f /etc/apt/preferences ] && apt_items_to_backup+=("etc/apt/preferences")
+        [ -d /etc/apt/preferences.d ] && apt_items_to_backup+=("etc/apt/preferences.d")
+
+        # Discover all signing keyrings referenced in APT sources (deb822 Signed-By and one-line signed-by=)
+        local -A seen_apt_keys=()
+        local src_file raw_line
+        for src_file in /etc/apt/sources.list /etc/apt/sources.list.d/*; do
+            [ -f "$src_file" ] || continue
+            while IFS= read -r raw_line || [ -n "$raw_line" ]; do
+                # Match deb822 "Signed-By: /path/to/key"
+                if [[ "$raw_line" =~ ^[[:space:]]*[Ss]igned-[Bb]y:[[:space:]]*(.+) ]]; then
+                    local val="${BASH_REMATCH[1]}"
+                    local token
+                    for token in $val; do
+                        token="${token#[}"; token="${token%]}"; token="${token#\"}"; token="${token%\"}"; token="${token#\'}"; token="${token%\'}"
+                        if [ -f "$token" ]; then
+                            seen_apt_keys["$token"]=1
+                        fi
+                    done
+                fi
+                # Match one-line style "[signed-by=/path/to/key]"
+                if [[ "$raw_line" =~ signed-by=([^[:space:],\]]+) ]]; then
+                    local token="${BASH_REMATCH[1]}"
+                    token="${token#[}"; token="${token%]}"; token="${token#\"}"; token="${token%\"}"; token="${token#\'}"; token="${token%\'}"
+                    if [ -f "$token" ]; then
+                        seen_apt_keys["$token"]=1
+                    fi
+                fi
+            done < "$src_file"
+        done
+
+        # Also capture any third-party or custom keyrings located in /usr/share/keyrings
+        if [ -d /usr/share/keyrings ]; then
+            local unowned_keyring
+            while IFS= read -r unowned_keyring || [ -n "$unowned_keyring" ]; do
+                [ -n "$unowned_keyring" ] && [ -f "$unowned_keyring" ] && seen_apt_keys["$unowned_keyring"]=1
+            done < <(dpkg -S /usr/share/keyrings/* 2>&1 | awk -F'matching pattern ' '/no path found matching pattern/ {print $2}' 2>/dev/null || true)
+        fi
+
+        # Append discovered keyrings (storing paths relative to /)
+        local kpath rel_kpath
+        for kpath in "${!seen_apt_keys[@]}"; do
+            rel_kpath="${kpath#/}"
+            # Avoid duplicate if already included under etc/apt/
+            if [[ "$rel_kpath" != etc/apt/* ]]; then
+                apt_items_to_backup+=("$rel_kpath")
+            fi
+        done
 
         if [ ${#apt_items_to_backup[@]} -gt 0 ]; then
-            if tar -czf "${staging_dir}/${APT_REPOS_FILE}" -C /etc/apt \
+            local tar_extra_args=()
+            tar --help 2>/dev/null | grep -q -- '--ignore-failed-read' && tar_extra_args+=("--ignore-failed-read")
+            if tar -czf "${staging_dir}/${APT_REPOS_FILE}" -C / \
+                "${tar_extra_args[@]}" \
                 --exclude='*.save' --exclude='*.bak' --exclude='*~' \
-                "${apt_items_to_backup[@]}" 2>/dev/null; then
-                log_message "APT repositories and keyrings backed up successfully."
+                "${apt_items_to_backup[@]}" 2>> "$LOG_FILE"; then
+                log_message "APT repositories and signing keyrings backed up successfully (${#apt_items_to_backup[@]} items/paths)."
+            elif [ -s "${staging_dir}/${APT_REPOS_FILE}" ]; then
+                log_message "WARNING: APT repositories archive created with non-fatal warnings."
             else
                 log_message "WARNING: Failed to export APT repositories and keyrings."
                 rm -f "${staging_dir}/${APT_REPOS_FILE}" 2>/dev/null || true
@@ -4203,7 +4258,7 @@ apply_system_state() {
                             log_message "WARNING: Sudo credentials not cached for APT repository restore in non-interactive mode. Proceeding without root privileges."
                         fi
                     else
-                        echo "Root privileges are required to restore APT repository sources and keyrings to /etc/apt."
+                        echo "Root privileges are required to restore APT repository sources and keyrings."
                         if sudo -v; then
                             repos_can_sudo=true
                         else
@@ -4214,18 +4269,26 @@ apply_system_state() {
                 fi
 
                 if [ "$repos_can_sudo" = true ]; then
+                    local apt_dest_dir="/"
+                    if ! tar -tzf "${apt_repos_f}" 2>/dev/null | grep -q -E '^(etc|usr)/'; then
+                        apt_dest_dir="/etc/apt/"
+                    fi
                     # shellcheck disable=SC2024
-                    if sudo -n tar -xzpf "${apt_repos_f}" -C /etc/apt/ >> "$LOG_FILE" 2>&1; then
-                        log_message "APT repositories and signing keyrings restored successfully to /etc/apt/."
+                    if sudo -n tar -xzpf "${apt_repos_f}" -C "${apt_dest_dir}" >> "$LOG_FILE" 2>&1; then
+                        log_message "APT repositories and signing keyrings restored successfully (destination: ${apt_dest_dir})."
                         echo "APT repositories and signing keyrings restored successfully."
                     else
-                        log_message "WARNING: Failed to unpack APT repositories and keyrings to /etc/apt/."
-                        echo "WARNING: Failed to unpack APT repositories and keyrings to /etc/apt/." >&2
+                        log_message "WARNING: Failed to unpack APT repositories and keyrings."
+                        echo "WARNING: Failed to unpack APT repositories and keyrings." >&2
                     fi
                 else
                     echo "Skipping APT repository restore due to lack of sudo privileges."
                     echo "Tip: You can manually restore them later with:"
-                    echo "  sudo tar -xzpf \"${apt_repos_f}\" -C /etc/apt/"
+                    if tar -tzf "${apt_repos_f}" 2>/dev/null | grep -q -E '^(etc|usr)/'; then
+                        echo "  sudo tar -xzpf \"${apt_repos_f}\" -C /"
+                    else
+                        echo "  sudo tar -xzpf \"${apt_repos_f}\" -C /etc/apt/"
+                    fi
                     log_message "Skipped APT repository restore (no sudo privileges)."
                 fi
             else
@@ -4274,33 +4337,70 @@ apply_system_state() {
 
                     if [ "$can_sudo" = true ]; then
                         echo "Updating package repository lists..."
-                        # shellcheck disable=SC2024
-                        sudo -n apt-get update -qq >> "$LOG_FILE" 2>&1 || true
-                        echo "Installing APT packages (this may take several minutes)..."
-                        local apt_packages_to_install=()
-                        mapfile -t apt_packages_to_install < "$apt_pkgs_f"
-                        # shellcheck disable=SC2024
-                        if sudo -n apt-get install -y --no-upgrade "${apt_packages_to_install[@]}" >> "$LOG_FILE" 2>&1; then
-                            log_message "APT packages batch installed successfully."
-                            echo "APT packages installed successfully."
+                        if [ "$(id -u)" -eq 0 ]; then
+                            apt-get update 2>&1 | tee -a "$LOG_FILE" || true
                         else
-                            log_message "Batch APT install encountered issues; attempting individual package installs."
-                            echo "Batch install encountered issues; attempting individual package installs..."
-                            local apt_success=0 apt_failed=0
-                            for pkg in "${apt_packages_to_install[@]}"; do
-                                [ -z "$pkg" ] && continue
-                                if ! dpkg -s "$pkg" &>/dev/null; then
-                                    echo "Installing APT package: $pkg..."
-                                    # shellcheck disable=SC2024
-                                    if sudo -n apt-get install -y --no-upgrade "$pkg" >> "$LOG_FILE" 2>&1; then
-                                        ((apt_success++))
-                                    else
-                                        ((apt_failed++))
-                                        log_message "WARNING: Failed to install APT package $pkg"
-                                    fi
+                            # shellcheck disable=SC2024
+                            sudo -n apt-get update 2>&1 | tee -a "$LOG_FILE" || true
+                        fi
+
+                        local apt_packages_to_install=()
+                        local skipped_pkgs=()
+                        local valid_pkgs_set=()
+                        mapfile -t valid_pkgs_set < <(apt-cache pkgnames 2>/dev/null)
+                        local has_pkg_cache=false
+                        if [ ${#valid_pkgs_set[@]} -gt 0 ]; then
+                            has_pkg_cache=true
+                        fi
+                        declare -A is_valid_pkg
+                        for vp in "${valid_pkgs_set[@]}"; do
+                            is_valid_pkg["$vp"]=1
+                        done
+
+                        while IFS= read -r pkg || [ -n "$pkg" ]; do
+                            pkg=$(echo "$pkg" | tr -d '[:space:]')
+                            [ -z "$pkg" ] && continue
+                            [[ "$pkg" =~ ^# ]] && continue
+                            local base_pkg="${pkg%%:*}"
+                            if [ "$has_pkg_cache" = true ]; then
+                                if [ "${is_valid_pkg[$base_pkg]:-0}" -eq 1 ]; then
+                                    apt_packages_to_install+=("$pkg")
+                                else
+                                    skipped_pkgs+=("$pkg")
                                 fi
-                            done
-                            log_message "Individual APT package installation completed (${apt_success} installed, ${apt_failed} failed)."
+                            else
+                                apt_packages_to_install+=("$pkg")
+                            fi
+                        done < "$apt_pkgs_f"
+
+                        if [ ${#skipped_pkgs[@]} -gt 0 ]; then
+                            echo "Notice: ${#skipped_pkgs[@]} package(s) not found in current APT repositories and will be skipped:"
+                            printf "  - %s\n" "${skipped_pkgs[@]}"
+                            log_message "Notice: Skipped ${#skipped_pkgs[@]} APT packages not found in repositories: ${skipped_pkgs[*]}"
+                        fi
+
+                        if [ ${#apt_packages_to_install[@]} -gt 0 ]; then
+                            echo "Installing ${#apt_packages_to_install[@]} APT package(s)..."
+                            log_message "Installing ${#apt_packages_to_install[@]} APT packages at once: ${apt_packages_to_install[*]}"
+                            local apt_rc=0
+                            if [ "$(id -u)" -eq 0 ]; then
+                                apt-get install -y --no-upgrade "${apt_packages_to_install[@]}" 2>&1 | tee -a "$LOG_FILE"
+                                apt_rc=${PIPESTATUS[0]}
+                            else
+                                # shellcheck disable=SC2024
+                                sudo -n apt-get install -y --no-upgrade "${apt_packages_to_install[@]}" 2>&1 | tee -a "$LOG_FILE"
+                                apt_rc=${PIPESTATUS[0]}
+                            fi
+                            if [ "$apt_rc" -eq 0 ]; then
+                                log_message "APT packages batch installed successfully (${#apt_packages_to_install[@]} packages)."
+                                echo "APT packages installed successfully."
+                            else
+                                log_message "WARNING: APT packages installation completed with error status (${apt_rc})."
+                                echo "WARNING: APT packages installation completed with error status (${apt_rc})." >&2
+                            fi
+                        else
+                            echo "No valid APT packages found to install."
+                            log_message "No valid APT packages found to install from ${apt_pkgs_f}."
                         fi
                     else
                         echo "Skipping APT installation due to lack of sudo privileges."
@@ -4591,58 +4691,63 @@ apply_system_state() {
                         fi
                     done < "$flatpak_pkgs_f"
 
+                    local can_sudo_flatpak=false
+                    if [ "$(id -u)" -eq 0 ]; then
+                        can_sudo_flatpak=true
+                    elif command -v sudo &>/dev/null; then
+                        if [ "$cli_yes" = true ] || [ ! -t 0 ]; then
+                            if sudo -n -v 2>/dev/null; then
+                                can_sudo_flatpak=true
+                            else
+                                log_message "WARNING: Sudo credentials not cached for system flatpak install in non-interactive mode. Proceeding without root privileges."
+                            fi
+                        else
+                            echo "Root privileges may be required to install system flatpaks."
+                            if sudo -v; then
+                                can_sudo_flatpak=true
+                            else
+                                echo "WARNING: Sudo authentication failed. Proceeding without root privileges." >&2
+                                log_message "WARNING: Sudo authentication failed for system flatpak install."
+                            fi
+                        fi
+                    fi
+
                     # Restore system flatpaks
                     if [ ${#system_apps[@]} -gt 0 ]; then
                         echo "Restoring ${#system_apps[@]} system flatpak(s)..."
-                        log_message "Restoring ${#system_apps[@]} system flatpaks: ${system_apps[*]}"
-                        if ! flatpak install -y --or-update --system "${system_apps[@]}" >> "$LOG_FILE" 2>&1; then
-                            log_message "Batch system flatpak install encountered issues; attempting individual installs."
-                            local can_sudo=false
-                            if command -v sudo &>/dev/null; then
-                                if [ "$cli_yes" = true ] || [ ! -t 0 ]; then
-                                    if sudo -n -v 2>/dev/null; then
-                                        can_sudo=true
-                                    else
-                                        log_message "WARNING: Sudo credentials not cached for system flatpak install in non-interactive mode. Proceeding without root privileges."
-                                    fi
-                                else
-                                    echo "Root privileges may be required to install system flatpaks."
-                                    if sudo -v; then
-                                        can_sudo=true
-                                    else
-                                        echo "WARNING: Sudo authentication failed. Proceeding without root privileges." >&2
-                                        log_message "WARNING: Sudo authentication failed for system flatpak fallback."
-                                    fi
-                                fi
-                            fi
+                        log_message "Restoring ${#system_apps[@]} system flatpaks at once: ${system_apps[*]}"
+                        local fp_sys_rc=0
+                        if [ "$can_sudo_flatpak" = true ] && [ "$(id -u)" -ne 0 ]; then
+                            sudo -n flatpak install -y --or-update --system "${system_apps[@]}" 2>&1 | tee -a "$LOG_FILE"
+                            fp_sys_rc=${PIPESTATUS[0]}
+                        else
+                            flatpak install -y --or-update --system "${system_apps[@]}" 2>&1 | tee -a "$LOG_FILE"
+                            fp_sys_rc=${PIPESTATUS[0]}
+                        fi
 
-                            for app in "${system_apps[@]}"; do
-                                echo "Installing system flatpak: $app..."
-                                if ! flatpak install -y --or-update --system "$app" >> "$LOG_FILE" 2>&1; then
-                                    if [ "$can_sudo" = true ]; then
-                                        sudo -n -v 2>/dev/null || true
-                                        # shellcheck disable=SC2024
-                                        sudo -n flatpak install -y --or-update --system "$app" >> "$LOG_FILE" 2>&1 || \
-                                            log_message "WARNING: Failed to install system flatpak $app"
-                                    else
-                                        log_message "WARNING: Failed to install system flatpak $app"
-                                    fi
-                                fi
-                            done
+                        if [ "$fp_sys_rc" -eq 0 ]; then
+                            log_message "System flatpaks installed successfully (${#system_apps[@]} apps)."
+                            echo "System flatpaks installed successfully."
+                        else
+                            log_message "WARNING: System flatpak batch installation completed with error status (${fp_sys_rc})."
+                            echo "WARNING: System flatpak batch installation completed with error status (${fp_sys_rc})." >&2
                         fi
                     fi
 
                     # Restore user flatpaks
                     if [ ${#user_apps[@]} -gt 0 ]; then
                         echo "Restoring ${#user_apps[@]} user flatpak(s)..."
-                        log_message "Restoring ${#user_apps[@]} user flatpaks: ${user_apps[*]}"
-                        if ! flatpak install -y --or-update --user "${user_apps[@]}" >> "$LOG_FILE" 2>&1; then
-                            log_message "Batch user flatpak install encountered issues; attempting individual installs."
-                            for app in "${user_apps[@]}"; do
-                                echo "Installing user flatpak: $app..."
-                                flatpak install -y --or-update --user "$app" >> "$LOG_FILE" 2>&1 || \
-                                    log_message "WARNING: Failed to install user flatpak $app"
-                            done
+                        log_message "Restoring ${#user_apps[@]} user flatpaks at once: ${user_apps[*]}"
+                        local fp_user_rc=0
+                        flatpak install -y --or-update --user "${user_apps[@]}" 2>&1 | tee -a "$LOG_FILE"
+                        fp_user_rc=${PIPESTATUS[0]}
+
+                        if [ "$fp_user_rc" -eq 0 ]; then
+                            log_message "User flatpaks installed successfully (${#user_apps[@]} apps)."
+                            echo "User flatpaks installed successfully."
+                        else
+                            log_message "WARNING: User flatpak batch installation completed with error status (${fp_user_rc})."
+                            echo "WARNING: User flatpak batch installation completed with error status (${fp_user_rc})." >&2
                         fi
                     fi
 
