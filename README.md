@@ -744,7 +744,8 @@ If performing manual bare-metal recovery without `backup_script.sh`, the exporte
 
 - **APT (Debian / Ubuntu / Mint)**:
   ```bash
-  sudo tar -xzvf apt_repos_keys.tar.gz -C /etc/apt/
+  sudo tar -xzvf apt_repos_keys.tar.gz -C /
+  # Note: For legacy archives created with paths relative to /etc/apt, extract to -C /etc/apt/
   sudo apt update
   xargs -a apt_packages_manual.txt sudo apt install -y
   ```
