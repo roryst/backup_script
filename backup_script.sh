@@ -24,7 +24,7 @@
 #                 Usage: ./backup_script.sh [backup|restore|verify|list|stats|manifest|manage-preserved|init-config|check-config|help]
 #
 #        AUTHOR:  Rory Mobley, rorymobley5@gmail.com
-#       VERSION:  10.1.0
+#       VERSION:  10.3.1
 #==============================================================================
 
 #------------------------------------------------------------------------------
@@ -275,7 +275,7 @@ MAIL_COMMAND="${MAIL_COMMAND:-auto}"
 EMAIL_ALERT_SENT=0
 
 # Script version identifier
-SCRIPT_VERSION="10.2.0"
+SCRIPT_VERSION="10.3.1"
 
 # Path to this script for self-invocation
 SCRIPT_PATH="$(realpath "${BASH_SOURCE[0]}")"
@@ -314,8 +314,8 @@ DEFAULT_EXCLUDE_PATTERNS=(
     "./tmp"
     "./cache"
     "./.cache"
-    "./.encrypted_data"
     "./Downloads"
+    "./test"
     "./external_drive"
     "./sensitive"
     "./googledrive"
@@ -2317,34 +2317,73 @@ relaunch_closed_applications() {
         return 0
     fi
 
+    # Ensure D-Bus and display environment are populated for desktop application launching
+    if [ -z "$DBUS_SESSION_BUS_ADDRESS" ]; then
+        DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$(id -u)/bus"
+        export DBUS_SESSION_BUS_ADDRESS
+    fi
+    export DISPLAY="${DISPLAY:-:0}"
+    if [ -z "${XAUTHORITY:-}" ] && [ -f "$HOME/.Xauthority" ]; then
+        export XAUTHORITY="$HOME/.Xauthority"
+    fi
+
     echo "Relaunching application(s) closed prior to backup..."
     log_message "Relaunching closed applications: ${ACTUALLY_CLOSED_APPS[*]}"
     local launched=()
     for app in "${ACTUALLY_CLOSED_APPS[@]}"; do
         local bin="$app"
+        local desktop_candidates=()
         case "$app" in
-            vivaldi-bin) bin="vivaldi" ;;
-            firefox-bin) bin="firefox" ;;
-            chrome)
+            vivaldi-bin|vivaldi)
+                bin="vivaldi"
+                command -v vivaldi &>/dev/null || bin="vivaldi-stable"
+                desktop_candidates=("vivaldi-stable" "vivaldi" "vivaldi-snapshot")
+                ;;
+            firefox-bin|firefox)
+                bin="firefox"
+                command -v firefox &>/dev/null || bin="firefox-esr"
+                desktop_candidates=("firefox" "firefox-esr")
+                ;;
+            chrome|google-chrome)
                 if command -v google-chrome &>/dev/null; then
                     bin="google-chrome"
+                    desktop_candidates=("google-chrome" "google-chrome-stable")
                 elif command -v chrome &>/dev/null; then
                     bin="chrome"
+                    desktop_candidates=("chrome" "google-chrome")
                 elif command -v chromium &>/dev/null; then
                     bin="chromium"
+                    desktop_candidates=("chromium" "chromium-browser")
                 fi
                 ;;
             brave)
                 if command -v brave-browser &>/dev/null; then
                     bin="brave-browser"
+                    desktop_candidates=("brave-browser")
+                elif command -v brave &>/dev/null; then
+                    bin="brave"
+                    desktop_candidates=("brave" "brave-browser")
                 fi
                 ;;
             chromium)
                 if command -v chromium &>/dev/null; then
                     bin="chromium"
+                    desktop_candidates=("chromium" "chromium-browser")
                 elif command -v chromium-browser &>/dev/null; then
                     bin="chromium-browser"
+                    desktop_candidates=("chromium-browser" "chromium")
                 fi
+                ;;
+            opera)
+                bin="opera"
+                desktop_candidates=("opera")
+                ;;
+            thunderbird)
+                bin="thunderbird"
+                desktop_candidates=("thunderbird")
+                ;;
+            *)
+                desktop_candidates=("$bin")
                 ;;
         esac
 
@@ -2356,21 +2395,64 @@ relaunch_closed_applications() {
 
         if command -v "$bin" &>/dev/null; then
             echo "  Relaunching: $bin..."
-            if command -v gtk-launch &>/dev/null && [ -n "${DISPLAY:-${WAYLAND_DISPLAY:-}}" ] && gtk-launch "$bin" &>/dev/null; then
-                launched+=("$bin")
-                log_message "Relaunched $bin via gtk-launch."
-            elif command -v setsid &>/dev/null; then
-                setsid "$bin" </dev/null &>/dev/null &
-                launched+=("$bin")
-                log_message "Relaunched $bin via setsid."
-            elif command -v nohup &>/dev/null; then
-                nohup "$bin" </dev/null &>/dev/null &
-                launched+=("$bin")
-                log_message "Relaunched $bin via nohup."
-            else
-                "$bin" </dev/null &>/dev/null &
-                launched+=("$bin")
-                log_message "Relaunched $bin in background."
+            local launched_ok=false
+
+            # 1. Attempt desktop-level launch via gtk-launch or gio launch
+            if [ -n "${DISPLAY:-${WAYLAND_DISPLAY:-}}" ]; then
+                if command -v gtk-launch &>/dev/null; then
+                    for d_id in "${desktop_candidates[@]}"; do
+                        if gtk-launch "$d_id" &>/dev/null; then
+                            launched+=("$bin")
+                            log_message "Relaunched $bin via gtk-launch ($d_id)."
+                            launched_ok=true
+                            break
+                        fi
+                    done
+                fi
+
+                if [ "$launched_ok" = false ] && command -v gio &>/dev/null; then
+                    for d_id in "${desktop_candidates[@]}"; do
+                        local d_file=""
+                        for d_dir in "/usr/share/applications" "$HOME/.local/share/applications" "/usr/local/share/applications"; do
+                            if [ -f "${d_dir}/${d_id}.desktop" ]; then
+                                d_file="${d_dir}/${d_id}.desktop"
+                                break
+                            fi
+                        done
+                        if [ -n "$d_file" ] && gio launch "$d_file" &>/dev/null; then
+                            launched+=("$bin")
+                            log_message "Relaunched $bin via gio launch (${d_id}.desktop)."
+                            launched_ok=true
+                            break
+                        fi
+                    done
+                fi
+            fi
+
+            # 2. Decouple from calling cgroup via systemd-run (critical when running inside systemd services)
+            if [ "$launched_ok" = false ] && command -v systemd-run &>/dev/null && [ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ]; then
+                if systemd-run --user --slice=app.slice --unit="app-${bin}-$(date +%s%N)" "$bin" </dev/null &>/dev/null; then
+                    launched+=("$bin")
+                    log_message "Relaunched $bin via systemd-run (app.slice)."
+                    launched_ok=true
+                fi
+            fi
+
+            # 3. Fallback to process session detachment
+            if [ "$launched_ok" = false ]; then
+                if command -v setsid &>/dev/null; then
+                    setsid "$bin" </dev/null &>/dev/null &
+                    launched+=("$bin")
+                    log_message "Relaunched $bin via setsid."
+                elif command -v nohup &>/dev/null; then
+                    nohup "$bin" </dev/null &>/dev/null &
+                    launched+=("$bin")
+                    log_message "Relaunched $bin via nohup."
+                else
+                    "$bin" </dev/null &>/dev/null &
+                    launched+=("$bin")
+                    log_message "Relaunched $bin in background."
+                fi
             fi
         else
             log_message "WARNING: Could not find executable for '$bin' to relaunch."
@@ -9531,6 +9613,7 @@ init_config() {
 #    "./cache"
 #    "./.cache"
 #    "./Downloads"
+#    "./test"
 #    "./external_drive"
 #    "./sensitive"
 #    "./googledrive"
