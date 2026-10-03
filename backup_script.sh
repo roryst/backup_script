@@ -207,7 +207,7 @@ RESTORE_VERIFY_CHECKSUM="${RESTORE_VERIFY_CHECKSUM:-true}"
 # When enabled ('checksum', 'quick', 'checksum-local', 'checksum-cloud', 'local', 'cloud', true, or 1),
 # executes integrity verification on the newly created archive.
 # Can also be triggered per-run via 'backup --verify [auto|local|cloud]' or 'backup --verify-checksum'.
-AUTO_VERIFY_BACKUP="${AUTO_VERIFY_BACKUP:-local}"
+AUTO_VERIFY_BACKUP="${AUTO_VERIFY_BACKUP:-checksum-local}"
 
 # Preferred pager for viewing archive file listings in interactive terminals.
 # Set to an empty string ("") to disable pagination by default.
@@ -3661,7 +3661,9 @@ run_backup() {
         verify_args+=("${verify_target}")
         [ -n "$effective_verify_source" ] && verify_args+=("${effective_verify_source}")
 
-        log_message "Starting chained post-backup verification for ${verify_target} (${effective_verify_source:-auto}${verify_checksum_only:+, checksum-only})..."
+        local verify_mode_desc=""
+        [ "$verify_checksum_only" = true ] && verify_mode_desc=", checksum-only"
+        log_message "Starting chained post-backup verification for ${verify_target} (${effective_verify_source:-auto}${verify_mode_desc})..."
         if run_verify "${verify_args[@]}"; then
             if [ "$verify_checksum_only" = true ]; then
                 verify_status="Checksum OK"
