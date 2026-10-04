@@ -18,6 +18,7 @@ A robust, enterprise-grade Bash backup, verification, and disaster-recovery solu
   - [Environment & Health Check (`check-config`)](#environment--health-check-check-config)
   - [Creating Backups (`backup`)](#creating-backups-backup)
   - [Listing Available Backups (`list`)](#listing-available-backups-list)
+  - [Archive Pinning & Retention Holds (`pin`, `unpin`, `pinned`)](#archive-pinning--retention-holds-pin-unpin-pinned)
   - [Viewing Archive Files (`list-files`)](#viewing-archive-files-list-files)
   - [Searching Files Across Backups (`find-file`)](#searching-files-across-backups-find-file)
   - [Inspecting Backup Manifests (`manifest`)](#inspecting-backup-manifests-manifest)
@@ -27,7 +28,7 @@ A robust, enterprise-grade Bash backup, verification, and disaster-recovery solu
   - [System Packages & State Restore (`restore-system`)](#system-packages--state-restore-restore-system)
   - [Automated Scheduling (`systemd` Timer)](#automated-scheduling-systemd-timer)
   - [Testing Email Notifications (`test-email`)](#testing-email-notifications-test-email)
-- [Retention Policies & GFS Pruning](#retention-policies--gfs-pruning)
+- [Retention Policies, GFS Pruning & Retention Holds](#retention-policies-gfs-pruning--retention-holds)
 - [Exclusion Rules](#exclusion-rules)
 - [Disaster Recovery Bootstrapping](#disaster-recovery-bootstrapping)
 - [Configuration Reference](#configuration-reference)
@@ -46,11 +47,12 @@ A robust, enterprise-grade Bash backup, verification, and disaster-recovery solu
 - **Modern Zstandard (`zstd`)**: Tuned compression (default level 6) with **Long Distance Matching (`--long=27`)** to dramatically compress repetitive text, code repositories, and container structures.
 - **Adaptive Cloud Streaming**: Restore directly from cloud storage via `rclone cat` without downloading full multi-gigabyte archives to local disk, falling back to local staging when disk permits.
 - **Resilient Network Streaming**: All `rclone cat` streaming operations (restores, verifications, index queries) incorporate multi-level retries (`--retries 3 --low-level-retries 10`), socket timeouts, and optional bandwidth throttling to resist transient socket drops.
-- **Parallel Companion Uploads**: Companion sidecars (`.sha256`, `.manifest.json`, `.files.gz`) and disaster recovery bootstrap files upload concurrently in parallel background threads, cutting round-trip API latency.
+- **Parallel Companion Uploads**: Companion sidecars (`.sha256`, `.manifest.json`, `.files.gz`, `.pinned`) and disaster recovery bootstrap files upload concurrently in parallel background threads, cutting round-trip API latency.
 - **Resource Aware**: Dynamically caps decompression memory and enforces scratch space checks before archiving to prevent disk exhaustion.
 
 ### 🔄 Dual-Destination Synchronization & Retention
 - **Hybrid Storage**: Concurrently synchronizes to local external partitions (auto-discovered via filesystem UUID) and cloud remotes via `rclone` (Google Drive, Backblaze B2, AWS S3, etc.).
+- **Archive Pinning & Retention Holds**: Explicitly pin significant archives (e.g. prior to major system updates, migrations, or project milestones) locally and/or in the cloud with human-readable reason notes (`backup --pin "Pre-distro upgrade"` or `./backup_script.sh pin latest`). Pinned archives are completely immune from automated count-based pruning and GFS rotation, and do not consume regular retention quota slots.
 - **Flexible Retention (Count-Based or GFS Tiered)**:
   - **Count-based** (default): Retains the `N` newest archives on local drive and cloud remote (default: 10).
   - **Grandfather-Father-Son (GFS) Tiered Retention**: Automatically maintains a timeline of daily, weekly, monthly, and yearly archives (default: 7 daily, 4 weekly, 6 monthly, 1 yearly) for months or years of recovery coverage without extra storage bloat.
@@ -261,6 +263,8 @@ Execute a manual backup immediately:
 ```
 
 #### Common Options:
+- `--pin [reason]`: Pin archive (retention hold) during backup creation, exempting it permanently from rotation.
+- `--pin-reason, -pr <text>`: Specify custom explanation or tag when pinning an archive during backup (e.g. `--pin "Pre-distro upgrade"`).
 - `--close-apps`: Gracefully terminate running target applications (default).
 - `--prompt-apps`: Interactively prompt whether to close running applications.
 - `--no-close-apps`: Skip closing open applications; flushes filesystem buffers via `sync`.
@@ -280,7 +284,7 @@ Execute a manual backup immediately:
 
 ### Listing Available Backups (`list`)
 
-List all archives available on the local drive and cloud remote:
+List all archives available on the local drive and cloud remote (pinned archives display with `[PINNED]` and their reason note):
 
 ```bash
 $ ./backup_script.sh list
@@ -288,16 +292,91 @@ $ ./backup_script.sh list
 
 ```text
 Available local backups (/media/rory/bc3968af-d154-4167-b73c-5a172d2a25b8/Backups):
-  7.6GB     2026-09-21 00:53:31  rory_home_backup_hp_2026-09-21_005151.tar.zst.gpg
+  7.6GB     2026-09-21 00:53:31  rory_home_backup_hp_2026-09-21_005151.tar.zst.gpg [PINNED: Pre-Ubuntu 26.04 upgrade]
   7.6GB     2026-09-20 01:01:36  rory_home_backup_hp_2026-09-20_005952.tar.zst.gpg
   7.6GB     2026-09-19 00:49:26  rory_home_backup_hp_2026-09-19_004752.tar.zst.gpg
   7.8GB     2026-09-18 01:00:21  rory_home_backup_hp_2026-09-18_005852.tar.zst.gpg
 
 Available cloud backups for this host (hp) on googledrive:backup/:
-  7.6GB     2026-09-21 00:53:31  rory_home_backup_hp_2026-09-21_005151.tar.zst.gpg
+  7.6GB     2026-09-21 00:53:31  rory_home_backup_hp_2026-09-21_005151.tar.zst.gpg [PINNED: Pre-Ubuntu 26.04 upgrade]
   7.6GB     2026-09-20 01:01:36  rory_home_backup_hp_2026-09-20_005952.tar.zst.gpg
   7.6GB     2026-09-19 00:49:26  rory_home_backup_hp_2026-09-19_004752.tar.zst.gpg
   7.8GB     2026-09-18 01:00:21  rory_home_backup_hp_2026-09-18_005852.tar.zst.gpg
+```
+
+---
+
+### Archive Pinning & Retention Holds (`pin`, `unpin`, `pinned`)
+
+Set a retention hold on an archive to prevent it from ever being pruned by automatic rotation (count-based or GFS tiered). Pinned archives remain permanently protected across local external drives and cloud remotes until explicitly unpinned.
+
+#### Pinning an Archive (`pin`)
+```bash
+# Pin the latest backup across both local and cloud storage with default reason
+$ ./backup_script.sh pin latest
+
+# Pin the latest backup with an explanatory reason note
+$ ./backup_script.sh pin latest --reason "Pre-Ubuntu 26.04 LTS upgrade snapshot"
+# Or using positional syntax:
+$ ./backup_script.sh pin latest "Milestone: v2.0 production release"
+
+# Pin a specific historical archive
+$ ./backup_script.sh pin rory_home_backup_hp_2026-09-18_005852.tar.zst.gpg --reason "Baseline configuration"
+
+# Pin only to local storage (or only to cloud)
+$ ./backup_script.sh pin latest --source local --reason "Offline cold storage"
+
+# Interactively select an archive to pin (prompts with unpinned archives)
+$ ./backup_script.sh pin
+
+# Create a pinned backup directly during execution
+$ ./backup_script.sh backup --pin "Pre-hardware replacement"
+```
+
+#### Releasing a Retention Hold (`unpin`)
+```bash
+# Interactively select and unpin an archive (lists all currently pinned archives)
+$ ./backup_script.sh unpin
+
+# Unpin a specific archive (prompts for confirmation)
+$ ./backup_script.sh unpin rory_home_backup_hp_2026-09-18_005852.tar.zst.gpg
+
+# Non-interactive / batch unpinning (auto-confirm)
+$ ./backup_script.sh unpin rory_home_backup_hp_2026-09-18_005852.tar.zst.gpg --yes
+
+# Unpin only on cloud remote (keeping local pin intact)
+$ ./backup_script.sh unpin latest --source cloud --yes
+```
+
+#### Viewing Pinned Archives (`pinned` / `list-pinned`)
+```bash
+# Display a formatted table of all pinned archives, timestamps, and reasons
+$ ./backup_script.sh pinned
+
+# Output in JSON format for automated monitoring and reporting
+$ ./backup_script.sh pinned --json
+```
+
+```text
+===============================================================================
+  Pinned Archives (Retention Hold Active)
+===============================================================================
+Local External Drive (/media/rory/bc3968af-d154-4167-b73c-5a172d2a25b8/Backups):
+  7.6GB     rory_home_backup_hp_2026-09-21_005151.tar.zst.gpg
+            Pinned: 2026-10-04 16:30:00 | Reason: Pre-Ubuntu 26.04 LTS upgrade snapshot
+
+Cloud Storage (googledrive:backup/):
+  2026-10-04 16:30:00  rory_home_backup_hp_2026-09-21_005151.tar.zst.gpg
+            Status: Pinned on cloud remote
+===============================================================================
+Notice: Pinned archives are completely excluded from automatic rotation.
+        Use './backup_script.sh unpin <archive>' to release a retention hold.
+```
+
+#### Interactive Management Menu (`manage-pinned`)
+Launch the interactive pinning manager (also accessible from option 11 in the main menu):
+```bash
+$ ./backup_script.sh manage-pinned
 ```
 
 ---
@@ -678,9 +757,9 @@ $ ./backup_script.sh test-email user@example.com alerts@custom-domain.org
 
 ---
 
-## Retention Policies & GFS Pruning
+## Retention Policies, GFS Pruning & Retention Holds
 
-The backup suite supports two distinct pruning strategies for local external drives and cloud storage:
+The backup suite supports two distinct pruning strategies for local external drives and cloud storage, alongside an immutable retention hold system:
 
 ### 1. Count-Based Retention (Default)
 Retains the most recent `N` backup archives on each destination and deletes older ones:
@@ -713,6 +792,20 @@ RETENTION_YEARLY=1            # Last 1 year
 # Optional safety floor (default: 0)
 RETENTION_MIN_KEEP=0
 ```
+
+### 3. Archive Pinning & Retention Holds
+Archive pinning allows you to place an explicit retention hold on any backup snapshot:
+- **100% Rotation Immunity**: Pinned archives are detected via companion `<archive>.pinned` sidecars and are filtered out of candidate rotation pools *before* count or GFS calculations occur. Neither count-based rotation nor GFS tier pruning will ever delete a pinned archive.
+- **Quota Preservation**: Pinned archives do not consume rotation slots (`LOCAL_KEEP_COUNT` or `CLOUD_KEEP_COUNT`). For example, if `CLOUD_KEEP_COUNT=10` and you pin 3 archives, you retain all 3 pinned archives plus your 10 newest rolling unpinned backups (13 total archives).
+- **Companion Sidecar Metadata**: Pinned status is preserved alongside the archive via a lightweight companion file (`<archive>.pinned`):
+  ```text
+  Pinned: 2026-10-04 16:30:00
+  User: rory
+  Host: hp
+  Reason: Pre-Ubuntu 26.04 upgrade snapshot
+  ```
+- **Dual-Destination Mirroring & Failure Preservation**: Pinned status mirrors concurrently across both local external drives and cloud storage. If a backup run cannot reach the cloud and is preserved in `~`, the `.pinned` companion is preserved locally and uploaded in parallel when connectivity is restored.
+- **Hard Deletion Guard**: In addition to candidate pool filtering, both local and cloud rotation engines execute an explicit safety check immediately prior to any file deletion command (`rm` or `rclone deletefile`). If a companion `.pinned` sidecar exists, deletion is rejected.
 
 ---
 
