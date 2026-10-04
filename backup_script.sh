@@ -24,7 +24,7 @@
 #                 Usage: ./backup_script.sh [backup|restore|verify|list|stats|manifest|manage-preserved|init-config|check-config|help]
 #
 #        AUTHOR:  Rory Mobley, rorymobley5@gmail.com
-#       VERSION:  10.3.1
+#       VERSION:  10.4.0
 #==============================================================================
 
 #------------------------------------------------------------------------------
@@ -100,7 +100,8 @@ RETENTION_YEARLY="${RETENTION_YEARLY:-1}"
 RETENTION_MIN_KEEP="${RETENTION_MIN_KEEP:-0}"
 
 # Local Backup & Disaster Recovery Mirroring Settings
-LOCAL_DRIVE_UUID="${LOCAL_DRIVE_UUID:-bc3968af-d154-4167-b73c-5a172d2a25b8}"
+# UUID of external backup drive (e.g. from 'lsblk -f'). Set in ~/.config/backup_script/config.
+LOCAL_DRIVE_UUID="${LOCAL_DRIVE_UUID:-}"
 LOCAL_BACKUP_SUBDIR="${LOCAL_BACKUP_SUBDIR:-Backups}"
 MIRROR_SCRIPT_TO_LOCAL="${MIRROR_SCRIPT_TO_LOCAL:-true}"
 MIRROR_SCRIPT_TO_CLOUD="${MIRROR_SCRIPT_TO_CLOUD:-true}"
@@ -163,6 +164,13 @@ RCLONE_DRIVE_CHUNK_SIZE="${RCLONE_DRIVE_CHUNK_SIZE:-256M}"
 
 # Optional bandwidth limit for rclone cloud transfers (e.g. "10M", "5M", default: unlimited)
 RCLONE_BWLIMIT="${RCLONE_BWLIMIT:-}"
+
+# Resilient transfer options for rclone cloud streaming (rclone cat)
+# Includes connection and idle timeouts, multi-level retries, and optional bandwidth throttling.
+if [ -z "${RCLONE_STREAM_OPTS+x}" ]; then
+    RCLONE_STREAM_OPTS=(--retries 3 --low-level-retries 10 --contimeout 60s --timeout 30m)
+    [ -n "$RCLONE_BWLIMIT" ] && RCLONE_STREAM_OPTS+=(--bwlimit "$RCLONE_BWLIMIT")
+fi
 
 # Zstandard compression level (default: 6, max: 22 with ultra)
 ZSTD_LEVEL="${ZSTD_LEVEL:-6}"
@@ -261,6 +269,16 @@ ALERT_EMAIL="${ALERT_EMAIL:-${NOTIFICATION_EMAIL:-}}"
 # Can be enabled via config (ALERT_ON_SUCCESS="true" or EMAIL_ON_SUCCESS="true") or CLI (--email-on-success).
 ALERT_ON_SUCCESS="${ALERT_ON_SUCCESS:-${EMAIL_ON_SUCCESS:-false}}"
 
+# Send email alert when backup size changes significantly (>= threshold %) compared to previous backup.
+# Triggers if backup size increases by >= SIZE_CHANGE_THRESHOLD% or decreases by >= SIZE_CHANGE_THRESHOLD%.
+# Can be enabled/disabled via config (ALERT_ON_SIZE_CHANGE="true" or "false") or CLI (--alert-on-size-change / --no-alert-on-size-change).
+# Enabled by default.
+ALERT_ON_SIZE_CHANGE="${ALERT_ON_SIZE_CHANGE:-true}"
+
+# Percentage threshold for triggering backup size change alerts (default: 15%).
+# Triggers if backup size increases by >= threshold % or decreases by >= threshold %.
+SIZE_CHANGE_THRESHOLD="${SIZE_CHANGE_THRESHOLD:-15}"
+
 # Optional recipient email address specifically for success notifications (defaults to ALERT_EMAIL).
 SUCCESS_EMAIL="${SUCCESS_EMAIL:-${ALERT_EMAIL:-${NOTIFICATION_EMAIL:-}}}"
 
@@ -275,7 +293,7 @@ MAIL_COMMAND="${MAIL_COMMAND:-auto}"
 EMAIL_ALERT_SENT=0
 
 # Script version identifier
-SCRIPT_VERSION="10.3.1"
+SCRIPT_VERSION="10.4.0"
 
 # Path to this script for self-invocation
 SCRIPT_PATH="$(realpath "${BASH_SOURCE[0]}")"
@@ -300,6 +318,7 @@ CURRENT_VERIFY_TMP_DIR=""
 CURRENT_BACKUP_TMP_DIR=""
 CURRENT_RESTORE_TMP_DIR=""
 CURRENT_SYSTEM_STATE_TMP_DIR=""
+CURRENT_STATS_TMP_DIRS=()
 EXPECTED_RESTORE_SHA256=""
 
 # Flag to manage log file overwriting on the first log event.
@@ -418,6 +437,8 @@ DEFAULT_EXCLUDE_PATTERNS=(
     "./${TARBALL_BASENAME}_*.tar.*.gpg"
     "./${TARBALL_BASENAME}_*.sha256"
     "./${TARBALL_BASENAME}_*.manifest.json"
+    "./${TARBALL_BASENAME}_*.files.gz"
+    "./${TARBALL_BASENAME}_*.log"
 )
 
 # Initialize EXCLUDE_PATTERNS with defaults if not already explicitly defined in config
@@ -613,7 +634,7 @@ detect_archive_encryption() {
             packet_info=$(head -c 65536 "$target" 2>/dev/null | gpg --batch --list-packets 2>&1 || true)
         fi
     elif [ "$source_type" = "cloud" ]; then
-        packet_info=$(rclone cat --head 65536 "${BACKUP_DIR}${target}" 2>/dev/null | gpg --batch --list-packets 2>&1 || true)
+        packet_info=$(rclone cat "${RCLONE_STREAM_OPTS[@]}" --head 65536 "${BACKUP_DIR}${target}" 2>/dev/null | gpg --batch --list-packets 2>&1 || true)
     fi
 
     local has_sym=false has_pub=false
@@ -717,19 +738,23 @@ send_email_message() {
 
     case "$mailer" in
         msmtp)
-            local msmtp_args=()
+            local msmtp_args=(-t)
             if [ -n "$sender" ] && [[ "$sender" =~ @ ]]; then
                 msmtp_args+=(-f "$sender")
             fi
+            local msg_id
+            msg_id="<$(date +%s%N 2>/dev/null || date +%s).${RANDOM}@${HOSTNAME}>"
             {
                 printf "To: %s\n" "$recipient"
                 printf "From: %s\n" "$sender"
                 printf "Subject: %s\n" "$subject"
                 printf "Date: %s\n" "$(date -R 2>/dev/null || date)"
+                printf "Message-ID: %s\n" "$msg_id"
+                printf "MIME-Version: 1.0\n"
                 printf "Auto-Submitted: auto-generated\n"
                 printf "Content-Type: text/plain; charset=UTF-8\n"
                 printf "\n%s\n" "$email_body"
-            } | msmtp "${msmtp_args[@]}" "$recipient" 2>> "$LOG_FILE" || send_rc=$?
+            } | msmtp "${msmtp_args[@]}" 2>> "$LOG_FILE" || send_rc=$?
             ;;
         mailx)
             if [ -n "$sender" ] && [[ "$sender" =~ @ ]]; then
@@ -930,6 +955,101 @@ EOF
     else
         log_message "WARNING: Failed to send backup success email to ${recipient} (exit code ${send_rc})."
         echo "WARNING: Failed to send success notification email to ${recipient} (exit code ${send_rc})." >&2
+    fi
+
+    return "$send_rc"
+}
+
+#---
+#   FUNCTION:  send_size_change_email()
+#  DESCRIPTION:  Dispatches an automated alert email to ALERT_EMAIL when a backup's size
+#                increases or decreases by >= SIZE_CHANGE_THRESHOLD% compared to the previous backup.
+#---
+send_size_change_email() {
+    local archive_name="${1:-${ENCRYPTED_TARBALL_NAME:-unknown}}"
+    local archive_size="${2:-${archive_size_hr:-unknown}}"
+    local prev_archive_name="${3:-unknown}"
+    local prev_archive_size="${4:-unknown}"
+    local pct_change_str="${5:-unknown}"
+    local direction="${6:-changed}"
+    local diff_size_str="${7:-unknown}"
+    local duration="${8:-${duration_str:-unknown}}"
+    local verify_result="${9:-${verify_status:-None}}"
+    local cloud_result="${10:-${cloud_backup_status:-None}}"
+    local local_result="${11:-${local_backup_status:-None}}"
+    local recipient="${ALERT_EMAIL:-${NOTIFICATION_EMAIL:-}}"
+
+    if [ -z "$recipient" ]; then
+        log_message "WARNING: Backup size ${direction} by ${pct_change_str} (>= ±${SIZE_CHANGE_THRESHOLD:-15}%), but ALERT_EMAIL is not configured. Email alert skipped."
+        return 0
+    fi
+
+    log_message "Dispatching backup size change alert email to ${recipient} (change: ${pct_change_str}, threshold: ±${SIZE_CHANGE_THRESHOLD:-15}%)..."
+
+    local timestamp_str
+    timestamp_str=$(date '+%Y-%m-%d %H:%M:%S %Z')
+    local clean_pct="${pct_change_str#+}"
+    local subject="[BACKUP SIZE ALERT] ${HOSTNAME}: Backup size ${direction} by ${clean_pct} (${archive_name})"
+
+    # Extract recent log entries (last 30 lines) for summary context
+    local log_snippet=""
+    if [ -f "$LOG_FILE" ]; then
+        log_snippet=$(tail -n 30 "$LOG_FILE" 2>/dev/null)
+    fi
+
+    local direction_upper
+    direction_upper=$(echo "$direction" | tr '[:lower:]' '[:upper:]')
+
+    local email_body
+    email_body=$(cat << EOF
+================================================================================
+  AUTOMATED BACKUP SIZE CHANGE ALERT
+================================================================================
+Host:                 ${HOSTNAME}
+User:                 ${CURRENT_USER}
+Date & Time:          ${timestamp_str}
+Source Directory:     ${SOURCE_DIR}
+Script Version:       ${SCRIPT_VERSION}
+Log File:             ${LOG_FILE}
+================================================================================
+
+ALERT CONDITION:
+  Backup archive size has ${direction} by ${clean_pct} compared to the previous backup.
+  Configured threshold: ±${SIZE_CHANGE_THRESHOLD:-15}% (ALERT_ON_SIZE_CHANGE=true)
+
+BACKUP SIZE COMPARISON:
+  Current Archive:    ${archive_name}
+  Current Size:       ${archive_size}
+  Previous Archive:   ${prev_archive_name}
+  Previous Size:      ${prev_archive_size}
+  Size Difference:    ${diff_size_str} (${pct_change_str})
+  Change Direction:   ${direction_upper}
+
+BACKUP SUMMARY:
+  Duration:           ${duration}
+  Cloud Remote:       ${BACKUP_DIR} (${cloud_result})
+  Local Drive:        ${local_result}
+  Verification:       ${verify_result}
+
+================================================================================
+RECENT APPLICATION LOG (${LOG_FILE}):
+================================================================================
+${log_snippet:-No log entries available.}
+
+================================================================================
+This notification was automatically generated by backup_script.sh on ${HOSTNAME}.
+================================================================================
+EOF
+)
+
+    send_email_message "$subject" "$email_body" "$recipient"
+    local send_rc=$?
+
+    if [ "$send_rc" -eq 0 ]; then
+        log_message "Backup size change email alert successfully dispatched to ${recipient}."
+    else
+        log_message "WARNING: Failed to send backup size change alert email to ${recipient} (exit code ${send_rc})."
+        echo "WARNING: Failed to send size change alert email to ${recipient} (exit code ${send_rc})." >&2
     fi
 
     return "$send_rc"
@@ -1238,6 +1358,8 @@ run_rotation() {
 #                Returns the backup directory path if mounted, or returns 1.
 #---
 get_local_backup_path() {
+    [ -z "$LOCAL_DRIVE_UUID" ] && return 1
+
     local mount_point
     mount_point=$(findmnt -rn -o TARGET -S UUID="${LOCAL_DRIVE_UUID}" 2>/dev/null)
 
@@ -1275,6 +1397,63 @@ get_preserved_archives() {
         -name "${TARBALL_BASENAME}_*.tar.gz.gpg" -o \
         -name "${TARBALL_BASENAME}_*.tar.xz.gpg" \
     \) 2>/dev/null | sort -r
+}
+
+#---
+#   FUNCTION:  get_previous_backup_info()
+#  DESCRIPTION:  Finds the most recent completed backup prior to the given archive name
+#                across local drive, preserved archives in SOURCE_DIR, and cloud storage.
+#                Outputs: "<size_in_bytes>;<archive_filename>" or returns 1 if none found.
+#---
+get_previous_backup_info() {
+    local current_archive="${1:-}"
+    local current_base=""
+    [ -n "$current_archive" ] && current_base="$(basename "$current_archive")"
+    local local_backup_path=""
+    local_backup_path=$(get_local_backup_path 2>/dev/null || echo "")
+
+    local -a candidates=()
+
+    # 1. Check local backup drive if mounted
+    if [ -n "$local_backup_path" ] && [ -d "$local_backup_path" ]; then
+        while IFS= read -r line; do
+            [ -n "$line" ] && candidates+=("$line")
+        done < <(find "$local_backup_path" -maxdepth 1 -type f \( \
+            -name "${TARBALL_BASENAME}_*.tar.zst.gpg" -o \
+            -name "${TARBALL_BASENAME}_*.tar.gz.gpg" -o \
+            -name "${TARBALL_BASENAME}_*.tar.xz.gpg" \
+        \) -printf "%s;%f\n" 2>/dev/null)
+    fi
+
+    # 2. Check preserved archives in SOURCE_DIR
+    while IFS= read -r line; do
+        [ -n "$line" ] && candidates+=("$line")
+    done < <(find "$SOURCE_DIR" -maxdepth 1 -type f \( \
+        -name "${TARBALL_BASENAME}_*.tar.zst.gpg" -o \
+        -name "${TARBALL_BASENAME}_*.tar.gz.gpg" -o \
+        -name "${TARBALL_BASENAME}_*.tar.xz.gpg" \
+    \) -printf "%s;%f\n" 2>/dev/null)
+
+    # 3. Fallback to cloud remote if no local candidates found and cloud is available
+    if [ ${#candidates[@]} -eq 0 ] && [ "${cloud_available:-true}" = true ]; then
+        while IFS= read -r line; do
+            [ -n "$line" ] && candidates+=("$line")
+        done < <(rclone lsf --format "sp" --fast-list --contimeout 5s --timeout 15s "${BACKUP_DIR}" 2>/dev/null | grep -E "${TARBALL_BASENAME}_.*\.tar\.(zst|gz|xz)\.gpg$")
+    fi
+
+    [ ${#candidates[@]} -eq 0 ] && return 1
+
+    local best_match=""
+    if [ -n "$current_base" ]; then
+        best_match=$(printf '%s\n' "${candidates[@]}" | grep -v -F "$current_base" | grep -v '\.part' | sort -t';' -k2 -r | head -n 1)
+    else
+        best_match=$(printf '%s\n' "${candidates[@]}" | grep -v '\.part' | sort -t';' -k2 -r | head -n 1)
+    fi
+
+    [ -z "$best_match" ] && return 1
+
+    echo "$best_match"
+    return 0
 }
 
 #---
@@ -1488,9 +1667,9 @@ You can supply the decryption passphrase through any of the following methods:
    - Or prepend inline for a single execution:
        ENCRYPTION_PASSWORD="YourPassphraseHere" ./backup_script.sh restore <ARCHIVE_NAME>.tar.zst.gpg
    - Using environment variable with manual GPG:
-       gpg --batch --yes --pinentry-mode loopback --passphrase-fd 3 --decrypt <ARCHIVE_NAME>.tar.zst.gpg 3<<< "\$ENCRYPTION_PASSWORD" | ...
+       gpg --batch --yes --pinentry-mode loopback --passphrase-fd 3 --decrypt <ARCHIVE_NAME>.tar.zst.gpg 3< <(printf '%s' "\$ENCRYPTION_PASSWORD") | ...
        # Or via stdin pipe:
-       echo "\$ENCRYPTION_PASSWORD" | gpg --batch --yes --pinentry-mode loopback --passphrase-fd 0 --decrypt <ARCHIVE_NAME>.tar.zst.gpg | ...
+       printf '%s' "\$ENCRYPTION_PASSWORD" | gpg --batch --yes --pinentry-mode loopback --passphrase-fd 0 --decrypt <ARCHIVE_NAME>.tar.zst.gpg | ...
 
 4. Public Key / Asymmetric GPG Decryption:
    - If the archive was encrypted using a GPG public key, no passphrase file is required.
@@ -1553,7 +1732,7 @@ If you prefer not to run the script or need to extract files on any Unix system:
    gpg --batch --yes --pinentry-mode loopback --passphrase-file "${PASSWORD_FILE}" --decrypt <ARCHIVE_NAME>.tar.zst.gpg | zstd -dc --memory=${ZSTD_DECOMPRESS_MEMORY} | tar -xpvf - -C /home/${CURRENT_USER}/
 
 5. Non-interactive restore using an environment variable:
-   gpg --batch --yes --pinentry-mode loopback --passphrase-fd 3 --decrypt <ARCHIVE_NAME>.tar.zst.gpg 3<<< "\$ENCRYPTION_PASSWORD" | zstd -dc --memory=${ZSTD_DECOMPRESS_MEMORY} | tar -xpvf - -C /home/${CURRENT_USER}/
+   gpg --batch --yes --pinentry-mode loopback --passphrase-fd 3 --decrypt <ARCHIVE_NAME>.tar.zst.gpg 3< <(printf '%s' "\$ENCRYPTION_PASSWORD") | zstd -dc --memory=${ZSTD_DECOMPRESS_MEMORY} | tar -xpvf - -C /home/${CURRENT_USER}/
 
 --------------------------------------------------------------------------------
 METHOD 3: Post-Restore System Configuration Replay
@@ -1672,24 +1851,50 @@ mirror_script_and_cheatsheet_to_cloud() {
     fi
 
     local temp_readme="${staging_scratch}/RESTORE_README.txt"
+    local has_readme=false
     if generate_disaster_recovery_cheatsheet "${temp_readme}" "${cloud_dest}"; then
+        has_readme=true
+    fi
+
+    local -a mirror_pids=()
+    local -a mirror_descs=()
+    local -a mirror_logs=()
+    local m_tmp="${staging_scratch}/mirror_tmp_$$"
+    mkdir -p "$m_tmp" 2>/dev/null || m_tmp="${staging_scratch}"
+
+    if [ "$has_readme" = true ] && [ -f "$temp_readme" ]; then
         echo "Uploading disaster recovery cheatsheet to ${cloud_dest}..."
-        if rclone copy --retries 3 --low-level-retries 5 --timeout 5m "${temp_readme}" "${cloud_dest}" >> "$rclone_log_file" 2>&1; then
-            log_message "Disaster recovery cheatsheet mirrored to cloud (${cloud_dest}RESTORE_README.txt)."
-        else
-            log_message "WARNING: Failed to upload disaster recovery cheatsheet to cloud storage."
-        fi
-        rm -f "${temp_readme}" 2>/dev/null || true
+        local rlog="${m_tmp}/readme.log"
+        rclone copy --retries 3 --low-level-retries 5 --timeout 5m "${temp_readme}" "${cloud_dest}" > "$rlog" 2>&1 &
+        mirror_pids+=($!)
+        mirror_descs+=("Disaster recovery cheatsheet")
+        mirror_logs+=("$rlog")
     fi
 
     if [ -n "$SCRIPT_PATH" ] && [ -f "$SCRIPT_PATH" ]; then
         echo "Mirroring standalone backup script to ${cloud_dest}..."
-        if rclone copy --retries 3 --low-level-retries 5 --timeout 5m "${SCRIPT_PATH}" "${cloud_dest}" >> "$rclone_log_file" 2>&1; then
-            log_message "Standalone backup script mirrored to cloud (${cloud_dest}backup_script.sh)."
-        else
-            log_message "WARNING: Failed to upload standalone backup script to cloud storage."
-        fi
+        local slog="${m_tmp}/script.log"
+        rclone copy --retries 3 --low-level-retries 5 --timeout 5m "${SCRIPT_PATH}" "${cloud_dest}" > "$slog" 2>&1 &
+        mirror_pids+=($!)
+        mirror_descs+=("Standalone backup script")
+        mirror_logs+=("$slog")
     fi
+
+    local i
+    for ((i=0; i<${#mirror_pids[@]}; i++)); do
+        if wait "${mirror_pids[i]}"; then
+            log_message "${mirror_descs[i]} mirrored to cloud."
+            [ -f "${mirror_logs[i]}" ] && cat "${mirror_logs[i]}" >> "$rclone_log_file" 2>/dev/null
+            rm -f "${mirror_logs[i]}" 2>/dev/null
+        else
+            log_message "WARNING: Failed to upload ${mirror_descs[i]} to cloud storage."
+            [ -f "${mirror_logs[i]}" ] && cat "${mirror_logs[i]}" >> "$rclone_log_file" 2>/dev/null
+            rm -f "${mirror_logs[i]}" 2>/dev/null
+        fi
+    done
+
+    rm -f "${temp_readme}" 2>/dev/null || true
+    rmdir "$m_tmp" 2>/dev/null || true
     echo "Disaster recovery bootstrap mirrored to cloud storage."
 }
 
@@ -1701,6 +1906,11 @@ mirror_script_and_cheatsheet_to_cloud() {
 handle_local_backup() {
     local file_path="$1"
     local file_name="$2"
+
+    if [ -z "$LOCAL_DRIVE_UUID" ]; then
+        log_message "Local drive backup skipped (LOCAL_DRIVE_UUID not configured)."
+        return 0
+    fi
 
     echo "Checking for local backup drive (UUID: ${LOCAL_DRIVE_UUID})..."
     
@@ -1895,17 +2105,48 @@ upload_preserved_archive() {
     [ -n "$RCLONE_BWLIMIT" ] && rclone_common_opts+=(--bwlimit "$RCLONE_BWLIMIT")
 
     if rclone copy "${rclone_common_opts[@]}" "${rclone_progress_opts[@]}" --log-file "$rclone_log" "${target_file}" "${BACKUP_DIR}"; then
+        # Parallelize companion sidecar uploads
+        local -a pres_sidecar_pids=()
+        local -a pres_sidecar_descs=()
+        local -a pres_sidecar_logs=()
+        local ptmp="${TMPDIR:-/tmp}/pres_sidecars_$$"
+        mkdir -p "$ptmp" 2>/dev/null || ptmp="/tmp"
+
         if [ -f "$target_sha256" ]; then
-            rclone copy --retries 3 --low-level-retries 5 --timeout 5m "$target_sha256" "${BACKUP_DIR}" >> "$rclone_log" 2>&1 || true
+            local slog="${ptmp}/sha256.log"
+            rclone copy --retries 3 --low-level-retries 5 --timeout 5m "$target_sha256" "${BACKUP_DIR}" > "$slog" 2>&1 &
+            pres_sidecar_pids+=($!)
+            pres_sidecar_descs+=("SHA-256 sidecar")
+            pres_sidecar_logs+=("$slog")
         fi
         local target_manifest="${target_file}.manifest.json"
         if [ -f "$target_manifest" ]; then
-            rclone copy --retries 3 --low-level-retries 5 --timeout 5m "$target_manifest" "${BACKUP_DIR}" >> "$rclone_log" 2>&1 || true
+            local mlog="${ptmp}/manifest.log"
+            rclone copy --retries 3 --low-level-retries 5 --timeout 5m "$target_manifest" "${BACKUP_DIR}" > "$mlog" 2>&1 &
+            pres_sidecar_pids+=($!)
+            pres_sidecar_descs+=("backup manifest")
+            pres_sidecar_logs+=("$mlog")
         fi
         local target_index="${target_file}.files.gz"
         if [ -f "$target_index" ]; then
-            rclone copy --retries 3 --low-level-retries 5 --timeout 5m "$target_index" "${BACKUP_DIR}" >> "$rclone_log" 2>&1 || true
+            local ilog="${ptmp}/index.log"
+            rclone copy --retries 3 --low-level-retries 5 --timeout 5m "$target_index" "${BACKUP_DIR}" > "$ilog" 2>&1 &
+            pres_sidecar_pids+=($!)
+            pres_sidecar_descs+=("file list index")
+            pres_sidecar_logs+=("$ilog")
         fi
+        local p_idx
+        for ((p_idx=0; p_idx<${#pres_sidecar_pids[@]}; p_idx++)); do
+            if wait "${pres_sidecar_pids[p_idx]}"; then
+                [ -f "${pres_sidecar_logs[p_idx]}" ] && cat "${pres_sidecar_logs[p_idx]}" >> "$rclone_log" 2>/dev/null
+                rm -f "${pres_sidecar_logs[p_idx]}" 2>/dev/null
+            else
+                log_message "WARNING: Failed to upload ${pres_sidecar_descs[p_idx]} to cloud storage."
+                [ -f "${pres_sidecar_logs[p_idx]}" ] && cat "${pres_sidecar_logs[p_idx]}" >> "$rclone_log" 2>/dev/null
+                rm -f "${pres_sidecar_logs[p_idx]}" 2>/dev/null
+            fi
+        done
+        rmdir "$ptmp" 2>/dev/null || true
         local duration_str
         duration_str=$(format_duration $(( SECONDS - upload_start_time )))
         log_message "Preserved archive upload completed successfully: ${target_name} (${target_hr} in ${duration_str})"
@@ -2397,8 +2638,18 @@ relaunch_closed_applications() {
             echo "  Relaunching: $bin..."
             local launched_ok=false
 
-            # 1. Attempt desktop-level launch via gtk-launch or gio launch
-            if [ -n "${DISPLAY:-${WAYLAND_DISPLAY:-}}" ]; then
+            # 1. When running inside a systemd service (INVOCATION_ID set), prioritize systemd-run
+            # to decouple child processes completely from the backup unit's cgroup into app.slice.
+            if [ -n "${INVOCATION_ID:-}" ] && command -v systemd-run &>/dev/null && [ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ]; then
+                if systemd-run --user --slice=app.slice --unit="app-${bin}-$(date +%s%N)" "$bin" </dev/null &>/dev/null; then
+                    launched+=("$bin")
+                    log_message "Relaunched $bin via systemd-run (app.slice decoupled from service cgroup)."
+                    launched_ok=true
+                fi
+            fi
+
+            # 2. Attempt desktop-level launch via gtk-launch or gio launch
+            if [ "$launched_ok" = false ] && [ -n "${DISPLAY:-${WAYLAND_DISPLAY:-}}" ]; then
                 if command -v gtk-launch &>/dev/null; then
                     for d_id in "${desktop_candidates[@]}"; do
                         if gtk-launch "$d_id" &>/dev/null; then
@@ -2429,7 +2680,7 @@ relaunch_closed_applications() {
                 fi
             fi
 
-            # 2. Decouple from calling cgroup via systemd-run (critical when running inside systemd services)
+            # 3. Decouple from calling cgroup via systemd-run (fallback if not already launched)
             if [ "$launched_ok" = false ] && command -v systemd-run &>/dev/null && [ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ]; then
                 if systemd-run --user --slice=app.slice --unit="app-${bin}-$(date +%s%N)" "$bin" </dev/null &>/dev/null; then
                     launched+=("$bin")
@@ -2499,6 +2750,23 @@ run_backup() {
             --no-email-on-success|--no-alert-on-success)
                 ALERT_ON_SUCCESS="false"
                 shift
+                ;;
+            --alert-on-size-change|--email-on-size-change)
+                ALERT_ON_SIZE_CHANGE="true"
+                shift
+                ;;
+            --no-alert-on-size-change|--no-email-on-size-change)
+                ALERT_ON_SIZE_CHANGE="false"
+                shift
+                ;;
+            --size-change-threshold|--size-threshold)
+                if [ -n "${2:-}" ]; then
+                    SIZE_CHANGE_THRESHOLD="$2"
+                    shift 2
+                else
+                    echo "ERROR: Missing percentage threshold for --size-change-threshold." >&2
+                    return 1
+                fi
                 ;;
             --success-email|-se)
                 if [ -n "${2:-}" ]; then
@@ -3214,13 +3482,13 @@ run_backup() {
         done
         gpg_encrypt_args+=(--encrypt --symmetric --cipher-algo AES256 -z 0 --s2k-mode 3 --s2k-count 65011712 --s2k-digest-algo SHA512 --passphrase-fd 3 -o "${FULL_ENCRYPTED_PATH}")
         tar "${tar_fs_opts[@]}" "${tar_index_opts[@]}" --totals --sparse --exclude-caches-all "${tar_tag_opts[@]}" "${tar_ignore_opts[@]}" -l --acls --xattrs --xattrs-include='*' -I "${zstd_compress_cmd}" "${tar_checkpoint_opts[@]}" -cpf - "${TAR_EXCLUDE_OPTS[@]}" "${tar_staging_opts[@]}" -C "${SOURCE_DIR}" . 2>"$tar_fifo" \
-            | gpg "${gpg_encrypt_args[@]}" 3<<< "$ENCRYPTION_PASSWORD" 2>"$gpg_err_file"
+            | gpg "${gpg_encrypt_args[@]}" 3< <(printf '%s' "$ENCRYPTION_PASSWORD") 2>"$gpg_err_file"
     else
         # Default: symmetric
         tar "${tar_fs_opts[@]}" "${tar_index_opts[@]}" --totals --sparse --exclude-caches-all "${tar_tag_opts[@]}" "${tar_ignore_opts[@]}" -l --acls --xattrs --xattrs-include='*' -I "${zstd_compress_cmd}" "${tar_checkpoint_opts[@]}" -cpf - "${TAR_EXCLUDE_OPTS[@]}" "${tar_staging_opts[@]}" -C "${SOURCE_DIR}" . 2>"$tar_fifo" \
             | gpg --batch --yes --no-tty --pinentry-mode loopback --symmetric --cipher-algo AES256 \
                   -z 0 --s2k-mode 3 --s2k-count 65011712 --s2k-digest-algo SHA512 \
-                  --passphrase-fd 3 -o "${FULL_ENCRYPTED_PATH}" 3<<< "$ENCRYPTION_PASSWORD" 2>"$gpg_err_file"
+                  --passphrase-fd 3 -o "${FULL_ENCRYPTED_PATH}" 3< <(printf '%s' "$ENCRYPTION_PASSWORD") 2>"$gpg_err_file"
     fi
     local pipe_statuses=("${PIPESTATUS[@]}")
     wait "$tee_pid" 2>/dev/null || true
@@ -3428,6 +3696,56 @@ run_backup() {
         archive_size_hr=$(numfmt --to=iec --suffix=B "${archive_bytes}" 2>/dev/null || echo "${archive_bytes}B")
     fi
 
+    # Determine previous backup metrics and size delta
+    local prev_backup_info=""
+    local prev_archive_name=""
+    local prev_archive_bytes=0
+    local prev_archive_size_hr=""
+    local size_diff_bytes=0
+    local size_pct_change=0.0
+    local size_pct_abs=0.0
+    local size_pct_str=""
+    local size_direction=""
+    local size_diff_hr=""
+    local size_delta_summary=""
+    local size_threshold_exceeded=false
+
+    if prev_backup_info=$(get_previous_backup_info "${ENCRYPTED_TARBALL_NAME}"); then
+        prev_archive_bytes="${prev_backup_info%%;*}"
+        prev_archive_name="${prev_backup_info#*;}"
+        if [ -n "$prev_archive_bytes" ] && [ "$prev_archive_bytes" -gt 0 ] 2>/dev/null; then
+            prev_archive_size_hr=$(numfmt --to=iec --suffix=B "${prev_archive_bytes}" 2>/dev/null || echo "${prev_archive_bytes}B")
+            if [ "$archive_bytes" -gt 0 ] 2>/dev/null; then
+                read -r size_diff_bytes size_pct_change size_direction size_pct_abs size_threshold_exceeded < <(awk \
+                    -v cur="$archive_bytes" -v prev="$prev_archive_bytes" -v thresh="${SIZE_CHANGE_THRESHOLD:-15}" 'BEGIN {
+                    diff = cur - prev;
+                    pct = (diff / prev) * 100.0;
+                    dir = (diff >= 0) ? "increased" : "decreased";
+                    abs_pct = (pct < 0) ? -pct : pct;
+                    exceeded = (abs_pct >= thresh) ? "true" : "false";
+                    printf "%d %.1f %s %.1f %s\n", diff, pct, dir, abs_pct, exceeded;
+                }' 2>/dev/null || echo "0 0.0 same 0.0 false")
+
+                local diff_sign="+"
+                local pct_sign="+"
+                if [ "$size_diff_bytes" -lt 0 ] 2>/dev/null; then
+                    diff_sign="-"
+                    pct_sign=""
+                fi
+                local diff_abs="${size_diff_bytes#-}"
+                size_diff_hr="${diff_sign}$(numfmt --to=iec --suffix=B "${diff_abs}" 2>/dev/null || echo "${diff_abs}B")"
+                size_pct_str="${pct_sign}${size_pct_change}%"
+                size_delta_summary="${size_diff_hr} (${size_pct_str})"
+
+                if [ "$size_threshold_exceeded" = "true" ]; then
+                    log_message "NOTICE: Backup size ${size_direction} by ${size_pct_abs}% (${archive_size_hr} vs previous ${prev_archive_size_hr} from ${prev_archive_name}, threshold: ±${SIZE_CHANGE_THRESHOLD:-15}%)."
+                else
+                    log_message "Backup size delta: ${size_delta_summary} compared to previous ${prev_archive_name} (${prev_archive_size_hr})."
+                fi
+            fi
+        fi
+    fi
+
     # Calculate compression ratio and space savings percentage
     local compression_ratio="unknown"
     local space_savings_percent="unknown"
@@ -3552,23 +3870,47 @@ run_backup() {
             update_manifest_destination_status "${local_backup_path}/${ENCRYPTED_MANIFEST_NAME}" "cloud_backup" "OK"
         fi
 
-        # Also upload the companion SHA-256 sidecar to cloud
+        # Also upload companion sidecars (SHA-256, manifest, file list index) in parallel
+        echo "Uploading companion sidecars to ${BACKUP_DIR} in parallel..."
+        local -a sidecar_pids=()
+        local -a sidecar_descs=()
+        local -a sidecar_logs=()
+
         if [ -f "${FULL_SHA256_PATH}" ]; then
-            echo "Uploading SHA-256 sidecar to ${BACKUP_DIR}..."
-            rclone copy --retries 3 --low-level-retries 5 --timeout 5m "${FULL_SHA256_PATH}" "${BACKUP_DIR}" >> "$rclone_log" 2>&1 || log_message "WARNING: Failed to upload SHA-256 sidecar to cloud storage."
+            local sha_log="${SCRATCH_DIR}/sidecar_sha256.log"
+            rclone copy --retries 3 --low-level-retries 5 --timeout 5m "${FULL_SHA256_PATH}" "${BACKUP_DIR}" > "$sha_log" 2>&1 &
+            sidecar_pids+=($!)
+            sidecar_descs+=("SHA-256 sidecar")
+            sidecar_logs+=("$sha_log")
         fi
 
-        # Also upload the companion manifest to cloud
         if [ -f "${FULL_MANIFEST_PATH}" ]; then
-            echo "Uploading backup manifest to ${BACKUP_DIR}..."
-            rclone copy --retries 3 --low-level-retries 5 --timeout 5m "${FULL_MANIFEST_PATH}" "${BACKUP_DIR}" >> "$rclone_log" 2>&1 || log_message "WARNING: Failed to upload backup manifest to cloud storage."
+            local manifest_log="${SCRATCH_DIR}/sidecar_manifest.log"
+            rclone copy --retries 3 --low-level-retries 5 --timeout 5m "${FULL_MANIFEST_PATH}" "${BACKUP_DIR}" > "$manifest_log" 2>&1 &
+            sidecar_pids+=($!)
+            sidecar_descs+=("backup manifest")
+            sidecar_logs+=("$manifest_log")
         fi
 
-        # Also upload the companion file list index to cloud
         if [ -f "${FULL_INDEX_PATH}" ]; then
-            echo "Uploading file list index to ${BACKUP_DIR}..."
-            rclone copy --retries 3 --low-level-retries 5 --timeout 5m "${FULL_INDEX_PATH}" "${BACKUP_DIR}" >> "$rclone_log" 2>&1 || log_message "WARNING: Failed to upload file list index to cloud storage."
+            local index_log="${SCRATCH_DIR}/sidecar_index.log"
+            rclone copy --retries 3 --low-level-retries 5 --timeout 5m "${FULL_INDEX_PATH}" "${BACKUP_DIR}" > "$index_log" 2>&1 &
+            sidecar_pids+=($!)
+            sidecar_descs+=("file list index")
+            sidecar_logs+=("$index_log")
         fi
+
+        local sc_idx
+        for ((sc_idx=0; sc_idx<${#sidecar_pids[@]}; sc_idx++)); do
+            if wait "${sidecar_pids[sc_idx]}"; then
+                [ -f "${sidecar_logs[sc_idx]}" ] && cat "${sidecar_logs[sc_idx]}" >> "$rclone_log" 2>/dev/null
+                rm -f "${sidecar_logs[sc_idx]}" 2>/dev/null
+            else
+                log_message "WARNING: Failed to upload ${sidecar_descs[sc_idx]} to cloud storage."
+                [ -f "${sidecar_logs[sc_idx]}" ] && cat "${sidecar_logs[sc_idx]}" >> "$rclone_log" 2>/dev/null
+                rm -f "${sidecar_logs[sc_idx]}" 2>/dev/null
+            fi
+        done
 
         # Also mirror disaster recovery cheatsheet and standalone script to cloud if enabled
         if [ "$MIRROR_SCRIPT_TO_CLOUD" = true ] || [ "$MIRROR_SCRIPT_TO_CLOUD" = "1" ]; then
@@ -3684,6 +4026,9 @@ run_backup() {
     duration_str=$(format_duration "$duration_secs")
 
     local summary_oneline="Backup completed in ${duration_str} | Size: ${archive_size_hr}"
+    if [ -n "$size_delta_summary" ]; then
+        summary_oneline="${summary_oneline} (delta: ${size_delta_summary} vs ${prev_archive_size_hr})"
+    fi
     if [ -n "$uncompressed_size_hr" ] && [ "$uncompressed_size_hr" != "unknown" ] && [ -n "$compression_ratio" ] && [ "$compression_ratio" != "unknown" ]; then
         summary_oneline="${summary_oneline} (uncompressed: ${uncompressed_size_hr}, ${compression_ratio} / ${space_savings_percent} savings)"
     fi
@@ -3699,6 +4044,10 @@ run_backup() {
     echo "=================================================="
     echo "  Archive:      ${ENCRYPTED_TARBALL_NAME}"
     echo "  Archive Size: ${archive_size_hr}"
+    if [ -n "$size_delta_summary" ]; then
+        echo "  Previous:     ${prev_archive_size_hr} (${prev_archive_name})"
+        echo "  Size Change:  ${size_delta_summary}"
+    fi
     if [ -n "$uncompressed_size_hr" ] && [ "$uncompressed_size_hr" != "unknown" ]; then
         echo "  Uncompressed: ${uncompressed_size_hr}"
         if [ -n "$compression_ratio" ] && [ "$compression_ratio" != "unknown" ]; then
@@ -3736,12 +4085,17 @@ run_backup() {
     fi
 
     local size_notif="Size: ${archive_size_hr}"
-    if [ -n "$compression_ratio" ] && [ "$compression_ratio" != "unknown" ]; then
+    if [ -n "$size_delta_summary" ]; then
+        size_notif="${size_notif} (${size_delta_summary})"
+    elif [ -n "$compression_ratio" ] && [ "$compression_ratio" != "unknown" ]; then
         size_notif="${size_notif} (${compression_ratio})"
     fi
     local notif_msg="Archive: ${ENCRYPTED_TARBALL_NAME}"$'\n'"${size_notif} • Duration: ${duration_str}"$'\n'"Cloud: ${cloud_backup_status} • Local: ${local_backup_status}"
     if [ "$do_verify" = true ]; then
         notif_msg="${notif_msg}"$'\n'"Verification: ${verify_status}"
+    fi
+    if [ "$size_threshold_exceeded" = "true" ]; then
+        notif_msg="${notif_msg}"$'\n'"⚠️ Size Alert: ${size_direction} by ${size_pct_abs}% (threshold ±${SIZE_CHANGE_THRESHOLD:-15}%)"
     fi
     send_notification "$notif_urgency" "$notif_title" "$notif_msg" "$notif_icon"
 
@@ -3759,7 +4113,14 @@ run_backup() {
     if [ "$backup_overall_status" = "failure" ]; then
         send_failure_email "Backup Verification or Storage Failure" "Backup concluded with errors: verification=${verify_status}, cloud=${cloud_backup_status}, local=${local_backup_status}."
     elif [ "$backup_overall_status" = "success" ]; then
-        if [[ "${ALERT_ON_SUCCESS}" =~ ^([Tt][Rr][Uu][Ee]|1|[Yy][Ee][Ss]|[Oo][Nn])$ ]]; then
+        # If size threshold exceeded and size change alert is enabled, send the comprehensive size change alert
+        # (which already includes full backup statistics) instead of dispatching two redundant emails back-to-back.
+        if [ "$size_threshold_exceeded" = "true" ] && [[ "${ALERT_ON_SIZE_CHANGE}" =~ ^([Tt][Rr][Uu][Ee]|1|[Yy][Ee][Ss]|[Oo][Nn])$ ]]; then
+            send_size_change_email "${ENCRYPTED_TARBALL_NAME}" "${archive_size_hr}" \
+                "${prev_archive_name}" "${prev_archive_size_hr}" "${size_pct_str}" \
+                "${size_direction}" "${size_diff_hr}" "${duration_str}" \
+                "${verify_status}" "${cloud_backup_status}" "${local_backup_status}"
+        elif [[ "${ALERT_ON_SUCCESS}" =~ ^([Tt][Rr][Uu][Ee]|1|[Yy][Ee][Ss]|[Oo][Nn])$ ]]; then
             send_success_email "${ENCRYPTED_TARBALL_NAME}" "${archive_size_hr}" "${duration_str}" "${verify_status}" "${cloud_backup_status}" "${local_backup_status}" "${compression_ratio:-}" "${uncompressed_size_hr:-}"
         fi
     fi
@@ -3934,7 +4295,7 @@ verify_restore_checksum() {
 
         echo "Checking for cloud SHA-256 sidecar checksum (${archive_choice}.sha256)..."
         local cloud_sha_output
-        cloud_sha_output=$(rclone cat "${BACKUP_DIR}${archive_choice}.sha256" 2>/dev/null || true)
+        cloud_sha_output=$(rclone cat "${RCLONE_STREAM_OPTS[@]}" "${BACKUP_DIR}${archive_choice}.sha256" 2>/dev/null || true)
         if [ -n "$cloud_sha_output" ]; then
             local expected_hash
             expected_hash=$(awk '{print $1}' <<< "$cloud_sha_output")
@@ -4002,7 +4363,7 @@ interactive_browse_archive_files() {
         if rclone lsf "${BACKUP_DIR}${backup_choice}.files.gz" &>/dev/null; then
             echo "Downloading file index from cloud for fast zero-decryption browsing..."
             temp_index_download=$(mktemp "${SCRATCH_DIR:-/tmp}/files_idx_XXXXXX.gz")
-            if rclone cat "${BACKUP_DIR}${backup_choice}.files.gz" > "$temp_index_download" 2>/dev/null && [ -s "$temp_index_download" ]; then
+            if rclone cat "${RCLONE_STREAM_OPTS[@]}" "${BACKUP_DIR}${backup_choice}.files.gz" > "$temp_index_download" 2>/dev/null && [ -s "$temp_index_download" ]; then
                 local_index_file="$temp_index_download"
             else
                 rm -f "$temp_index_download" 2>/dev/null
@@ -4921,8 +5282,20 @@ apply_system_state() {
             if [[ "$restore_crontab_confirm" =~ ^[Yy]$ ]]; then
                 echo "Restoring crontab..."
                 log_message "Restoring crontab from ${crontab_f}"
-                crontab "$crontab_f"
-                log_message "Crontab restored."
+                local crontab_bak="${HOME}/.crontab.pre-restore.$(date +%s).bak"
+                if crontab -l > "$crontab_bak" 2>/dev/null && [ -s "$crontab_bak" ]; then
+                    log_message "Safety backup of active crontab saved to ${crontab_bak}"
+                    echo "  Safety backup of current crontab saved to ${crontab_bak}"
+                else
+                    rm -f "$crontab_bak" 2>/dev/null
+                fi
+                if crontab "$crontab_f"; then
+                    log_message "Crontab restored successfully."
+                    echo "Crontab restored successfully."
+                else
+                    log_message "WARNING: Failed to restore crontab from ${crontab_f}"
+                    echo "WARNING: Failed to restore crontab from ${crontab_f}" >&2
+                fi
             else
                 echo "Skipping crontab restore."
                 log_message "Crontab restore skipped by user."
@@ -5268,19 +5641,19 @@ run_restore_system() {
             gpg --batch --yes --no-tty --decrypt "$src_file" 2>/dev/null \
                 | tar --wildcards --ignore-failed-read "$tar_comp_opt" -xpf - -C "$staging_tmp" "${manifest_patterns[@]}" 2>/dev/null || true
         else
-            gpg --batch --yes --no-tty --pinentry-mode loopback --decrypt --passphrase-fd 3 "$src_file" 3<<< "$ENCRYPTION_PASSWORD" 2>/dev/null \
+            gpg --batch --yes --no-tty --pinentry-mode loopback --decrypt --passphrase-fd 3 "$src_file" 3< <(printf '%s' "$ENCRYPTION_PASSWORD") 2>/dev/null \
                 | tar --wildcards --ignore-failed-read "$tar_comp_opt" -xpf - -C "$staging_tmp" "${manifest_patterns[@]}" 2>/dev/null || true
         fi
     else
         # Cloud streaming
         echo "Streaming manifest files from cloud..."
         if [ "$archive_enc_type" = "asymmetric" ] && [ -z "$ENCRYPTION_PASSWORD" ]; then
-            rclone cat "${BACKUP_DIR}${backup_choice}" 2>/dev/null \
+            rclone cat "${RCLONE_STREAM_OPTS[@]}" "${BACKUP_DIR}${backup_choice}" 2>/dev/null \
                 | gpg --batch --yes --no-tty --decrypt 2>/dev/null \
                 | tar --wildcards --ignore-failed-read "$tar_comp_opt" -xpf - -C "$staging_tmp" "${manifest_patterns[@]}" 2>/dev/null || true
         else
-            rclone cat "${BACKUP_DIR}${backup_choice}" 2>/dev/null \
-                | gpg --batch --yes --no-tty --pinentry-mode loopback --decrypt --passphrase-fd 3 3<<< "$ENCRYPTION_PASSWORD" 2>/dev/null \
+            rclone cat "${RCLONE_STREAM_OPTS[@]}" "${BACKUP_DIR}${backup_choice}" 2>/dev/null \
+                | gpg --batch --yes --no-tty --pinentry-mode loopback --decrypt --passphrase-fd 3 3< <(printf '%s' "$ENCRYPTION_PASSWORD") 2>/dev/null \
                 | tar --wildcards --ignore-failed-read "$tar_comp_opt" -xpf - -C "$staging_tmp" "${manifest_patterns[@]}" 2>/dev/null || true
         fi
     fi
@@ -6024,7 +6397,7 @@ run_restore() {
             gpg --batch --yes --no-tty --decrypt "$SOURCE_ENCRYPTED_FILE" 2>"$gpg_err_file" \
                 | tar "${tar_wildcard_opts[@]}" --acls --xattrs "${tar_compress_opts[@]}" "${tar_checkpoint_opts[@]}" -xpf - -C "${restore_target}" "${restore_patterns[@]}"
         else
-            gpg --batch --yes --no-tty --pinentry-mode loopback --decrypt --passphrase-fd 3 "$SOURCE_ENCRYPTED_FILE" 3<<< "$ENCRYPTION_PASSWORD" 2>"$gpg_err_file" \
+            gpg --batch --yes --no-tty --pinentry-mode loopback --decrypt --passphrase-fd 3 "$SOURCE_ENCRYPTED_FILE" 3< <(printf '%s' "$ENCRYPTION_PASSWORD") 2>"$gpg_err_file" \
                 | tar "${tar_wildcard_opts[@]}" --acls --xattrs "${tar_compress_opts[@]}" "${tar_checkpoint_opts[@]}" -xpf - -C "${restore_target}" "${restore_patterns[@]}"
         fi
         local local_pipe_statuses=("${PIPESTATUS[@]}")
@@ -6047,7 +6420,7 @@ run_restore() {
             expected_stream_sha="${EXPECTED_RESTORE_SHA256:-}"
             if [ -z "$expected_stream_sha" ]; then
                 local sidecar_data
-                sidecar_data=$(rclone cat "${BACKUP_DIR}${ENCRYPTED_TARBALL_NAME}.sha256" 2>/dev/null || true)
+                sidecar_data=$(rclone cat "${RCLONE_STREAM_OPTS[@]}" "${BACKUP_DIR}${ENCRYPTED_TARBALL_NAME}.sha256" 2>/dev/null || true)
                 expected_stream_sha=$(awk '{print $1}' <<< "$sidecar_data")
             fi
             if [ -n "$expected_stream_sha" ]; then
@@ -6074,14 +6447,14 @@ run_restore() {
             local sha_pid=$!
 
             if [ "$archive_enc_type" = "asymmetric" ] && [ -z "$ENCRYPTION_PASSWORD" ]; then
-                rclone cat "${BACKUP_DIR}${ENCRYPTED_TARBALL_NAME}" 2>"$rclone_err_file" \
+                rclone cat "${RCLONE_STREAM_OPTS[@]}" "${BACKUP_DIR}${ENCRYPTED_TARBALL_NAME}" 2>"$rclone_err_file" \
                     | tee "$hash_fifo" \
                     | gpg --batch --yes --no-tty --decrypt - 2>"$gpg_err_file" \
                     | tar "${tar_wildcard_opts[@]}" --acls --xattrs "${tar_compress_opts[@]}" "${tar_checkpoint_opts[@]}" -xpf - -C "${restore_target}" "${restore_patterns[@]}"
             else
-                rclone cat "${BACKUP_DIR}${ENCRYPTED_TARBALL_NAME}" 2>"$rclone_err_file" \
+                rclone cat "${RCLONE_STREAM_OPTS[@]}" "${BACKUP_DIR}${ENCRYPTED_TARBALL_NAME}" 2>"$rclone_err_file" \
                     | tee "$hash_fifo" \
-                    | gpg --batch --yes --no-tty --pinentry-mode loopback --decrypt --passphrase-fd 3 - 3<<< "$ENCRYPTION_PASSWORD" 2>"$gpg_err_file" \
+                    | gpg --batch --yes --no-tty --pinentry-mode loopback --decrypt --passphrase-fd 3 - 3< <(printf '%s' "$ENCRYPTION_PASSWORD") 2>"$gpg_err_file" \
                     | tar "${tar_wildcard_opts[@]}" --acls --xattrs "${tar_compress_opts[@]}" "${tar_checkpoint_opts[@]}" -xpf - -C "${restore_target}" "${restore_patterns[@]}"
             fi
             local cloud_pipe_statuses=("${PIPESTATUS[@]}")
@@ -6094,12 +6467,12 @@ run_restore() {
             [ -f "$actual_hash_file" ] && actual_stream_sha=$(< "$actual_hash_file")
         else
             if [ "$archive_enc_type" = "asymmetric" ] && [ -z "$ENCRYPTION_PASSWORD" ]; then
-                rclone cat "${BACKUP_DIR}${ENCRYPTED_TARBALL_NAME}" 2>"$rclone_err_file" \
+                rclone cat "${RCLONE_STREAM_OPTS[@]}" "${BACKUP_DIR}${ENCRYPTED_TARBALL_NAME}" 2>"$rclone_err_file" \
                     | gpg --batch --yes --no-tty --decrypt - 2>"$gpg_err_file" \
                     | tar "${tar_wildcard_opts[@]}" --acls --xattrs "${tar_compress_opts[@]}" "${tar_checkpoint_opts[@]}" -xpf - -C "${restore_target}" "${restore_patterns[@]}"
             else
-                rclone cat "${BACKUP_DIR}${ENCRYPTED_TARBALL_NAME}" 2>"$rclone_err_file" \
-                    | gpg --batch --yes --no-tty --pinentry-mode loopback --decrypt --passphrase-fd 3 - 3<<< "$ENCRYPTION_PASSWORD" 2>"$gpg_err_file" \
+                rclone cat "${RCLONE_STREAM_OPTS[@]}" "${BACKUP_DIR}${ENCRYPTED_TARBALL_NAME}" 2>"$rclone_err_file" \
+                    | gpg --batch --yes --no-tty --pinentry-mode loopback --decrypt --passphrase-fd 3 - 3< <(printf '%s' "$ENCRYPTION_PASSWORD") 2>"$gpg_err_file" \
                     | tar "${tar_wildcard_opts[@]}" --acls --xattrs "${tar_compress_opts[@]}" "${tar_checkpoint_opts[@]}" -xpf - -C "${restore_target}" "${restore_patterns[@]}"
             fi
             local cloud_pipe_statuses=("${PIPESTATUS[@]}")
@@ -6162,7 +6535,7 @@ run_restore() {
             local staged_expected="${EXPECTED_RESTORE_SHA256:-}"
             if [ -z "$staged_expected" ]; then
                 local staged_cloud_sha
-                staged_cloud_sha=$(rclone cat "${BACKUP_DIR}${ENCRYPTED_TARBALL_NAME}.sha256" 2>/dev/null || true)
+                staged_cloud_sha=$(rclone cat "${RCLONE_STREAM_OPTS[@]}" "${BACKUP_DIR}${ENCRYPTED_TARBALL_NAME}.sha256" 2>/dev/null || true)
                 staged_expected=$(awk '{print $1}' <<< "$staged_cloud_sha")
             fi
             if [ -n "$staged_expected" ]; then
@@ -6207,7 +6580,7 @@ run_restore() {
             gpg --batch --yes --no-tty --decrypt "$FULL_ENCRYPTED_PATH" 2>"$gpg_err_file" \
                 | tar "${tar_wildcard_opts[@]}" --acls --xattrs "${tar_compress_opts[@]}" "${tar_checkpoint_opts[@]}" -xpf - -C "${restore_target}" "${restore_patterns[@]}"
         else
-            gpg --batch --yes --no-tty --pinentry-mode loopback --decrypt --passphrase-fd 3 "$FULL_ENCRYPTED_PATH" 3<<< "$ENCRYPTION_PASSWORD" 2>"$gpg_err_file" \
+            gpg --batch --yes --no-tty --pinentry-mode loopback --decrypt --passphrase-fd 3 "$FULL_ENCRYPTED_PATH" 3< <(printf '%s' "$ENCRYPTION_PASSWORD") 2>"$gpg_err_file" \
                 | tar "${tar_wildcard_opts[@]}" --acls --xattrs "${tar_compress_opts[@]}" "${tar_checkpoint_opts[@]}" -xpf - -C "${restore_target}" "${restore_patterns[@]}"
         fi
         local staged_pipe_statuses=("${PIPESTATUS[@]}")
@@ -6456,7 +6829,7 @@ display_manifest() {
                 local cloud_manifest_name=""
                 cloud_manifest_name=$(rclone lsf --fast-list "${BACKUP_DIR}" 2>/dev/null | grep -E "${TARBALL_BASENAME}_.*\.manifest\.json$" | sort -r | head -n 1)
                 if [ -n "$cloud_manifest_name" ]; then
-                    manifest_content=$(rclone cat "${BACKUP_DIR}${cloud_manifest_name}" 2>/dev/null)
+                    manifest_content=$(rclone cat "${RCLONE_STREAM_OPTS[@]}" "${BACKUP_DIR}${cloud_manifest_name}" 2>/dev/null)
                     manifest_source="cloud storage (${BACKUP_DIR}${cloud_manifest_name})"
                 fi
             fi
@@ -6483,7 +6856,7 @@ display_manifest() {
             if [ -z "$manifest_content" ]; then
                 echo "Searching cloud storage for manifest: ${clean_target}.manifest.json..." >&2
                 if rclone lsf "${BACKUP_DIR}${clean_target}.manifest.json" &>/dev/null; then
-                    manifest_content=$(rclone cat "${BACKUP_DIR}${clean_target}.manifest.json" 2>/dev/null)
+                    manifest_content=$(rclone cat "${RCLONE_STREAM_OPTS[@]}" "${BACKUP_DIR}${clean_target}.manifest.json" 2>/dev/null)
                     manifest_source="cloud storage (${BACKUP_DIR}${clean_target}.manifest.json)"
                 fi
             fi
@@ -6735,8 +7108,10 @@ show_backup_stats() {
 
     cleanup_stats_tmp() {
         for d in "${cloud_temp_dirs[@]}"; do
-            [ -n "$d" ] && [ -d "$d" ] && rm -rf "$d"
+            [ -n "$d" ] && [ -d "$d" ] && rm -rf "$d" 2>/dev/null
         done
+        cloud_temp_dirs=()
+        CURRENT_STATS_TMP_DIRS=()
     }
     trap cleanup_stats_tmp RETURN
 
@@ -6756,6 +7131,7 @@ show_backup_stats() {
         local stats_tmp_dir
         stats_tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/backup_stats_cloud.XXXXXX")
         cloud_temp_dirs+=("$stats_tmp_dir")
+        CURRENT_STATS_TMP_DIRS+=("$stats_tmp_dir")
         echo "Fetching backup manifests from cloud storage (${BACKUP_DIR})..." >&2
         if rclone copy --include "${TARBALL_BASENAME}_*.manifest.json" "${BACKUP_DIR}" "$stats_tmp_dir" 2>/dev/null; then
             mapfile -t manifest_files < <(find "$stats_tmp_dir" -maxdepth 1 -type f -name "${TARBALL_BASENAME}_*.manifest.json" 2>/dev/null | sort)
@@ -6772,6 +7148,7 @@ show_backup_stats() {
         local stats_tmp_dir
         stats_tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/backup_stats_cloud.XXXXXX")
         cloud_temp_dirs+=("$stats_tmp_dir")
+        CURRENT_STATS_TMP_DIRS+=("$stats_tmp_dir")
         echo "Fetching backup manifests from cloud storage (${BACKUP_DIR})..." >&2
         if rclone copy --include "${TARBALL_BASENAME}_*.manifest.json" "${BACKUP_DIR}" "$stats_tmp_dir" 2>/dev/null; then
             local -a cloud_files=()
@@ -6791,6 +7168,7 @@ show_backup_stats() {
             local stats_tmp_dir
             stats_tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/backup_stats_cloud.XXXXXX")
             cloud_temp_dirs+=("$stats_tmp_dir")
+            CURRENT_STATS_TMP_DIRS+=("$stats_tmp_dir")
             echo "No local manifests found. Fetching from cloud storage (${BACKUP_DIR})..." >&2
             if rclone copy --include "${TARBALL_BASENAME}_*.manifest.json" "${BACKUP_DIR}" "$stats_tmp_dir" 2>/dev/null; then
                 mapfile -t manifest_files < <(find "$stats_tmp_dir" -maxdepth 1 -type f -name "${TARBALL_BASENAME}_*.manifest.json" 2>/dev/null | sort)
@@ -7506,24 +7884,24 @@ list_archive_contents() {
         else
             if [ "$long_format" = true ]; then
                 if [ -n "$pattern_filter" ]; then
-                    rclone cat "${BACKUP_DIR}${backup_choice}.files.gz" 2>/dev/null \
+                    rclone cat "${RCLONE_STREAM_OPTS[@]}" "${BACKUP_DIR}${backup_choice}.files.gz" 2>/dev/null \
                         | gzip -dc 2>/dev/null \
                         | grep --color="$grep_color" -E -i "$pattern_filter" \
                         | "${pager_cmd[@]}" || index_query_failed=true
                 else
-                    rclone cat "${BACKUP_DIR}${backup_choice}.files.gz" 2>/dev/null \
+                    rclone cat "${RCLONE_STREAM_OPTS[@]}" "${BACKUP_DIR}${backup_choice}.files.gz" 2>/dev/null \
                         | gzip -dc 2>/dev/null \
                         | "${pager_cmd[@]}" || index_query_failed=true
                 fi
             else
                 if [ -n "$pattern_filter" ]; then
-                    rclone cat "${BACKUP_DIR}${backup_choice}.files.gz" 2>/dev/null \
+                    rclone cat "${RCLONE_STREAM_OPTS[@]}" "${BACKUP_DIR}${backup_choice}.files.gz" 2>/dev/null \
                         | gzip -dc 2>/dev/null \
                         | sed -E 's/^([^[:space:]]+[[:space:]]+){5}//' \
                         | grep --color="$grep_color" -E -i "$pattern_filter" \
                         | "${pager_cmd[@]}" || index_query_failed=true
                 else
-                    rclone cat "${BACKUP_DIR}${backup_choice}.files.gz" 2>/dev/null \
+                    rclone cat "${RCLONE_STREAM_OPTS[@]}" "${BACKUP_DIR}${backup_choice}.files.gz" 2>/dev/null \
                         | gzip -dc 2>/dev/null \
                         | sed -E 's/^([^[:space:]]+[[:space:]]+){5}//' \
                         | "${pager_cmd[@]}" || index_query_failed=true
@@ -7618,7 +7996,7 @@ list_archive_contents() {
                     | grep --color="$grep_color" -E -i "$pattern_filter" \
                     | "${pager_cmd[@]}"
             else
-                "${gpg_cmd[@]}" 3<<< "$ENCRYPTION_PASSWORD" 2>"$gpg_err_file" \
+                "${gpg_cmd[@]}" 3< <(printf '%s' "$ENCRYPTION_PASSWORD") 2>"$gpg_err_file" \
                     | tar "${tar_compress_opts[@]}" "$tar_list_flag" - 2>/dev/null \
                     | grep --color="$grep_color" -E -i "$pattern_filter" \
                     | "${pager_cmd[@]}"
@@ -7632,7 +8010,7 @@ list_archive_contents() {
                     | tar "${tar_compress_opts[@]}" "$tar_list_flag" - 2>/dev/null \
                     | "${pager_cmd[@]}"
             else
-                "${gpg_cmd[@]}" 3<<< "$ENCRYPTION_PASSWORD" 2>"$gpg_err_file" \
+                "${gpg_cmd[@]}" 3< <(printf '%s' "$ENCRYPTION_PASSWORD") 2>"$gpg_err_file" \
                     | tar "${tar_compress_opts[@]}" "$tar_list_flag" - 2>/dev/null \
                     | "${pager_cmd[@]}"
             fi
@@ -7650,14 +8028,14 @@ list_archive_contents() {
 
         if [ -n "$pattern_filter" ]; then
             if [ "$archive_enc_type" = "asymmetric" ] && [ -z "$ENCRYPTION_PASSWORD" ]; then
-                rclone cat "${BACKUP_DIR}${backup_choice}" 2>"$rclone_err_file" \
+                rclone cat "${RCLONE_STREAM_OPTS[@]}" "${BACKUP_DIR}${backup_choice}" 2>"$rclone_err_file" \
                     | "${gpg_cmd[@]}" 2>"$gpg_err_file" \
                     | tar "${tar_compress_opts[@]}" "$tar_list_flag" - 2>/dev/null \
                     | grep --color="$grep_color" -E -i "$pattern_filter" \
                     | "${pager_cmd[@]}"
             else
-                rclone cat "${BACKUP_DIR}${backup_choice}" 2>"$rclone_err_file" \
-                    | "${gpg_cmd[@]}" 3<<< "$ENCRYPTION_PASSWORD" 2>"$gpg_err_file" \
+                rclone cat "${RCLONE_STREAM_OPTS[@]}" "${BACKUP_DIR}${backup_choice}" 2>"$rclone_err_file" \
+                    | "${gpg_cmd[@]}" 3< <(printf '%s' "$ENCRYPTION_PASSWORD") 2>"$gpg_err_file" \
                     | tar "${tar_compress_opts[@]}" "$tar_list_flag" - 2>/dev/null \
                     | grep --color="$grep_color" -E -i "$pattern_filter" \
                     | "${pager_cmd[@]}"
@@ -7668,13 +8046,13 @@ list_archive_contents() {
             tar_exit_code=${pipe_statuses[2]}
         else
             if [ "$archive_enc_type" = "asymmetric" ] && [ -z "$ENCRYPTION_PASSWORD" ]; then
-                rclone cat "${BACKUP_DIR}${backup_choice}" 2>"$rclone_err_file" \
+                rclone cat "${RCLONE_STREAM_OPTS[@]}" "${BACKUP_DIR}${backup_choice}" 2>"$rclone_err_file" \
                     | "${gpg_cmd[@]}" 2>"$gpg_err_file" \
                     | tar "${tar_compress_opts[@]}" "$tar_list_flag" - 2>/dev/null \
                     | "${pager_cmd[@]}"
             else
-                rclone cat "${BACKUP_DIR}${backup_choice}" 2>"$rclone_err_file" \
-                    | "${gpg_cmd[@]}" 3<<< "$ENCRYPTION_PASSWORD" 2>"$gpg_err_file" \
+                rclone cat "${RCLONE_STREAM_OPTS[@]}" "${BACKUP_DIR}${backup_choice}" 2>"$rclone_err_file" \
+                    | "${gpg_cmd[@]}" 3< <(printf '%s' "$ENCRYPTION_PASSWORD") 2>"$gpg_err_file" \
                     | tar "${tar_compress_opts[@]}" "$tar_list_flag" - 2>/dev/null \
                     | "${pager_cmd[@]}"
             fi
@@ -7718,6 +8096,7 @@ find_file() {
     local source_filter="auto"
     local long_format=false
     local match_limit=0
+    local fixed_strings=false
     local use_pager=false
     local do_restore=false
     local restore_dest=""
@@ -7728,6 +8107,10 @@ find_file() {
 
     while [ $# -gt 0 ]; do
         case "$1" in
+            --fixed-strings|-F)
+                fixed_strings=true
+                shift
+                ;;
             --restore|-r)
                 do_restore=true
                 shift
@@ -7781,6 +8164,7 @@ find_file() {
                 echo
                 echo "Options:"
                 echo "  <pattern>                         Text, filename, or regex pattern to search"
+                echo "  --fixed-strings, -F               Treat pattern as literal fixed string (not regex)"
                 echo "  --restore, -r                     Select and restore a matching file directly"
                 echo "  --dest, -d, --target <dir>        Destination directory for restore (default: prompt)"
                 echo "  --source, -s <auto|local|cloud|all> Target archive locations (default: auto)"
@@ -7916,6 +8300,13 @@ find_file() {
     local total_archives_matched=0
     local global_match_idx=0
 
+    local -a grep_match_opts=(-i)
+    if [ "$fixed_strings" = true ]; then
+        grep_match_opts+=(-F)
+    else
+        grep_match_opts+=(-E)
+    fi
+
     for arc_name in "${archive_order[@]}"; do
         local meta="${archive_indices[$arc_name]}"
         local src_type="${meta%%|*}"
@@ -7923,9 +8314,9 @@ find_file() {
 
         local raw_matches=()
         if [ "$src_type" = "cloud" ]; then
-            mapfile -t raw_matches < <(rclone cat "${BACKUP_DIR}${src_target}" 2>/dev/null | gzip -dc 2>/dev/null | grep -E -i "$search_pattern" || true)
+            mapfile -t raw_matches < <(rclone cat "${RCLONE_STREAM_OPTS[@]}" "${BACKUP_DIR}${src_target}" 2>/dev/null | gzip -dc 2>/dev/null | grep "${grep_match_opts[@]}" "$search_pattern" || true)
         else
-            mapfile -t raw_matches < <(gzip -dc "$src_target" 2>/dev/null | grep -E -i "$search_pattern" || true)
+            mapfile -t raw_matches < <(gzip -dc "$src_target" 2>/dev/null | grep "${grep_match_opts[@]}" "$search_pattern" || true)
         fi
 
         if [ ${#raw_matches[@]} -gt 0 ]; then
@@ -7976,7 +8367,7 @@ find_file() {
                 local formatted_line
                 formatted_line=$(printf " [%d] %s" "$global_match_idx" "$display_line")
                 if [ "$use_pager" = true ]; then
-                    grep --color="$grep_color" -E -i "$search_pattern" <<< "$formatted_line" >> "$results_tmp" 2>/dev/null || echo "$formatted_line" >> "$results_tmp"
+                    grep --color="$grep_color" "${grep_match_opts[@]}" "$search_pattern" <<< "$formatted_line" >> "$results_tmp" 2>/dev/null || echo "$formatted_line" >> "$results_tmp"
                 else
                     echo "$formatted_line" >> "$results_tmp"
                 fi
@@ -8483,13 +8874,13 @@ run_verify() {
     else
         # Cloud verification
         local cloud_sha_output
-        cloud_sha_output=$(rclone cat "${BACKUP_DIR}${backup_choice}.sha256" 2>/dev/null)
+        cloud_sha_output=$(rclone cat "${RCLONE_STREAM_OPTS[@]}" "${BACKUP_DIR}${backup_choice}.sha256" 2>/dev/null)
         if [ -n "$cloud_sha_output" ]; then
             if [ "$checksum_only" = true ]; then
                 echo "Streaming cloud archive to verify SHA-256 checksum..."
                 local expected_hash actual_hash
                 expected_hash=$(awk '{print $1}' <<< "$cloud_sha_output")
-                actual_hash=$(rclone cat "${BACKUP_DIR}${backup_choice}" 2>/dev/null | sha256sum | awk '{print $1}')
+                actual_hash=$(rclone cat "${RCLONE_STREAM_OPTS[@]}" "${BACKUP_DIR}${backup_choice}" 2>/dev/null | sha256sum | awk '{print $1}')
                 if [ -n "$actual_hash" ] && [ "$actual_hash" = "$expected_hash" ]; then
                     echo "Cloud SHA-256 checksum verified OK (${actual_hash:0:12}...)."
                     log_message "Cloud SHA-256 checksum valid for ${backup_choice}."
@@ -8584,7 +8975,7 @@ run_verify() {
                         print NR > cf
                     }'
         else
-            gpg --batch --yes --no-tty --pinentry-mode loopback --decrypt --passphrase-fd 3 "$source_file" 3<<< "$ENCRYPTION_PASSWORD" 2>"$gpg_err_file" \
+            gpg --batch --yes --no-tty --pinentry-mode loopback --decrypt --passphrase-fd 3 "$source_file" 3< <(printf '%s' "$ENCRYPTION_PASSWORD") 2>"$gpg_err_file" \
                 | tar "${tar_compress_opts[@]}" -tf - 2>"$tar_err_file" \
                 | awk -v cf="$count_file" -v tty="$is_tty" -v label="Verifying" '
                     tty == 1 && NR % 5000 == 0 { printf "\r%s: %d items scanned...", label, NR; fflush() }
@@ -8604,7 +8995,7 @@ run_verify() {
     else
         echo "Streaming archive from cloud storage (${BACKUP_DIR})..."
         if [ "$archive_enc_type" = "asymmetric" ] && [ -z "$ENCRYPTION_PASSWORD" ]; then
-            rclone cat "${BACKUP_DIR}${backup_choice}" 2>"$rclone_err_file" \
+            rclone cat "${RCLONE_STREAM_OPTS[@]}" "${BACKUP_DIR}${backup_choice}" 2>"$rclone_err_file" \
                 | gpg --batch --yes --no-tty --decrypt - 2>"$gpg_err_file" \
                 | tar "${tar_compress_opts[@]}" -tf - 2>"$tar_err_file" \
                 | awk -v cf="$count_file" -v tty="$is_tty" -v label="Verifying cloud archive" '
@@ -8619,8 +9010,8 @@ run_verify() {
                         print NR > cf
                     }'
         else
-            rclone cat "${BACKUP_DIR}${backup_choice}" 2>"$rclone_err_file" \
-                | gpg --batch --yes --no-tty --pinentry-mode loopback --decrypt --passphrase-fd 3 - 3<<< "$ENCRYPTION_PASSWORD" 2>"$gpg_err_file" \
+            rclone cat "${RCLONE_STREAM_OPTS[@]}" "${BACKUP_DIR}${backup_choice}" 2>"$rclone_err_file" \
+                | gpg --batch --yes --no-tty --pinentry-mode loopback --decrypt --passphrase-fd 3 - 3< <(printf '%s' "$ENCRYPTION_PASSWORD") 2>"$gpg_err_file" \
                 | tar "${tar_compress_opts[@]}" -tf - 2>"$tar_err_file" \
                 | awk -v cf="$count_file" -v tty="$is_tty" -v label="Verifying cloud archive" '
                     tty == 1 && NR % 5000 == 0 { printf "\r%s: %d items scanned...", label, NR; fflush() }
@@ -8798,6 +9189,14 @@ cleanup() {
             CURRENT_SYSTEM_STATE_TMP_DIR=""
         fi
 
+        # Clean up any temporary statistics cloud directories
+        if [ ${#CURRENT_STATS_TMP_DIRS[@]} -gt 0 ]; then
+            for d in "${CURRENT_STATS_TMP_DIRS[@]}"; do
+                [ -n "$d" ] && [ -d "$d" ] && rm -rf "$d" 2>/dev/null
+            done
+            CURRENT_STATS_TMP_DIRS=()
+        fi
+
         # Relaunch applications if they were closed and not yet relaunched
         relaunch_closed_applications
 
@@ -8846,6 +9245,9 @@ cleanup() {
 
     # Clean up inhibition sentinel if trapped before normal completion
     [ -n "${INHIBIT_SENTINEL:-}" ] && rm -f "$INHIBIT_SENTINEL" 2>/dev/null
+
+    # Secure memory isolation: wipe plaintext passphrases from shell environment
+    unset ENCRYPTION_PASSWORD BACKUP_ENCRYPTION_PASSWORD pass1 pass2 _cred_val _sec_val
 
     exit "$exit_code"
 }
@@ -8984,6 +9386,7 @@ Wants=network-online.target
 Type=oneshot
 ExecStart=${SCRIPT_PATH} backup
 TimeoutStartSec=0
+KillMode=mixed
 Environment="PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin"
 Nice=19
 IOSchedulingClass=best-effort
@@ -9338,6 +9741,11 @@ init_config() {
 # Default: "" (unlimited)
 #RCLONE_BWLIMIT=""
 
+# Optional transfer options for rclone cloud streaming operations ('rclone cat').
+# Provides network resiliency against transient socket drops during restores and verification.
+# Default: (--retries 3 --low-level-retries 10 --contimeout 60s --timeout 30m)
+#RCLONE_STREAM_OPTS=(--retries 3 --low-level-retries 10 --contimeout 60s --timeout 30m)
+
 #------------------------------------------------------------------------------
 # 2. Source & Staging Directories
 #------------------------------------------------------------------------------
@@ -9416,8 +9824,9 @@ init_config() {
 #------------------------------------------------------------------------------
 # Filesystem UUID of the external drive partition to use for local backup mirroring.
 # You can find your drive UUID using 'lsblk -f' or 'blkid'.
-# Default: bc3968af-d154-4167-b73c-5a172d2a25b8
-#LOCAL_DRIVE_UUID="bc3968af-d154-4167-b73c-5a172d2a25b8"
+# Leave empty ("") if you only want cloud backups.
+# Default: ""
+#LOCAL_DRIVE_UUID=""
 
 # Subdirectory on the mounted local drive partition where backup archives are stored.
 # Default: Backups
@@ -9773,12 +10182,24 @@ init_config() {
 #------------------------------------------------------------------------------
 # 15. Email Alerts & Notifications
 #------------------------------------------------------------------------------
-# Recipient email address to notify if backup operations encounter fatal errors
-# or post-backup verification failure.
+# Recipient email address to notify if backup operations encounter fatal errors,
+# post-backup verification failure, or significant backup size changes.
 # Leave empty or commented out to disable email notifications.
 # Example: ALERT_EMAIL="alert@domain.com"
 # Default: ""
 #ALERT_EMAIL=""
+
+# Send email alert when backup size increases or decreases by >= threshold %
+# compared to the previous backup. Uses ALERT_EMAIL.
+# Options: true, false
+# Default: true
+#ALERT_ON_SIZE_CHANGE="true"
+
+# Percentage threshold for backup size change alerts (default: 15).
+# Triggers if size increases by >= threshold % or decreases by >= threshold %.
+# Example: SIZE_CHANGE_THRESHOLD="15"
+# Default: 15
+#SIZE_CHANGE_THRESHOLD=15
 
 # Send an email notification when a backup completes successfully.
 # Options: true, false
@@ -10202,8 +10623,8 @@ check_config() {
             if [ -n "$test_pass" ] && [ "$test_pass" != "EnterPasswordHere" ]; then
                 local gpg_probe_res
                 if gpg_probe_res=$(echo "check_config_test_payload" \
-                    | gpg --batch --yes --no-tty --pinentry-mode loopback --symmetric --cipher-algo AES256 --passphrase-fd 3 3<<< "$test_pass" 2>/dev/null \
-                    | gpg --batch --yes --no-tty --pinentry-mode loopback --decrypt --passphrase-fd 3 3<<< "$test_pass" 2>/dev/null) \
+                    | gpg --batch --yes --no-tty --pinentry-mode loopback --symmetric --cipher-algo AES256 --passphrase-fd 3 3< <(printf '%s' "$test_pass") 2>/dev/null \
+                    | gpg --batch --yes --no-tty --pinentry-mode loopback --decrypt --passphrase-fd 3 3< <(printf '%s' "$test_pass") 2>/dev/null) \
                     && [ "$gpg_probe_res" = "check_config_test_payload" ]; then
                     report_ok "GPG Symmetric Test" "Symmetric AES-256 loopback encryption & decryption passed"
                 else
@@ -10273,48 +10694,52 @@ check_config() {
 
     # 4. Local Drive Destination
     print_section "Local Drive Destination:"
-    local drive_dev=""
-    if [ -b "/dev/disk/by-uuid/${LOCAL_DRIVE_UUID}" ]; then
-        drive_dev="/dev/disk/by-uuid/${LOCAL_DRIVE_UUID}"
-    elif command -v blkid &>/dev/null && blkid -U "${LOCAL_DRIVE_UUID}" &>/dev/null; then
-        drive_dev=$(blkid -U "${LOCAL_DRIVE_UUID}" 2>/dev/null)
-    fi
-
-    if [ -n "$drive_dev" ]; then
-        report_ok "Local Drive Device" "Partition detected at ${drive_dev} (UUID: ${LOCAL_DRIVE_UUID})"
+    if [ -z "$LOCAL_DRIVE_UUID" ]; then
+        report_info "Local Drive Destination" "Unconfigured (LOCAL_DRIVE_UUID is empty; backups will run in cloud-only mode)"
     else
-        report_warn "Local Drive Device" "Drive UUID ${LOCAL_DRIVE_UUID} not detected (drive unplugged or UUID changed)"
-    fi
-
-    local local_dest
-    if local_dest=$(get_local_backup_path 2>/dev/null) && [ -n "$local_dest" ]; then
-        report_ok "Local Drive Mount" "Mounted at ${local_dest%/*}"
-        if [ -d "$local_dest" ]; then
-            if [ -w "$local_dest" ]; then
-                local drive_free_kb drive_free_hr
-                drive_free_kb=$(df -Pk "$local_dest" 2>/dev/null | awk 'NR==2 {print $4}')
-                drive_free_hr=$(numfmt --to=iec --from-unit=1024 "${drive_free_kb}" 2>/dev/null || echo "${drive_free_kb}K")
-                report_ok "Local Backup Subdir" "${local_dest} is writable (${drive_free_hr} free)"
-            else
-                report_fail "Local Backup Subdir" "${local_dest} exists but is not writable"
-            fi
-        else
-            local parent_mount="${local_dest%/*}"
-            if [ -w "$parent_mount" ]; then
-                report_ok "Local Backup Subdir" "${LOCAL_BACKUP_SUBDIR} will be created in ${parent_mount}"
-            else
-                report_fail "Local Backup Subdir" "${parent_mount} is mounted read-only or not writable"
-            fi
+        local drive_dev=""
+        if [ -b "/dev/disk/by-uuid/${LOCAL_DRIVE_UUID}" ]; then
+            drive_dev="/dev/disk/by-uuid/${LOCAL_DRIVE_UUID}"
+        elif command -v blkid &>/dev/null && blkid -U "${LOCAL_DRIVE_UUID}" &>/dev/null; then
+            drive_dev=$(blkid -U "${LOCAL_DRIVE_UUID}" 2>/dev/null)
         fi
-    else
+
         if [ -n "$drive_dev" ]; then
-            if command -v udisksctl &>/dev/null; then
-                report_warn "Local Drive Mount" "Drive partition connected but unmounted (udisksctl available for auto-mount on run)"
+            report_ok "Local Drive Device" "Partition detected at ${drive_dev} (UUID: ${LOCAL_DRIVE_UUID})"
+        else
+            report_warn "Local Drive Device" "Drive UUID ${LOCAL_DRIVE_UUID} not detected (drive unplugged or UUID changed)"
+        fi
+
+        local local_dest
+        if local_dest=$(get_local_backup_path 2>/dev/null) && [ -n "$local_dest" ]; then
+            report_ok "Local Drive Mount" "Mounted at ${local_dest%/*}"
+            if [ -d "$local_dest" ]; then
+                if [ -w "$local_dest" ]; then
+                    local drive_free_kb drive_free_hr
+                    drive_free_kb=$(df -Pk "$local_dest" 2>/dev/null | awk 'NR==2 {print $4}')
+                    drive_free_hr=$(numfmt --to=iec --from-unit=1024 "${drive_free_kb}" 2>/dev/null || echo "${drive_free_kb}K")
+                    report_ok "Local Backup Subdir" "${local_dest} is writable (${drive_free_hr} free)"
+                else
+                    report_fail "Local Backup Subdir" "${local_dest} exists but is not writable"
+                fi
             else
-                report_warn "Local Drive Mount" "Drive partition connected but unmounted (udisksctl not found for unprivileged mounting)"
+                local parent_mount="${local_dest%/*}"
+                if [ -w "$parent_mount" ]; then
+                    report_ok "Local Backup Subdir" "${LOCAL_BACKUP_SUBDIR} will be created in ${parent_mount}"
+                else
+                    report_fail "Local Backup Subdir" "${parent_mount} is mounted read-only or not writable"
+                fi
             fi
         else
-            report_info "Local Drive Mount" "External drive not connected; cloud-only backups will proceed if cloud is reachable"
+            if [ -n "$drive_dev" ]; then
+                if command -v udisksctl &>/dev/null; then
+                    report_warn "Local Drive Mount" "Drive partition connected but unmounted (udisksctl available for auto-mount on run)"
+                else
+                    report_warn "Local Drive Mount" "Drive partition connected but unmounted (udisksctl not found for unprivileged mounting)"
+                fi
+            else
+                report_info "Local Drive Mount" "External drive not connected; cloud-only backups will proceed if cloud is reachable"
+            fi
         fi
     fi
 
@@ -10349,6 +10774,7 @@ check_config() {
     else
         report_info "Rclone Bandwidth Limit" "Unlimited (RCLONE_BWLIMIT not set)"
     fi
+    report_ok "Rclone Stream Resilience" "Active (retries: 3, low-level-retries: 10, timeout: 30m, contimeout: 60s)"
 
     # 6. Compression & Retention Settings
     print_section "Compression & Retention Settings:"
@@ -10552,9 +10978,25 @@ check_config() {
         report_info "Success Email Alert" "Disabled (set ALERT_ON_SUCCESS=\"true\" in config or use --email-on-success)"
     fi
 
+    # Size Change Email Alert Check
+    if [[ "${ALERT_ON_SIZE_CHANGE}" =~ ^([Tt][Rr][Uu][Ee]|1|[Yy][Ee][Ss]|[Oo][Nn])$ ]]; then
+        local size_recip="${ALERT_EMAIL:-${NOTIFICATION_EMAIL:-}}"
+        if [ -n "$size_recip" ]; then
+            if [[ "$size_recip" =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$ ]]; then
+                report_ok "Size Change Alert" "Enabled: ${size_recip} (threshold: ±${SIZE_CHANGE_THRESHOLD:-15}%)"
+            else
+                report_warn "Size Change Alert" "Enabled, but unusual email format: ${size_recip}"
+            fi
+        else
+            report_warn "Size Change Alert" "Enabled (ALERT_ON_SIZE_CHANGE=true, threshold: ±${SIZE_CHANGE_THRESHOLD:-15}%), but ALERT_EMAIL is not configured"
+        fi
+    else
+        report_info "Size Change Alert" "Disabled (set ALERT_ON_SIZE_CHANGE=\"true\" in config or use --alert-on-size-change)"
+    fi
+
     # 7. Dependencies
     print_section "Tools & Dependencies:"
-    local req_tools=("tar" "rclone" "gpg" "pkill" "pgrep" "hostname" "zstd" "findmnt" "flock" "df" "awk" "numfmt" "sha256sum")
+    local req_tools=("tar" "rclone" "gpg" "pkill" "pgrep" "hostname" "zstd" "findmnt" "flock" "df" "awk" "numfmt" "sha256sum" "gzip")
     local missing_req=()
     for tool in "${req_tools[@]}"; do
         if ! command -v "$tool" &>/dev/null; then
@@ -10740,8 +11182,9 @@ show_main_menu() {
         echo "11. Systemd Backup Timer (Schedule/Status)"
         echo "12. Check Configuration & Environment"
         echo "13. Initialize Configuration File"
-        echo "14. Exit"
-        if ! read -r -p "Please enter your choice [1-14]: " choice; then
+        echo "14. Send Test Email Notification"
+        echo "15. Exit"
+        if ! read -r -p "Please enter your choice [1-15]: " choice; then
             echo -e "\nExiting."
             break
         fi
@@ -10760,7 +11203,8 @@ show_main_menu() {
             11) manage_systemd_timer ;;
             12) check_config ;;
             13) init_config ;;
-            14) echo "Exiting."; break ;;
+            14) test_email ;;
+            15) echo "Exiting."; break ;;
             *) echo "Invalid option." ;;
         esac
     done
@@ -10781,6 +11225,9 @@ case "${1:-}" in
         echo "                                  --alert-email, -ae <email>        Recipient email address to notify if backup fails"
         echo "                                  --email-on-success                Send email notification on successful backup"
         echo "                                  --no-email-on-success             Do not send email notification on successful backup"
+        echo "                                  --alert-on-size-change            Send email alert if backup size changes by >= threshold% (default: on)"
+        echo "                                  --no-alert-on-size-change         Disable email alerts for backup size changes"
+        echo "                                  --size-change-threshold <pct>     Percentage threshold for size change alerts (default: 15)"
         echo "                                  --success-email, -se <email>      Recipient email address for success notifications"
         echo "                                  --alert-from, -af <email>         Sender email address for failure/success notifications"
         echo "                                  --apps-action, -aa <mode>         Running applications consistency action"
@@ -10936,10 +11383,6 @@ if [ -n "$1" ]; then
             ;;
         init-config|--init-config|init_config)
             init_config "${@:2}"
-            exit $?
-            ;;
-        test-email|test_email|send-test-email)
-            test_email "${@:2}"
             exit $?
             ;;
         backup|restore|restore-system|restore_system|system-restore|system_restore|verify|manage-preserved|clean-preserved)
