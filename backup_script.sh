@@ -21,10 +21,10 @@
 #                 You should have received a copy of the GNU General Public License
 #                 along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #
-#                 Usage: ./backup_script.sh [backup|restore|verify|list|stats|manifest|manage-preserved|init-config|check-config|help]
+#                 Usage: ./backup_script.sh [backup|restore|verify|list|stats|manifest|manage-preserved|pin|unpin|pinned|init-config|check-config|help]
 #
 #        AUTHOR:  Rory Mobley, rorymobley5@gmail.com
-#       VERSION:  10.4.0
+#       VERSION:  10.5.0
 #==============================================================================
 
 #------------------------------------------------------------------------------
@@ -293,7 +293,7 @@ MAIL_COMMAND="${MAIL_COMMAND:-auto}"
 EMAIL_ALERT_SENT=0
 
 # Script version identifier
-SCRIPT_VERSION="10.4.0"
+SCRIPT_VERSION="10.5.0"
 
 # Path to this script for self-invocation
 SCRIPT_PATH="$(realpath "${BASH_SOURCE[0]}")"
@@ -310,10 +310,12 @@ CURRENT_ENCRYPTED_ARCHIVE=""
 CURRENT_SHA256_FILE=""
 CURRENT_MANIFEST_FILE=""
 CURRENT_FILE_INDEX_FILE=""
+CURRENT_PIN_FILE=""
 CURRENT_LOCAL_TEMP_ARCHIVE=""
 CURRENT_LOCAL_TEMP_SHA256=""
 CURRENT_LOCAL_TEMP_MANIFEST=""
 CURRENT_LOCAL_TEMP_INDEX=""
+CURRENT_LOCAL_TEMP_PIN=""
 CURRENT_VERIFY_TMP_DIR=""
 CURRENT_BACKUP_TMP_DIR=""
 CURRENT_RESTORE_TMP_DIR=""
@@ -438,6 +440,7 @@ DEFAULT_EXCLUDE_PATTERNS=(
     "./${TARBALL_BASENAME}_*.sha256"
     "./${TARBALL_BASENAME}_*.manifest.json"
     "./${TARBALL_BASENAME}_*.files.gz"
+    "./${TARBALL_BASENAME}_*.pinned"
     "./${TARBALL_BASENAME}_*.log"
 )
 
@@ -1320,11 +1323,32 @@ calculate_tiered_retention_prune_list() {
 #---
 run_rotation() {
     local -a files_to_delete=()
+    local cloud_listing=""
+    cloud_listing=$(rclone lsf --fast-list "${BACKUP_DIR}" 2>/dev/null)
+
+    # Discover pinned archives on cloud remote
+    local -A cloud_pinned_map=()
+    while IFS= read -r pin_file; do
+        [ -z "$pin_file" ] && continue
+        local base_arch="${pin_file%.pinned}"
+        cloud_pinned_map["$base_arch"]=1
+    done < <(grep -E "${TARBALL_BASENAME}_.*\.tar\.(zst|gz|xz)\.gpg\.pinned$" <<< "$cloud_listing")
+
+    # Filter unpinned candidates for rotation evaluation
+    local -a candidate_cloud_files=()
+    while IFS= read -r cloud_arch; do
+        [ -z "$cloud_arch" ] && continue
+        if [ -n "${cloud_pinned_map[$cloud_arch]+x}" ]; then
+            log_message "Cloud archive '${cloud_arch}' is pinned (retention hold); exempt from rotation."
+        else
+            candidate_cloud_files+=("$cloud_arch")
+        fi
+    done < <(grep -E "${TARBALL_BASENAME}_.*\.tar\.(zst|gz|xz)\.gpg$" <<< "$cloud_listing")
 
     if [ "$RETENTION_MODE" = "tiered" ] || [ "$RETENTION_MODE" = "gfs" ]; then
         log_message "Running tiered cloud backup rotation (daily=${RETENTION_DAILY:-7}, weekly=${RETENTION_WEEKLY:-4}, monthly=${RETENTION_MONTHLY:-6}, yearly=${RETENTION_YEARLY:-1})."
         echo "Running tiered cloud backup rotation (daily=${RETENTION_DAILY:-7}, weekly=${RETENTION_WEEKLY:-4}, monthly=${RETENTION_MONTHLY:-6}, yearly=${RETENTION_YEARLY:-1})..."
-        mapfile -t files_to_delete < <(rclone lsf --fast-list "${BACKUP_DIR}" 2>/dev/null | grep -E "${TARBALL_BASENAME}_.*\.tar\.(zst|gz|xz)\.gpg$" | calculate_tiered_retention_prune_list)
+        mapfile -t files_to_delete < <(printf '%s\n' "${candidate_cloud_files[@]}" | calculate_tiered_retention_prune_list)
     else
         if ! [ "${CLOUD_KEEP_COUNT:-0}" -gt 0 ] 2>/dev/null; then
             log_message "WARNING: Cloud backup rotation skipped. CLOUD_KEEP_COUNT must be a positive integer (currently '${CLOUD_KEEP_COUNT}')."
@@ -1334,17 +1358,22 @@ run_rotation() {
 
         log_message "Running cloud backup rotation. Keeping the latest ${CLOUD_KEEP_COUNT} backups."
         echo "Running cloud backup rotation (keeping ${CLOUD_KEEP_COUNT})..."
-        mapfile -t files_to_delete < <(rclone lsf --fast-list "${BACKUP_DIR}" 2>/dev/null | grep -E "${TARBALL_BASENAME}_.*\.tar\.(zst|gz|xz)\.gpg$" | sort | head -n -"${CLOUD_KEEP_COUNT}")
+        mapfile -t files_to_delete < <(printf '%s\n' "${candidate_cloud_files[@]}" | sort | head -n -"${CLOUD_KEEP_COUNT}")
     fi
 
     for file_to_delete in "${files_to_delete[@]}"; do
         [ -z "$file_to_delete" ] && continue
+        if [ -n "${cloud_pinned_map[$file_to_delete]+x}" ]; then
+            log_message "SAFETY: Skipped deletion of pinned cloud archive: ${file_to_delete}"
+            continue
+        fi
         log_message "Trashing old cloud backup: ${file_to_delete}"
         echo "Trashing old cloud backup: ${file_to_delete}"
         rclone deletefile "${BACKUP_DIR}${file_to_delete}" >> "$LOG_FILE" 2>&1
         rclone deletefile "${BACKUP_DIR}${file_to_delete}.sha256" >> "$LOG_FILE" 2>&1 || true
         rclone deletefile "${BACKUP_DIR}${file_to_delete}.manifest.json" >> "$LOG_FILE" 2>&1 || true
         rclone deletefile "${BACKUP_DIR}${file_to_delete}.files.gz" >> "$LOG_FILE" 2>&1 || true
+        rclone deletefile "${BACKUP_DIR}${file_to_delete}.pinned" >> "$LOG_FILE" 2>&1 || true
     done
 
     log_message "Cloud backup rotation complete."
@@ -2005,19 +2034,48 @@ handle_local_backup() {
                     log_message "WARNING: Failed to mirror file list index to local backup drive."
                 fi
             fi
+
+            # Mirror companion archive pin marker if present
+            local pin_src="${file_path}.pinned"
+            if [ -f "$pin_src" ]; then
+                local final_pin_dest="${local_backup_path}/${file_name}.pinned"
+                local temp_pin_dest="${local_backup_path}/${file_name}.pinned.part"
+                CURRENT_LOCAL_TEMP_PIN="${temp_pin_dest}"
+                if cp -p "${pin_src}" "${temp_pin_dest}" 2>/dev/null; then
+                    mv -f "${temp_pin_dest}" "${final_pin_dest}" 2>/dev/null || true
+                    CURRENT_LOCAL_TEMP_PIN=""
+                    log_message "Local archive pin marker mirrored: ${file_name}.pinned"
+                else
+                    rm -f "${temp_pin_dest}" 2>/dev/null || true
+                    CURRENT_LOCAL_TEMP_PIN=""
+                    log_message "WARNING: Failed to mirror archive pin marker to local backup drive."
+                fi
+            fi
             
             # Local Rotation
             local -a local_files_to_delete=()
+            local -a all_found_local=()
+            mapfile -t all_found_local < <(find "${local_backup_path}" -maxdepth 1 -type f \( -name "${TARBALL_BASENAME}_*.tar.zst.gpg" -o -name "${TARBALL_BASENAME}_*.tar.gz.gpg" -o -name "${TARBALL_BASENAME}_*.tar.xz.gpg" \) -printf "%f\n" 2>/dev/null)
+
+            local -a candidate_local_files=()
+            for f in "${all_found_local[@]}"; do
+                [ -z "$f" ] && continue
+                if [ -f "${local_backup_path}/${f}.pinned" ]; then
+                    log_message "Local archive '${f}' is pinned (retention hold); exempt from rotation."
+                else
+                    candidate_local_files+=("$f")
+                fi
+            done
+
             if [ "$RETENTION_MODE" = "tiered" ] || [ "$RETENTION_MODE" = "gfs" ]; then
                 echo "Running tiered local backup rotation (daily=${RETENTION_DAILY:-7}, weekly=${RETENTION_WEEKLY:-4}, monthly=${RETENTION_MONTHLY:-6}, yearly=${RETENTION_YEARLY:-1})..."
                 log_message "Running tiered local backup rotation (daily=${RETENTION_DAILY:-7}, weekly=${RETENTION_WEEKLY:-4}, monthly=${RETENTION_MONTHLY:-6}, yearly=${RETENTION_YEARLY:-1})."
-                mapfile -t local_files_to_delete < <(find "${local_backup_path}" -maxdepth 1 -type f \( -name "${TARBALL_BASENAME}_*.tar.zst.gpg" -o -name "${TARBALL_BASENAME}_*.tar.gz.gpg" -o -name "${TARBALL_BASENAME}_*.tar.xz.gpg" \) -printf "%f\n" 2>/dev/null | calculate_tiered_retention_prune_list)
+                mapfile -t local_files_to_delete < <(printf '%s\n' "${candidate_local_files[@]}" | calculate_tiered_retention_prune_list)
             else
                 if [ "${LOCAL_KEEP_COUNT:-0}" -gt 0 ] 2>/dev/null; then
                     echo "Running local backup rotation (keeping ${LOCAL_KEEP_COUNT})..."
                     log_message "Running local backup rotation. Keeping the latest ${LOCAL_KEEP_COUNT} backups."
-                    # Find files matching the basename, sort by name (timestamped), delete all but the newest
-                    mapfile -t local_files_to_delete < <(find "${local_backup_path}" -maxdepth 1 -type f \( -name "${TARBALL_BASENAME}_*.tar.zst.gpg" -o -name "${TARBALL_BASENAME}_*.tar.gz.gpg" -o -name "${TARBALL_BASENAME}_*.tar.xz.gpg" \) -printf "%f\n" 2>/dev/null | sort | head -n -"${LOCAL_KEEP_COUNT}")
+                    mapfile -t local_files_to_delete < <(printf '%s\n' "${candidate_local_files[@]}" | sort | head -n -"${LOCAL_KEEP_COUNT}")
                 else
                     log_message "WARNING: Local backup rotation skipped. LOCAL_KEEP_COUNT must be a positive integer (currently '${LOCAL_KEEP_COUNT}')."
                     echo "Local backup rotation skipped (invalid or zero keep count)."
@@ -2026,11 +2084,16 @@ handle_local_backup() {
 
             for old_file in "${local_files_to_delete[@]}"; do
                 [ -z "$old_file" ] && continue
+                if [ -f "${local_backup_path}/${old_file}.pinned" ]; then
+                    log_message "SAFETY: Skipped deletion of pinned local archive: ${old_file}"
+                    continue
+                fi
                 log_message "Deleting old local backup: ${old_file}"
                 rm -f "${local_backup_path}/${old_file}"
                 rm -f "${local_backup_path}/${old_file}.sha256"
                 rm -f "${local_backup_path}/${old_file}.manifest.json"
                 rm -f "${local_backup_path}/${old_file}.files.gz"
+                rm -f "${local_backup_path}/${old_file}.pinned"
             done
             sync -f "${local_backup_path}" 2>/dev/null || sync
 
@@ -2039,11 +2102,12 @@ handle_local_backup() {
 
             return 0
         else
-            rm -f "${temp_dest}" "${final_dest}" "${local_backup_path}/${file_name}.sha256"* "${local_backup_path}/${file_name}.manifest.json"* "${local_backup_path}/${file_name}.files.gz"* 2>/dev/null
+            rm -f "${temp_dest}" "${final_dest}" "${local_backup_path}/${file_name}.sha256"* "${local_backup_path}/${file_name}.manifest.json"* "${local_backup_path}/${file_name}.files.gz"* "${local_backup_path}/${file_name}.pinned"* 2>/dev/null
             CURRENT_LOCAL_TEMP_ARCHIVE=""
             CURRENT_LOCAL_TEMP_SHA256=""
             CURRENT_LOCAL_TEMP_MANIFEST=""
             CURRENT_LOCAL_TEMP_INDEX=""
+            CURRENT_LOCAL_TEMP_PIN=""
             log_message "ERROR: Failed to copy backup to local drive. Cleaned up incomplete archive."
             echo "Local copy failed! Incomplete archive cleaned up." >&2
             return 1
@@ -2135,6 +2199,14 @@ upload_preserved_archive() {
             pres_sidecar_descs+=("file list index")
             pres_sidecar_logs+=("$ilog")
         fi
+        local target_pin="${target_file}.pinned"
+        if [ -f "$target_pin" ]; then
+            local plog="${ptmp}/pin.log"
+            rclone copy --retries 3 --low-level-retries 5 --timeout 5m "$target_pin" "${BACKUP_DIR}" > "$plog" 2>&1 &
+            pres_sidecar_pids+=($!)
+            pres_sidecar_descs+=("archive pin marker")
+            pres_sidecar_logs+=("$plog")
+        fi
         local p_idx
         for ((p_idx=0; p_idx<${#pres_sidecar_pids[@]}; p_idx++)); do
             if wait "${pres_sidecar_pids[p_idx]}"; then
@@ -2151,7 +2223,7 @@ upload_preserved_archive() {
         duration_str=$(format_duration $(( SECONDS - upload_start_time )))
         log_message "Preserved archive upload completed successfully: ${target_name} (${target_hr} in ${duration_str})"
         echo "Upload of ${target_name} succeeded in ${duration_str}!"
-        rm -f "${target_file}" "${target_sha256}" "${target_manifest}" "${target_index}"
+        rm -f "${target_file}" "${target_sha256}" "${target_manifest}" "${target_index}" "${target_pin}"
         run_rotation
         send_notification "normal" "Backup Upload Succeeded" "Preserved archive ${target_name} (${target_hr}) successfully uploaded in ${duration_str}." "drive-harddisk"
         return 0
@@ -2722,10 +2794,31 @@ run_backup() {
     local verify_forced_source=""
     local verify_checksum_only=false
     local cli_apps_action=""
+    local pin_backup=false
+    local pin_reason=""
     ACTUALLY_CLOSED_APPS=()
 
     while [ $# -gt 0 ]; do
         case "$1" in
+            --pin)
+                pin_backup=true
+                if [ -n "${2:-}" ] && [[ "${2:-}" != -* ]]; then
+                    pin_reason="$2"
+                    shift 2
+                else
+                    shift
+                fi
+                ;;
+            --pin-reason|--reason)
+                if [ -n "${2:-}" ]; then
+                    pin_backup=true
+                    pin_reason="$2"
+                    shift 2
+                else
+                    echo "ERROR: Missing reason for $1." >&2
+                    return 1
+                fi
+                ;;
             --restart-apps|-ra)
                 RESTART_CLOSED_APPS="true"
                 shift
@@ -3783,6 +3876,17 @@ run_backup() {
         log_message "Generated backup manifest: ${ENCRYPTED_MANIFEST_NAME}"
     fi
 
+    # Generate companion archive pin marker if --pin was requested
+    local ENCRYPTED_PIN_NAME="${ENCRYPTED_TARBALL_NAME}.pinned"
+    local FULL_PIN_PATH="${SCRATCH_DIR}/${ENCRYPTED_PIN_NAME}"
+    CURRENT_PIN_FILE=""
+    if [ "$pin_backup" = true ]; then
+        echo "Creating retention hold pin marker..."
+        create_pin_metadata_file "$FULL_PIN_PATH" "${pin_reason:-Manual retention hold}"
+        CURRENT_PIN_FILE="$FULL_PIN_PATH"
+        log_message "Archive marked as pinned (retention hold): ${ENCRYPTED_PIN_NAME}"
+    fi
+
     # --- Step 3.5: Local Drive Backup ---
     local local_backup_status="Skipped (not mounted)"
     handle_local_backup "${FULL_ENCRYPTED_PATH}" "${ENCRYPTED_TARBALL_NAME}"
@@ -3843,6 +3947,10 @@ run_backup() {
                     mv -f "${FULL_INDEX_PATH}" "${SOURCE_DIR}/${ENCRYPTED_FILES_INDEX_NAME}" 2>/dev/null || true
                     CURRENT_FILE_INDEX_FILE="${SOURCE_DIR}/${ENCRYPTED_FILES_INDEX_NAME}"
                 fi
+                if [ -f "${FULL_PIN_PATH}" ]; then
+                    mv -f "${FULL_PIN_PATH}" "${SOURCE_DIR}/${ENCRYPTED_PIN_NAME}" 2>/dev/null || true
+                    CURRENT_PIN_FILE="${SOURCE_DIR}/${ENCRYPTED_PIN_NAME}"
+                fi
             else
                 local ERROR_MSG="Failed to upload archive. Local encrypted tarball preserved at: ${FULL_ENCRYPTED_PATH}"
                 PRESERVED_PATH="${FULL_ENCRYPTED_PATH}"
@@ -3870,7 +3978,7 @@ run_backup() {
             update_manifest_destination_status "${local_backup_path}/${ENCRYPTED_MANIFEST_NAME}" "cloud_backup" "OK"
         fi
 
-        # Also upload companion sidecars (SHA-256, manifest, file list index) in parallel
+        # Also upload companion sidecars (SHA-256, manifest, file list index, pin marker) in parallel
         echo "Uploading companion sidecars to ${BACKUP_DIR} in parallel..."
         local -a sidecar_pids=()
         local -a sidecar_descs=()
@@ -3900,6 +4008,14 @@ run_backup() {
             sidecar_logs+=("$index_log")
         fi
 
+        if [ -f "${FULL_PIN_PATH}" ]; then
+            local pin_log="${SCRATCH_DIR}/sidecar_pin.log"
+            rclone copy --retries 3 --low-level-retries 5 --timeout 5m "${FULL_PIN_PATH}" "${BACKUP_DIR}" > "$pin_log" 2>&1 &
+            sidecar_pids+=($!)
+            sidecar_descs+=("archive pin marker")
+            sidecar_logs+=("$pin_log")
+        fi
+
         local sc_idx
         for ((sc_idx=0; sc_idx<${#sidecar_pids[@]}; sc_idx++)); do
             if wait "${sidecar_pids[sc_idx]}"; then
@@ -3921,11 +4037,12 @@ run_backup() {
         echo "Upload completed successfully."
 
         # --- Step 5: Clean up local encrypted tarball and rotate ---
-        rm -f "${FULL_ENCRYPTED_PATH}" "${FULL_SHA256_PATH}" "${FULL_MANIFEST_PATH}" "${FULL_INDEX_PATH}"
+        rm -f "${FULL_ENCRYPTED_PATH}" "${FULL_SHA256_PATH}" "${FULL_MANIFEST_PATH}" "${FULL_INDEX_PATH}" "${FULL_PIN_PATH}"
         CURRENT_ENCRYPTED_ARCHIVE=""
         CURRENT_SHA256_FILE=""
         CURRENT_MANIFEST_FILE=""
         CURRENT_FILE_INDEX_FILE=""
+        CURRENT_PIN_FILE=""
         rmdir "${SCRATCH_DIR}" 2>/dev/null || true
         SCRATCH_FILES_CREATED=0
         run_rotation
@@ -3963,14 +4080,19 @@ run_backup() {
                     mv -f "${FULL_INDEX_PATH}" "${SOURCE_DIR}/${ENCRYPTED_FILES_INDEX_NAME}" 2>/dev/null || true
                     CURRENT_FILE_INDEX_FILE="${SOURCE_DIR}/${ENCRYPTED_FILES_INDEX_NAME}"
                 fi
+                if [ -f "${FULL_PIN_PATH}" ]; then
+                    mv -f "${FULL_PIN_PATH}" "${SOURCE_DIR}/${ENCRYPTED_PIN_NAME}" 2>/dev/null || true
+                    CURRENT_PIN_FILE="${SOURCE_DIR}/${ENCRYPTED_PIN_NAME}"
+                fi
                 echo "Archive preserved at: ${PRESERVED_PATH}"
             fi
         else
-            rm -f "${FULL_ENCRYPTED_PATH}" "${FULL_SHA256_PATH}" "${FULL_MANIFEST_PATH}" "${FULL_INDEX_PATH}"
+            rm -f "${FULL_ENCRYPTED_PATH}" "${FULL_SHA256_PATH}" "${FULL_MANIFEST_PATH}" "${FULL_INDEX_PATH}" "${FULL_PIN_PATH}"
             CURRENT_ENCRYPTED_ARCHIVE=""
             CURRENT_SHA256_FILE=""
             CURRENT_MANIFEST_FILE=""
             CURRENT_FILE_INDEX_FILE=""
+            CURRENT_PIN_FILE=""
         fi
         rmdir "${SCRATCH_DIR}" 2>/dev/null || true
         SCRATCH_FILES_CREATED=0
@@ -7494,6 +7616,762 @@ PYEOF
 }
 
 #---
+#   FUNCTION:  create_pin_metadata_file()
+#  DESCRIPTION:  Writes structured metadata (timestamp, user, host, reason)
+#                into a companion .pinned sidecar file.
+#---
+create_pin_metadata_file() {
+    local target_path="$1"
+    local reason="${2:-Manual retention hold}"
+    local timestamp
+    timestamp=$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date '+%Y-%m-%d %H:%M:%S')
+    cat <<EOF > "$target_path"
+Pinned: ${timestamp}
+User: ${CURRENT_USER}
+Host: ${HOSTNAME}
+Reason: ${reason}
+EOF
+}
+
+#---
+#   FUNCTION:  pin_archive()
+#  DESCRIPTION:  Sets a retention hold on a backup archive (local, cloud, or both).
+#                Pinned archives are exempt from count-based and GFS tiered rotation.
+#                Usage: pin [archive|latest] [reason] [--reason <text>] [--source <auto|local|cloud|all>]
+#---
+pin_archive() {
+    local target=""
+    local reason=""
+    local source_scope="all"
+    local positional_args=()
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --reason|-r)
+                if [ -n "${2:-}" ]; then
+                    reason="$2"
+                    shift 2
+                else
+                    echo "ERROR: Missing reason text for $1." >&2
+                    return 1
+                fi
+                ;;
+            --source|-s)
+                if [[ "${2:-}" =~ ^(all|both|local|cloud|auto)$ ]]; then
+                    source_scope="$2"
+                    shift 2
+                else
+                    echo "ERROR: Invalid source scope '${2:-}'. Must be 'all', 'local', or 'cloud'." >&2
+                    return 1
+                fi
+                ;;
+            --list|-l)
+                list_pinned_archives
+                return $?
+                ;;
+            help|-h|--help)
+                echo "Usage: $0 pin [archive|latest] [reason] [options]"
+                echo
+                echo "Set a retention hold on an archive to prevent automated deletion during rotation."
+                echo "Pinned archives remain protected indefinitely until explicitly unpinned."
+                echo
+                echo "Arguments:"
+                echo "  [archive]             Archive filename, path, or 'latest' (interactive if omitted)"
+                echo "  [reason]              Optional explanation / tag for why the archive is pinned"
+                echo
+                echo "Options:"
+                echo "  --reason, -r <text>   Specify pin reason / retention note"
+                echo "  --source, -s <scope>  Target destination: 'all' (default), 'local', or 'cloud'"
+                echo "  --list, -l            List all currently pinned archives"
+                return 0
+                ;;
+            *)
+                positional_args+=("$1")
+                shift
+                ;;
+        esac
+    done
+
+    if [ ${#positional_args[@]} -ge 1 ]; then
+        target="${positional_args[0]}"
+    fi
+    if [ ${#positional_args[@]} -ge 2 ] && [ -z "$reason" ]; then
+        reason="${positional_args[1]}"
+    fi
+
+    local local_backup_path
+    local_backup_path=$(get_local_backup_path 2>/dev/null || echo "")
+
+    # Interactive selection if no archive specified
+    if [ -z "$target" ]; then
+        if [ ! -t 0 ]; then
+            echo "ERROR: No archive specified for pinning in non-interactive mode. Run '$0 pin --help'." >&2
+            return 1
+        fi
+
+        echo "Gathering available backups to pin..."
+        local -a available_archives=()
+        local -A seen_archives=()
+
+        # 1. Local
+        if [ -n "$local_backup_path" ] && [ -d "$local_backup_path" ]; then
+            while IFS= read -r f; do
+                [ -z "$f" ] && continue
+                if [ ! -f "${local_backup_path}/${f}.pinned" ]; then
+                    if [ -z "${seen_archives[$f]+x}" ]; then
+                        seen_archives["$f"]="local"
+                        available_archives+=("$f")
+                    fi
+                fi
+            done < <(find "$local_backup_path" -maxdepth 1 -type f \( -name "${TARBALL_BASENAME}_*.tar.zst.gpg" -o -name "${TARBALL_BASENAME}_*.tar.gz.gpg" -o -name "${TARBALL_BASENAME}_*.tar.xz.gpg" \) -printf "%f\n" 2>/dev/null | sort -r)
+        fi
+
+        # 2. Preserved
+        while IFS= read -r fpath; do
+            [ -z "$fpath" ] && continue
+            local fname
+            fname=$(basename "$fpath")
+            if [ ! -f "${fpath}.pinned" ]; then
+                if [ -z "${seen_archives[$fname]+x}" ]; then
+                    seen_archives["$fname"]="preserved"
+                    available_archives+=("$fname")
+                fi
+            fi
+        done < <(get_preserved_archives)
+
+        # 3. Cloud
+        local cloud_raw
+        if cloud_raw=$(rclone lsf --fast-list "${BACKUP_DIR}" 2>/dev/null); then
+            local -A cloud_pins=()
+            while IFS= read -r pf; do
+                [ -z "$pf" ] && continue
+                cloud_pins["${pf%.pinned}"]=1
+            done < <(grep -E "${TARBALL_BASENAME}_.*\.tar\.(zst|gz|xz)\.gpg\.pinned$" <<< "$cloud_raw")
+
+            while IFS= read -r cf; do
+                [ -z "$cf" ] && continue
+                if [ -z "${cloud_pins[$cf]+x}" ]; then
+                    if [ -z "${seen_archives[$cf]+x}" ]; then
+                        seen_archives["$cf"]="cloud"
+                        available_archives+=("$cf")
+                    else
+                        seen_archives["$cf"]="${seen_archives[$cf]}, cloud"
+                    fi
+                fi
+            done < <(grep -E "${TARBALL_BASENAME}_.*\.tar\.(zst|gz|xz)\.gpg$" <<< "$cloud_raw" | sort -r)
+        fi
+
+        if [ ${#available_archives[@]} -eq 0 ]; then
+            echo "No unpinned backup archives available to pin."
+            return 0
+        fi
+
+        echo
+        echo "==============================================================================="
+        echo "  Select an Archive to Pin (Set Retention Hold)"
+        echo "==============================================================================="
+        local idx=1
+        for a in "${available_archives[@]}"; do
+            printf "  %2d) %s  (%s)\n" "$idx" "$a" "${seen_archives[$a]}"
+            ((idx++))
+        done
+        echo "==============================================================================="
+        local sel=""
+        if ! read -r -p "Enter selection [1-$((idx - 1)), or 'q' to cancel]: " sel || [[ "$sel" =~ ^[qQ]$ ]] || [ -z "$sel" ]; then
+            echo "Pinning cancelled."
+            return 0
+        fi
+
+        if ! [[ "$sel" =~ ^[0-9]+$ ]] || [ "$sel" -lt 1 ] || [ "$sel" -ge "$idx" ]; then
+            echo "ERROR: Invalid selection: '${sel}'." >&2
+            return 1
+        fi
+
+        target="${available_archives[$((sel - 1))]}"
+
+        if [ -z "$reason" ]; then
+            read -r -p "Enter pin reason / label [default: 'Manual retention hold']: " reason
+            reason="${reason:-Manual retention hold}"
+        fi
+    fi
+
+    # Resolve target
+    local clean_target
+    clean_target=$(basename "$target")
+    clean_target="${clean_target%.pinned}"
+    clean_target="${clean_target%.sha256}"
+    clean_target="${clean_target%.manifest.json}"
+    clean_target="${clean_target%.files.gz}"
+
+    if [ "$clean_target" = "latest" ]; then
+        clean_target=""
+        # Search local
+        if [ -n "$local_backup_path" ] && [ -d "$local_backup_path" ]; then
+            clean_target=$(find "$local_backup_path" -maxdepth 1 -type f \( -name "${TARBALL_BASENAME}_*.tar.zst.gpg" -o -name "${TARBALL_BASENAME}_*.tar.gz.gpg" -o -name "${TARBALL_BASENAME}_*.tar.xz.gpg" \) -printf "%f\n" 2>/dev/null | sort -r | head -n 1)
+        fi
+        # Search preserved
+        if [ -z "$clean_target" ]; then
+            local p_latest
+            p_latest=$(get_preserved_archives | head -n 1)
+            [ -n "$p_latest" ] && clean_target="$(basename "$p_latest")"
+        fi
+        # Search cloud
+        if [ -z "$clean_target" ]; then
+            clean_target=$(rclone lsf --fast-list "${BACKUP_DIR}" 2>/dev/null | grep -E "${TARBALL_BASENAME}_.*\.tar\.(zst|gz|xz)\.gpg$" | sort -r | head -n 1)
+        fi
+
+        if [ -z "$clean_target" ]; then
+            echo "ERROR: Could not resolve 'latest' archive. No backups found on local drive, preserved directory, or cloud." >&2
+            return 1
+        fi
+    fi
+
+    local on_local=false
+    local on_preserved=false
+    local on_cloud=false
+
+    if [ -n "$local_backup_path" ] && [ -d "$local_backup_path" ] && [ -f "${local_backup_path}/${clean_target}" ]; then
+        on_local=true
+    fi
+    if [ -f "${SOURCE_DIR}/${clean_target}" ]; then
+        on_preserved=true
+    fi
+    if [[ "$source_scope" == "all" || "$source_scope" == "both" || "$source_scope" == "cloud" || "$source_scope" == "auto" ]]; then
+        if [[ "$BACKUP_DIR" == *:* ]] && command -v rclone &>/dev/null; then
+            if rclone lsf --files-only --max-depth 1 --contimeout 5s --timeout 10s --include "${clean_target}" "${BACKUP_DIR}" 2>/dev/null | grep -q "${clean_target}"; then
+                on_cloud=true
+            fi
+        fi
+    fi
+
+    if [ "$on_local" = false ] && [ "$on_preserved" = false ] && [ "$on_cloud" = false ]; then
+        echo "ERROR: Archive '${clean_target}' not found on local drive, preserved directory, or cloud storage (${BACKUP_DIR})." >&2
+        return 1
+    fi
+
+    [ -z "$reason" ] && reason="Manual retention hold"
+
+    # Prepare pin metadata
+    local pin_tmp="${SCRATCH_DIR:-/tmp}/pin_${clean_target}_$$"
+    mkdir -p "$(dirname "$pin_tmp")" 2>/dev/null || pin_tmp="/tmp/pin_${clean_target}_$$"
+    create_pin_metadata_file "$pin_tmp" "$reason"
+
+    local -a pinned_destinations=()
+    local pin_failed=0
+
+    # 1. Apply to Local drive / preserved
+    if [[ "$source_scope" == "all" || "$source_scope" == "both" || "$source_scope" == "local" || "$source_scope" == "auto" ]]; then
+        if [ "$on_local" = true ]; then
+            if cp -f "$pin_tmp" "${local_backup_path}/${clean_target}.pinned" 2>/dev/null; then
+                pinned_destinations+=("Local drive (${local_backup_path})")
+                log_message "Local archive pinned: ${clean_target} (${reason})"
+            else
+                echo "WARNING: Failed to write pin sidecar to local drive." >&2
+                pin_failed=1
+            fi
+        fi
+        if [ "$on_preserved" = true ]; then
+            if cp -f "$pin_tmp" "${SOURCE_DIR}/${clean_target}.pinned" 2>/dev/null; then
+                pinned_destinations+=("Preserved directory (${SOURCE_DIR})")
+                log_message "Preserved archive pinned: ${clean_target} (${reason})"
+            fi
+        fi
+    fi
+
+    # 2. Apply to Cloud remote
+    if [[ "$source_scope" == "all" || "$source_scope" == "both" || "$source_scope" == "cloud" || "$source_scope" == "auto" ]]; then
+        if [ "$on_cloud" = true ]; then
+            if rclone copyto --retries 3 --low-level-retries 5 --timeout 2m "$pin_tmp" "${BACKUP_DIR}${clean_target}.pinned" >> "$LOG_FILE" 2>&1; then
+                pinned_destinations+=("Cloud storage (${BACKUP_DIR})")
+                log_message "Cloud archive pinned: ${clean_target} (${reason})"
+            else
+                echo "WARNING: Failed to upload pin sidecar to cloud storage (${BACKUP_DIR})." >&2
+                pin_failed=1
+            fi
+        fi
+    fi
+
+    rm -f "$pin_tmp" 2>/dev/null
+
+    if [ ${#pinned_destinations[@]} -eq 0 ]; then
+        echo "ERROR: Could not pin archive '${clean_target}' to any requested destinations." >&2
+        return 1
+    fi
+
+    echo
+    echo "==============================================================================="
+    echo "  Archive Retention Hold Activated (PINNED)"
+    echo "==============================================================================="
+    echo "  Archive  : ${clean_target}"
+    echo "  Reason   : ${reason}"
+    echo "  Pinned On: ${pinned_destinations[*]}"
+    echo "  Status   : Immune to automated count-based and GFS tiered pruning."
+    echo "==============================================================================="
+    log_message "SUCCESS: Archive pinned (${clean_target}) on: ${pinned_destinations[*]}"
+    send_notification "normal" "Archive Pinned" "Retention hold enabled for ${clean_target}: ${reason}" "emblem-favorite"
+    return $pin_failed
+}
+
+#---
+#   FUNCTION:  unpin_archive()
+#  DESCRIPTION:  Removes retention hold from a backup archive (local, cloud, or both).
+#                Once unpinned, the archive is subject to normal rotation rules.
+#                Usage: unpin [archive|latest] [--source <auto|local|cloud|all>] [--yes|-y]
+#---
+unpin_archive() {
+    local target=""
+    local source_scope="all"
+    local auto_yes=false
+    local positional_args=()
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --source|-s)
+                if [[ "${2:-}" =~ ^(all|both|local|cloud|auto)$ ]]; then
+                    source_scope="$2"
+                    shift 2
+                else
+                    echo "ERROR: Invalid source scope '${2:-}'." >&2
+                    return 1
+                fi
+                ;;
+            --yes|-y|--batch)
+                auto_yes=true
+                shift
+                ;;
+            help|-h|--help)
+                echo "Usage: $0 unpin [archive|latest] [options]"
+                echo
+                echo "Remove retention hold from a pinned archive, allowing normal rotation to prune it."
+                echo
+                echo "Arguments:"
+                echo "  [archive]             Pinned archive filename, path, or 'latest' (interactive if omitted)"
+                echo
+                echo "Options:"
+                echo "  --source, -s <scope>  Target destination: 'all' (default), 'local', or 'cloud'"
+                echo "  --yes, -y             Skip confirmation prompt"
+                return 0
+                ;;
+            *)
+                positional_args+=("$1")
+                shift
+                ;;
+        esac
+    done
+
+    if [ ${#positional_args[@]} -ge 1 ]; then
+        target="${positional_args[0]}"
+    fi
+
+    local local_backup_path
+    local_backup_path=$(get_local_backup_path 2>/dev/null || echo "")
+
+    # Interactive selection if no archive specified
+    if [ -z "$target" ]; then
+        if [ ! -t 0 ]; then
+            echo "ERROR: No archive specified for unpinning in non-interactive mode. Run '$0 unpin --help'." >&2
+            return 1
+        fi
+
+        echo "Gathering currently pinned archives..."
+        local -a pinned_list=()
+        local -A pinned_info=()
+
+        # 1. Local
+        if [ -n "$local_backup_path" ] && [ -d "$local_backup_path" ]; then
+            while IFS= read -r pf; do
+                [ -z "$pf" ] && continue
+                local bname="${pf%.pinned}"
+                local rnote
+                rnote=$(grep -E "^Reason:" "${local_backup_path}/${pf}" 2>/dev/null | sed 's/^Reason:[[:space:]]*//')
+                pinned_list+=("$bname")
+                pinned_info["$bname"]="local | Reason: ${rnote:-Manual retention hold}"
+            done < <(find "$local_backup_path" -maxdepth 1 -type f -name "${TARBALL_BASENAME}_*.pinned" -printf "%f\n" 2>/dev/null | sort -r)
+        fi
+
+        # 2. Preserved
+        while IFS= read -r pf; do
+            [ -z "$pf" ] && continue
+            local bname
+            bname=$(basename "$pf")
+            bname="${bname%.pinned}"
+            local rnote
+            rnote=$(grep -E "^Reason:" "$pf" 2>/dev/null | sed 's/^Reason:[[:space:]]*//')
+            if [ -z "${pinned_info[$bname]+x}" ]; then
+                pinned_list+=("$bname")
+                pinned_info["$bname"]="preserved | Reason: ${rnote:-Manual retention hold}"
+            else
+                pinned_info["$bname"]="${pinned_info[$bname]}, preserved"
+            fi
+        done < <(find "${SOURCE_DIR}" -maxdepth 1 -type f -name "${TARBALL_BASENAME}_*.pinned" 2>/dev/null | sort -r)
+
+        # 3. Cloud
+        local cloud_pins_raw
+        if cloud_pins_raw=$(rclone lsf --fast-list "${BACKUP_DIR}" 2>/dev/null | grep -E "${TARBALL_BASENAME}_.*\.pinned$"); then
+            while IFS= read -r pf; do
+                [ -z "$pf" ] && continue
+                local bname="${pf%.pinned}"
+                if [ -z "${pinned_info[$bname]+x}" ]; then
+                    pinned_list+=("$bname")
+                    pinned_info["$bname"]="cloud"
+                else
+                    pinned_info["$bname"]="${pinned_info[$bname]}, cloud"
+                fi
+            done <<< "$cloud_pins_raw"
+        fi
+
+        if [ ${#pinned_list[@]} -eq 0 ]; then
+            echo "No pinned archives found."
+            return 0
+        fi
+
+        echo
+        echo "==============================================================================="
+        echo "  Select an Archive to Unpin (Release Retention Hold)"
+        echo "==============================================================================="
+        local idx=1
+        for p in "${pinned_list[@]}"; do
+            printf "  %2d) %s\n      [%s]\n" "$idx" "$p" "${pinned_info[$p]}"
+            ((idx++))
+        done
+        echo "==============================================================================="
+        local sel=""
+        if ! read -r -p "Enter selection [1-$((idx - 1)), or 'q' to cancel]: " sel || [[ "$sel" =~ ^[qQ]$ ]] || [ -z "$sel" ]; then
+            echo "Unpinning cancelled."
+            return 0
+        fi
+
+        if ! [[ "$sel" =~ ^[0-9]+$ ]] || [ "$sel" -lt 1 ] || [ "$sel" -ge "$idx" ]; then
+            echo "ERROR: Invalid selection: '${sel}'." >&2
+            return 1
+        fi
+
+        target="${pinned_list[$((sel - 1))]}"
+    fi
+
+    # Resolve target
+    local clean_target
+    clean_target=$(basename "$target")
+    clean_target="${clean_target%.pinned}"
+    clean_target="${clean_target%.sha256}"
+    clean_target="${clean_target%.manifest.json}"
+    clean_target="${clean_target%.files.gz}"
+
+    if [ "$clean_target" = "latest" ]; then
+        clean_target=""
+        if [ -n "$local_backup_path" ] && [ -d "$local_backup_path" ]; then
+            local lp
+            lp=$(find "$local_backup_path" -maxdepth 1 -type f -name "${TARBALL_BASENAME}_*.pinned" -printf "%f\n" 2>/dev/null | sort -r | head -n 1)
+            [ -n "$lp" ] && clean_target="${lp%.pinned}"
+        fi
+        if [ -z "$clean_target" ]; then
+            local cp_file
+            cp_file=$(rclone lsf --fast-list "${BACKUP_DIR}" 2>/dev/null | grep -E "${TARBALL_BASENAME}_.*\.pinned$" | sort -r | head -n 1)
+            [ -n "$cp_file" ] && clean_target="${cp_file%.pinned}"
+        fi
+
+        if [ -z "$clean_target" ]; then
+            echo "ERROR: No pinned backups found to unpin." >&2
+            return 1
+        fi
+    fi
+
+    local is_pinned_local=false
+    local is_pinned_preserved=false
+    local is_pinned_cloud=false
+
+    if [ -n "$local_backup_path" ] && [ -f "${local_backup_path}/${clean_target}.pinned" ]; then
+        is_pinned_local=true
+    fi
+    if [ -f "${SOURCE_DIR}/${clean_target}.pinned" ]; then
+        is_pinned_preserved=true
+    fi
+    if [[ "$source_scope" == "all" || "$source_scope" == "both" || "$source_scope" == "cloud" || "$source_scope" == "auto" ]]; then
+        if [[ "$BACKUP_DIR" == *:* ]] && command -v rclone &>/dev/null; then
+            if rclone lsf --files-only --max-depth 1 --contimeout 5s --timeout 10s --include "${clean_target}.pinned" "${BACKUP_DIR}" 2>/dev/null | grep -q "${clean_target}\.pinned"; then
+                is_pinned_cloud=true
+            fi
+        fi
+    fi
+
+    if [ "$is_pinned_local" = false ] && [ "$is_pinned_preserved" = false ] && [ "$is_pinned_cloud" = false ]; then
+        echo "Archive '${clean_target}' is not currently pinned."
+        return 0
+    fi
+
+    if [ "$auto_yes" = false ] && [ -t 0 ]; then
+        local confirm=""
+        read -r -p "Remove retention hold for '${clean_target}'? (y/N): " confirm
+        if [[ ! "$confirm" =~ ^[yY]([eE][sS])?$ ]]; then
+            echo "Unpinning aborted."
+            return 0
+        fi
+    fi
+
+    local -a unpinned_dests=()
+
+    if [[ "$source_scope" == "all" || "$source_scope" == "both" || "$source_scope" == "local" || "$source_scope" == "auto" ]]; then
+        if [ "$is_pinned_local" = true ]; then
+            rm -f "${local_backup_path}/${clean_target}.pinned" 2>/dev/null
+            unpinned_dests+=("Local drive")
+            log_message "Local archive unpinned: ${clean_target}"
+        fi
+        if [ "$is_pinned_preserved" = true ]; then
+            rm -f "${SOURCE_DIR}/${clean_target}.pinned" 2>/dev/null
+            unpinned_dests+=("Preserved directory")
+            log_message "Preserved archive unpinned: ${clean_target}"
+        fi
+    fi
+
+    if [[ "$source_scope" == "all" || "$source_scope" == "both" || "$source_scope" == "cloud" || "$source_scope" == "auto" ]]; then
+        if [ "$is_pinned_cloud" = true ]; then
+            if rclone deletefile "${BACKUP_DIR}${clean_target}.pinned" >> "$LOG_FILE" 2>&1; then
+                unpinned_dests+=("Cloud storage")
+                log_message "Cloud archive unpinned: ${clean_target}"
+            else
+                echo "WARNING: Failed to remove cloud pin marker from ${BACKUP_DIR}." >&2
+            fi
+        fi
+    fi
+
+    echo
+    echo "==============================================================================="
+    echo "  Archive Retention Hold Removed (UNPINNED)"
+    echo "==============================================================================="
+    echo "  Archive     : ${clean_target}"
+    echo "  Unpinned On : ${unpinned_dests[*]}"
+    echo "  Status      : Standard rotation rules (count/tiered GFS) now apply."
+    echo "==============================================================================="
+    send_notification "normal" "Archive Unpinned" "Retention hold removed for ${clean_target}." "emblem-default"
+    return 0
+}
+
+#---
+#   FUNCTION:  list_pinned_archives()
+#  DESCRIPTION:  Lists all currently pinned archives on local drive, preserved directory,
+#                and cloud remote, showing pin dates and reasons.
+#                Usage: pinned [options]
+#---
+list_pinned_archives() {
+    local raw_json=false
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --json|-j)
+                raw_json=true
+                shift
+                ;;
+            help|-h|--help)
+                echo "Usage: $0 pinned [--json]"
+                echo
+                echo "List all archives currently protected by retention hold (pinned)."
+                echo "Pinned archives are protected from automated count-based and GFS rotation."
+                return 0
+                ;;
+            *)
+                shift
+                ;;
+        esac
+    done
+
+    local local_backup_path
+    local_backup_path=$(get_local_backup_path 2>/dev/null || echo "")
+
+    local -a local_pins=()
+    local -a preserved_pins=()
+    local -a cloud_pins=()
+
+    # 1. Local
+    if [ -n "$local_backup_path" ] && [ -d "$local_backup_path" ]; then
+        mapfile -t local_pins < <(find "$local_backup_path" -maxdepth 1 -type f -name "${TARBALL_BASENAME}_*.pinned" -printf "%f\n" 2>/dev/null | sort -r)
+    fi
+
+    # 2. Preserved
+    mapfile -t preserved_pins < <(find "${SOURCE_DIR}" -maxdepth 1 -type f -name "${TARBALL_BASENAME}_*.pinned" -printf "%f\n" 2>/dev/null | sort -r)
+
+    # 3. Cloud
+    local cloud_raw
+    if cloud_raw=$(rclone lsl --fast-list "${BACKUP_DIR}" 2>/dev/null); then
+        mapfile -t cloud_pins < <(grep -E "${TARBALL_BASENAME}_.*\.pinned$" <<< "$cloud_raw" | sort -k4 -r)
+    fi
+
+    local total_count=$(( ${#local_pins[@]} + ${#preserved_pins[@]} + ${#cloud_pins[@]} ))
+
+    if [ "$raw_json" = true ]; then
+        python3 - <<PYEOF
+import json, os, glob
+
+data = {
+    "host": "${HOSTNAME}",
+    "user": "${CURRENT_USER}",
+    "total_pinned": ${total_count},
+    "local_drive": [],
+    "preserved": [],
+    "cloud": []
+}
+
+local_path = "${local_backup_path}"
+if local_path and os.path.isdir(local_path):
+    for pf in sorted(glob.glob(os.path.join(local_path, "${TARBALL_BASENAME}_*.pinned")), reverse=True):
+        arch_name = os.path.basename(pf)[:-7]
+        arch_file = os.path.join(local_path, arch_name)
+        sz = os.path.getsize(arch_file) if os.path.isfile(arch_file) else 0
+        reason = "Manual retention hold"
+        pinned_at = ""
+        try:
+            with open(pf) as f:
+                for line in f:
+                    if line.startswith("Reason:"):
+                        reason = line.split(":", 1)[1].strip()
+                    elif line.startswith("Pinned:"):
+                        pinned_at = line.split(":", 1)[1].strip()
+        except:
+            pass
+        data["local_drive"].append({"archive": arch_name, "size_bytes": sz, "reason": reason, "pinned_at": pinned_at})
+
+for pf in sorted(glob.glob(os.path.join("${SOURCE_DIR}", "${TARBALL_BASENAME}_*.pinned")), reverse=True):
+    arch_name = os.path.basename(pf)[:-7]
+    arch_file = os.path.join("${SOURCE_DIR}", arch_name)
+    sz = os.path.getsize(arch_file) if os.path.isfile(arch_file) else 0
+    reason = "Manual retention hold"
+    pinned_at = ""
+    try:
+        with open(pf) as f:
+            for line in f:
+                if line.startswith("Reason:"):
+                    reason = line.split(":", 1)[1].strip()
+                elif line.startswith("Pinned:"):
+                    pinned_at = line.split(":", 1)[1].strip()
+    except:
+        pass
+    data["preserved"].append({"archive": arch_name, "size_bytes": sz, "reason": reason, "pinned_at": pinned_at})
+
+cloud_pins_raw = """${cloud_raw}"""
+for line in cloud_pins_raw.strip().splitlines():
+    parts = line.split(None, 3)
+    if len(parts) >= 4 and parts[3].endswith(".pinned"):
+        arch_name = parts[3][:-7]
+        data["cloud"].append({"archive": arch_name, "pinned_file": parts[3], "timestamp": f"{parts[1]} {parts[2]}"})
+
+print(json.dumps(data, indent=2))
+PYEOF
+        return 0
+    fi
+
+    echo "==============================================================================="
+    echo "  Pinned Archives (Retention Hold Active)"
+    echo "==============================================================================="
+
+    local found_any=0
+
+    # Local display
+    if [ -n "$local_backup_path" ] && [ -d "$local_backup_path" ]; then
+        echo "Local External Drive (${local_backup_path}):"
+        if [ ${#local_pins[@]} -gt 0 ]; then
+            for pf in "${local_pins[@]}"; do
+                local aname="${pf%.pinned}"
+                local afull="${local_backup_path}/${aname}"
+                local asz="unknown"
+                if [ -f "$afull" ]; then
+                    local bytes
+                    bytes=$(stat -c %s "$afull" 2>/dev/null || echo 0)
+                    asz=$(numfmt --to=iec --suffix=B "$bytes" 2>/dev/null || echo "${bytes}B")
+                fi
+                local rnote="Manual retention hold"
+                local pdate=""
+                if [ -f "${local_backup_path}/${pf}" ]; then
+                    rnote=$(grep -E "^Reason:" "${local_backup_path}/${pf}" 2>/dev/null | sed 's/^Reason:[[:space:]]*//')
+                    pdate=$(grep -E "^Pinned:" "${local_backup_path}/${pf}" 2>/dev/null | sed 's/^Pinned:[[:space:]]*//')
+                fi
+                printf "  %-9s %s\n" "$asz" "$aname"
+                printf "            Pinned: %s | Reason: %s\n" "${pdate:-unknown}" "${rnote:-Manual retention hold}"
+                found_any=1
+            done
+        else
+            echo "  (None)"
+        fi
+        echo
+    fi
+
+    # Preserved display
+    if [ ${#preserved_pins[@]} -gt 0 ]; then
+        echo "Preserved Archives (~):"
+        for pf in "${preserved_pins[@]}"; do
+            local aname="${pf%.pinned}"
+            local afull="${SOURCE_DIR}/${aname}"
+            local asz="unknown"
+            if [ -f "$afull" ]; then
+                local bytes
+                bytes=$(stat -c %s "$afull" 2>/dev/null || echo 0)
+                asz=$(numfmt --to=iec --suffix=B "$bytes" 2>/dev/null || echo "${bytes}B")
+            fi
+            local rnote="Manual retention hold"
+            local pdate=""
+            if [ -f "${SOURCE_DIR}/${pf}" ]; then
+                rnote=$(grep -E "^Reason:" "${SOURCE_DIR}/${pf}" 2>/dev/null | sed 's/^Reason:[[:space:]]*//')
+                pdate=$(grep -E "^Pinned:" "${SOURCE_DIR}/${pf}" 2>/dev/null | sed 's/^Pinned:[[:space:]]*//')
+            fi
+            printf "  %-9s %s (preserved in ~)\n" "$asz" "$aname"
+            printf "            Pinned: %s | Reason: %s\n" "${pdate:-unknown}" "${rnote:-Manual retention hold}"
+            found_any=1
+        done
+        echo
+    fi
+
+    # Cloud display
+    echo "Cloud Storage (${BACKUP_DIR}):"
+    if [ ${#cloud_pins[@]} -gt 0 ]; then
+        while read -r sz cdate ctime pname; do
+            [ -z "$pname" ] && continue
+            local aname="${pname%.pinned}"
+            local time_clean="${ctime%%.*}"
+            printf "  %s %s  %s\n" "$cdate" "$time_clean" "$aname"
+            printf "            Status: Pinned on cloud remote\n"
+            found_any=1
+        done < <(printf '%s\n' "${cloud_pins[@]}")
+    else
+        echo "  (None)"
+    fi
+
+    echo "==============================================================================="
+    if [ "$found_any" -eq 1 ]; then
+        echo "Notice: Pinned archives are completely excluded from automatic rotation."
+        echo "        Use '$0 unpin <archive>' to release a retention hold."
+    else
+        echo "No archives are currently pinned. Use '$0 pin [archive]' to set a retention hold."
+    fi
+    echo "==============================================================================="
+}
+
+#---
+#   FUNCTION:  manage_pinned_archives()
+#  DESCRIPTION:  Interactive menu for viewing, pinning, and unpinning backup archives.
+#---
+manage_pinned_archives() {
+    while true; do
+        echo -e "\n========================================"
+        echo "  Manage Pinned Archives (Retention Hold)"
+        echo "========================================"
+        echo "1) List Pinned Archives"
+        echo "2) Pin an Archive (Set Retention Hold)"
+        echo "3) Unpin an Archive (Remove Retention Hold)"
+        echo "4) Return to Main Menu"
+        local p_choice=""
+        if ! read -r -p "Please select [1-4, default: 4]: " p_choice; then
+            echo
+            break
+        fi
+
+        case "${p_choice:-4}" in
+            1) list_pinned_archives ;;
+            2) pin_archive ;;
+            3) unpin_archive ;;
+            4) break ;;
+            *) echo "Invalid option." ;;
+        esac
+    done
+}
+
+#---
 #   FUNCTION:  list_backups()
 #  DESCRIPTION:  Shows a list of available backups on the local drive and remote.
 #---
@@ -7506,7 +8384,17 @@ list_backups() {
             [ -z "$name" ] && continue
             local hr_size
             hr_size=$(numfmt --to=iec --suffix=B "$size" 2>/dev/null || echo "$size")
-            printf "  %-9s %s  %s\n" "$hr_size" "$mtime" "$name"
+            local pin_tag=""
+            if [ -f "${local_backup_path}/${name}.pinned" ]; then
+                local pin_reason
+                pin_reason=$(grep -E "^Reason:" "${local_backup_path}/${name}.pinned" 2>/dev/null | sed -e 's/^Reason:[[:space:]]*//')
+                if [ -n "$pin_reason" ]; then
+                    pin_tag=" [PINNED: ${pin_reason}]"
+                else
+                    pin_tag=" [PINNED]"
+                fi
+            fi
+            printf "  %-9s %s  %s%s\n" "$hr_size" "$mtime" "$name" "$pin_tag"
             local_found=1
         done < <(find "${local_backup_path}" -maxdepth 1 -type f \( -name "${TARBALL_BASENAME}_*.tar.zst.gpg" -o -name "${TARBALL_BASENAME}_*.tar.gz.gpg" -o -name "${TARBALL_BASENAME}_*.tar.xz.gpg" \) -printf "%s\t%TY-%Tm-%Td %TH:%TM:%.2TS\t%f\n" 2>/dev/null | sort -t$'\t' -k3 -r)
 
@@ -7523,13 +8411,23 @@ list_backups() {
     if [ "$rclone_lsl_status" -ne 0 ]; then
         echo "  ERROR: Failed to query cloud storage (${BACKUP_DIR}): ${rclone_lsl_output}" >&2
     else
+        local -A cloud_pins=()
+        while read -r _ _ _ p_name; do
+            [ -z "$p_name" ] && continue
+            cloud_pins["${p_name%.pinned}"]=1
+        done < <(grep -E "${TARBALL_BASENAME}_.*\.pinned$" <<< "$rclone_lsl_output")
+
         local cloud_found=0
         while read -r size date time name; do
             [ -z "$name" ] && continue
             local time_clean="${time%%.*}"
             local hr_size
             hr_size=$(numfmt --to=iec --suffix=B "$size" 2>/dev/null || echo "$size")
-            printf "  %-9s %s %s  %s\n" "$hr_size" "$date" "$time_clean" "$name"
+            local pin_tag=""
+            if [ -n "${cloud_pins[$name]+x}" ]; then
+                pin_tag=" [PINNED]"
+            fi
+            printf "  %-9s %s %s  %s%s\n" "$hr_size" "$date" "$time_clean" "$name" "$pin_tag"
             cloud_found=1
         done < <(grep -E "${TARBALL_BASENAME}_.*\.tar\.(zst|gz|xz)\.gpg$" <<< "$rclone_lsl_output" | sort -k4 -r)
 
@@ -7551,7 +8449,17 @@ list_backups() {
             p_name=$(basename "$p_file")
             local hr_size
             hr_size=$(numfmt --to=iec --suffix=B "$p_size" 2>/dev/null || echo "$p_size")
-            printf "  %-9s %s  %s (preserved)\n" "$hr_size" "$p_mtime" "$p_name"
+            local pin_tag=""
+            if [ -f "${p_file}.pinned" ]; then
+                local pin_reason
+                pin_reason=$(grep -E "^Reason:" "${p_file}.pinned" 2>/dev/null | sed -e 's/^Reason:[[:space:]]*//')
+                if [ -n "$pin_reason" ]; then
+                    pin_tag=" [PINNED: ${pin_reason}]"
+                else
+                    pin_tag=" [PINNED]"
+                fi
+            fi
+            printf "  %-9s %s  %s (preserved)%s\n" "$hr_size" "$p_mtime" "$p_name" "$pin_tag"
         done
         echo "  [Notice: These files consume local disk space. Run backup to retry upload or clean up.]"
     fi
@@ -9205,6 +10113,9 @@ acquire_lock() {
             restore|restore-system|restore_system|system-restore|system_restore) display_action="Restore" ;;
             verify) display_action="Verification" ;;
             manage-preserved|clean-preserved) display_action="Archive Management" ;;
+            pin) display_action="Pin Archive" ;;
+            unpin) display_action="Unpin Archive" ;;
+            manage-pinned|manage_pinned) display_action="Manage Pinned Archives" ;;
             *) display_action="${action^}" ;;
         esac
         send_notification "normal" "${display_action} Skipped" "Another backup or restore process is already running${blocker}."
@@ -9256,6 +10167,10 @@ cleanup() {
             rm -f "$CURRENT_LOCAL_TEMP_INDEX" 2>/dev/null
             CURRENT_LOCAL_TEMP_INDEX=""
         fi
+        if [ -n "$CURRENT_LOCAL_TEMP_PIN" ]; then
+            rm -f "$CURRENT_LOCAL_TEMP_PIN" 2>/dev/null
+            CURRENT_LOCAL_TEMP_PIN=""
+        fi
 
         # Clean up any temporary verification, backup, or restore directory
         if [ -n "$CURRENT_VERIFY_TMP_DIR" ]; then
@@ -9300,13 +10215,14 @@ cleanup() {
             # Clean up partial backup/restore archives in SCRATCH_DIR
             if [ -d "${SCRATCH_DIR}" ]; then
                 if [ "$PRESERVE_ARCHIVE" = true ]; then
-                    local keep_name="" keep_sha="" keep_manifest="" keep_index=""
+                    local keep_name="" keep_sha="" keep_manifest="" keep_index="" keep_pin=""
                     [ -n "$CURRENT_ENCRYPTED_ARCHIVE" ] && keep_name=$(basename "$CURRENT_ENCRYPTED_ARCHIVE")
                     [ -n "$CURRENT_SHA256_FILE" ] && keep_sha=$(basename "$CURRENT_SHA256_FILE")
                     [ -n "$CURRENT_MANIFEST_FILE" ] && keep_manifest=$(basename "$CURRENT_MANIFEST_FILE")
                     [ -n "$CURRENT_FILE_INDEX_FILE" ] && keep_index=$(basename "$CURRENT_FILE_INDEX_FILE")
+                    [ -n "$CURRENT_PIN_FILE" ] && keep_pin=$(basename "$CURRENT_PIN_FILE")
                     if [ -n "$keep_name" ]; then
-                        find "${SCRATCH_DIR}" -maxdepth 1 \( -name "${TARBALL_BASENAME}_*" ! -name "$keep_name" ${keep_sha:+! -name "$keep_sha"} ${keep_manifest:+! -name "$keep_manifest"} ${keep_index:+! -name "$keep_index"} \) -delete 2>/dev/null
+                        find "${SCRATCH_DIR}" -maxdepth 1 \( -name "${TARBALL_BASENAME}_*" ! -name "$keep_name" ${keep_sha:+! -name "$keep_sha"} ${keep_manifest:+! -name "$keep_manifest"} ${keep_index:+! -name "$keep_index"} ${keep_pin:+! -name "$keep_pin"} \) -delete 2>/dev/null
                     fi
                     rmdir "${SCRATCH_DIR}" 2>/dev/null || true
                 else
@@ -9315,6 +10231,7 @@ cleanup() {
                     [ -n "$CURRENT_SHA256_FILE" ] && rm -f "$CURRENT_SHA256_FILE" 2>/dev/null
                     [ -n "$CURRENT_MANIFEST_FILE" ] && rm -f "$CURRENT_MANIFEST_FILE" 2>/dev/null
                     [ -n "$CURRENT_FILE_INDEX_FILE" ] && rm -f "$CURRENT_FILE_INDEX_FILE" 2>/dev/null
+                    [ -n "$CURRENT_PIN_FILE" ] && rm -f "$CURRENT_PIN_FILE" 2>/dev/null
                     # Fallback in case archive tracking was unset
                     if [ -z "$CURRENT_TEMP_ARCHIVE" ] && [ -z "$CURRENT_ENCRYPTED_ARCHIVE" ]; then
                         rm -f "${SCRATCH_DIR}/${TARBALL_BASENAME}_"* 2>/dev/null
@@ -9358,6 +10275,9 @@ execute_with_inhibit() {
         list-files|view-archive|list-contents) why_msg="Listing backup archive contents" ;;
         find-file|find_file|search-file|search_file) why_msg="Searching files across backup archives" ;;
         manage-preserved|clean-preserved) why_msg="Managing preserved backup archives" ;;
+        pin)     why_msg="Pinning backup archive (setting retention hold)" ;;
+        unpin)   why_msg="Unpinning backup archive (releasing retention hold)" ;;
+        manage-pinned|manage_pinned) why_msg="Managing pinned backup archives" ;;
     esac
 
     # If invoked under systemd-inhibit, acknowledge invocation and consume sentinel
@@ -9386,6 +10306,9 @@ execute_with_inhibit() {
                 restore|restore-system|restore_system|system-restore|system_restore) display_title="Restore" ;;
                 verify) display_title="Verification" ;;
                 manage-preserved|clean-preserved) display_title="Archive Management" ;;
+                pin) display_title="Pin Archive" ;;
+                unpin) display_title="Unpin Archive" ;;
+                manage-pinned|manage_pinned) display_title="Manage Pinned Archives" ;;
                 *) display_title="${action^}" ;;
             esac
             send_notification "normal" "${display_title} Skipped" "Another backup or restore process is already running${blocker}."
@@ -9427,6 +10350,9 @@ execute_with_inhibit() {
             list-files|view-archive|list-contents) list_archive_contents "$@" || ret=$? ;;
             find-file|find_file|search-file|search_file) find_file "$@" || ret=$? ;;
             manage-preserved|clean-preserved) manage_preserved_archives "$@" || ret=$? ;;
+            pin)     pin_archive "$@" || ret=$? ;;
+            unpin)   unpin_archive "$@" || ret=$? ;;
+            manage-pinned|manage_pinned) manage_pinned_archives "$@" || ret=$? ;;
             *)       echo "Unknown action: $action" >&2; ret=1 ;;
         esac
         release_lock
@@ -10911,6 +11837,25 @@ check_config() {
         fi
     fi
 
+    # Pinned Archives (Retention Holds) Check
+    local local_pinned_count=0 cloud_pinned_count=0 pres_pinned_count=0
+    local local_dest_check
+    if local_dest_check=$(get_local_backup_path 2>/dev/null) && [ -d "$local_dest_check" ]; then
+        local_pinned_count=$(find "$local_dest_check" -maxdepth 1 -type f -name "${TARBALL_BASENAME}_*.pinned" 2>/dev/null | wc -l)
+    fi
+    if [ -d "$SOURCE_DIR" ]; then
+        pres_pinned_count=$(find "$SOURCE_DIR" -maxdepth 1 -type f -name "${TARBALL_BASENAME}_*.pinned" 2>/dev/null | wc -l)
+    fi
+    if [[ "$BACKUP_DIR" == *:* ]] && command -v rclone &>/dev/null; then
+        cloud_pinned_count=$(rclone lsf --files-only --max-depth 1 --include "${TARBALL_BASENAME}_*.pinned" "$BACKUP_DIR" 2>/dev/null | grep -E "${TARBALL_BASENAME}_.*\.pinned$" | wc -l)
+    fi
+    local total_pinned=$((local_pinned_count + pres_pinned_count + cloud_pinned_count))
+    if [ "$total_pinned" -gt 0 ]; then
+        report_ok "Retention Holds" "${total_pinned} pinned archive marker(s) active (local: ${local_pinned_count}, preserved: ${pres_pinned_count}, cloud: ${cloud_pinned_count})"
+    else
+        report_info "Retention Holds" "No archives currently pinned (use 'pin' to exempt archives from rotation)"
+    fi
+
     if [ "$GENERATE_MANIFEST" = true ] || [ "$GENERATE_MANIFEST" = "1" ]; then
         report_ok "Manifest Generation" "Enabled (.manifest.json companion metadata)"
     else
@@ -11273,12 +12218,13 @@ show_main_menu() {
         else
             echo "10. Manage Preserved Archives"
         fi
-        echo "11. Systemd Backup Timer (Schedule/Status)"
-        echo "12. Check Configuration & Environment"
-        echo "13. Initialize Configuration File"
-        echo "14. Send Test Email Notification"
-        echo "15. Exit"
-        if ! read -r -p "Please enter your choice [1-15]: " choice; then
+        echo "11. Manage Pinned Archives (Retention Hold)"
+        echo "12. Systemd Backup Timer (Schedule/Status)"
+        echo "13. Check Configuration & Environment"
+        echo "14. Initialize Configuration File"
+        echo "15. Send Test Email Notification"
+        echo "16. Exit"
+        if ! read -r -p "Please enter your choice [1-16]: " choice; then
             echo -e "\nExiting."
             break
         fi
@@ -11294,11 +12240,12 @@ show_main_menu() {
             8) list_archive_contents ;;
             9) find_file ;;
             10) execute_with_inhibit manage-preserved ;;
-            11) manage_systemd_timer ;;
-            12) check_config ;;
-            13) init_config ;;
-            14) test_email ;;
-            15) echo "Exiting."; break ;;
+            11) execute_with_inhibit manage-pinned ;;
+            12) manage_systemd_timer ;;
+            13) check_config ;;
+            14) init_config ;;
+            15) test_email ;;
+            16) echo "Exiting."; break ;;
             *) echo "Invalid option." ;;
         esac
     done
@@ -11339,6 +12286,8 @@ case "${1:-}" in
         echo "                                  --symmetric, --passphrase         Use symmetric passphrase encryption (default)"
         echo "                                  --hybrid [key]                    Encrypt with both public key and symmetric passphrase"
         echo "                                  --recipient, -r <key>             Add GPG recipient key ID, fingerprint, or email"
+        echo "                                  --pin [reason]                    Pin archive (retention hold) to exempt it from rotation"
+        echo "                                  --pin-reason, -pr <text>          Specify reason/label for pinned archive"
         echo "                                  --verify, -v [source]             Verify archive integrity immediately after creation"
         echo "                                                                    (optional source: 'auto', 'local', or 'cloud')"
         echo "                                  --verify-checksum, -vc [source]   Fast SHA-256 sidecar checksum verification after creation"
@@ -11376,6 +12325,20 @@ case "${1:-}" in
         echo "                                                                    (detects bit-rot without decryption/passphrase)"
         echo "                                Runs non-interactively if target is specified or stdin is non-interactive."
         echo "  list, -l, --list              List available local and cloud backups"
+        echo "  pin [archive|latest] [opts]   Set a retention hold on an archive to prevent deletion during rotation"
+        echo "                                [archive] can be: 'latest' (default), an archive filename, or direct file path."
+        echo "                                Options:"
+        echo "                                  --reason, -r <text>               Specify pin reason / retention note"
+        echo "                                  --source, -s <all|local|cloud>    Target destination (default: all)"
+        echo "  unpin [archive] [opts]        Remove retention hold from an archive, allowing normal rotation to prune it"
+        echo "                                [archive] can be: an archive filename, or direct file path (or interactive prompt)."
+        echo "                                Options:"
+        echo "                                  --source, -s <all|local|cloud>    Target destination (default: all)"
+        echo "                                  --yes, -y                         Non-interactive batch mode (bypass confirmation)"
+        echo "  pinned, list-pinned [opts]    List all currently pinned archives with retention holds and metadata"
+        echo "                                Options: --json, -j                 (structured JSON output)"
+        echo "                                         --source, -s <all|local|cloud>"
+        echo "  manage-pinned                 Interactive menu to list, pin, and unpin backup archives"
         echo "  manifest [archive|path]       View lightweight JSON backup manifest & inventory without decryption"
         echo "                                [archive] can be: 'latest' (default), an archive filename, or direct file path."
         echo "                                Options: --json, -j (print raw JSON output)"
@@ -11439,6 +12402,10 @@ if [ -n "$1" ]; then
             list_backups
             exit 0
             ;;
+        pinned|list-pinned|list_pinned)
+            list_pinned_archives "${@:2}"
+            exit $?
+            ;;
         manifest|show-manifest|view-manifest|info)
             display_manifest "${@:2}"
             exit $?
@@ -11479,7 +12446,7 @@ if [ -n "$1" ]; then
             init_config "${@:2}"
             exit $?
             ;;
-        backup|restore|restore-system|restore_system|system-restore|system_restore|verify|manage-preserved|clean-preserved)
+        backup|restore|restore-system|restore_system|system-restore|system_restore|verify|manage-preserved|clean-preserved|pin|unpin|manage-pinned|manage_pinned)
             execute_with_inhibit "$1" "${@:2}"
             exit $?
             ;;
