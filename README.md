@@ -26,6 +26,7 @@ A robust, enterprise-grade Bash backup, verification, and disaster-recovery solu
   - [Restoring Data (`restore`)](#restoring-data-restore)
   - [System Packages & State Restore (`restore-system`)](#system-packages--state-restore-restore-system)
   - [Automated Scheduling (`systemd` Timer)](#automated-scheduling-systemd-timer)
+  - [Testing Email Notifications (`test-email`)](#testing-email-notifications-test-email)
 - [Retention Policies & GFS Pruning](#retention-policies--gfs-pruning)
 - [Exclusion Rules](#exclusion-rules)
 - [Disaster Recovery Bootstrapping](#disaster-recovery-bootstrapping)
@@ -44,6 +45,8 @@ A robust, enterprise-grade Bash backup, verification, and disaster-recovery solu
 ### ⚡ Compression & Performance
 - **Modern Zstandard (`zstd`)**: Tuned compression (default level 6) with **Long Distance Matching (`--long=27`)** to dramatically compress repetitive text, code repositories, and container structures.
 - **Adaptive Cloud Streaming**: Restore directly from cloud storage via `rclone cat` without downloading full multi-gigabyte archives to local disk, falling back to local staging when disk permits.
+- **Resilient Network Streaming**: All `rclone cat` streaming operations (restores, verifications, index queries) incorporate multi-level retries (`--retries 3 --low-level-retries 10`), socket timeouts, and optional bandwidth throttling to resist transient socket drops.
+- **Parallel Companion Uploads**: Companion sidecars (`.sha256`, `.manifest.json`, `.files.gz`) and disaster recovery bootstrap files upload concurrently in parallel background threads, cutting round-trip API latency.
 - **Resource Aware**: Dynamically caps decompression memory and enforces scratch space checks before archiving to prevent disk exhaustion.
 
 ### 🔄 Dual-Destination Synchronization & Retention
@@ -66,10 +69,12 @@ A robust, enterprise-grade Bash backup, verification, and disaster-recovery solu
 - **Zero-Bandwidth Companion File Indexes (`.files.gz`)**: Captures full file tables during archive creation (`tar -vv --index-file`) with zero extra disk passes, enabling instant file search (`find-file`) and zero-download archive exploration (`list-files`) across all local and remote snapshots.
 
 ### ⚙️ Reliability & Safety
-- **Application Consistency Guard & Automatic Relaunch**: Detects running database-heavy applications (Vivaldi, Chrome, Firefox, Thunderbird) and gracefully terminates them with `SIGTERM` and filesystem `sync` before archiving. When `RESTART_CLOSED_APPS=true` (or `--restart-apps`), the script automatically relaunches closed applications as soon as archive creation finishes.
+- **Application Consistency Guard & Cgroup-Decoupled Relaunch**: Detects running database-heavy applications (Vivaldi, Chrome, Firefox, Thunderbird) and gracefully terminates them with `SIGTERM` and filesystem `sync` before archiving. When `RESTART_CLOSED_APPS=true` (or `--restart-apps`), the script automatically relaunches closed applications. Under systemd services, relaunches are prioritized into independent `app.slice` scopes via `systemd-run` alongside `KillMode=mixed`, preventing cgroup teardown crashes when the backup unit terminates.
+- **Passphrase Memory Isolation**: Explicitly wipes plaintext passphrases from shell environment memory (`unset`) upon exit or signal interruption.
+- **Pre-Restore Safety Backups**: Automatically generates a timestamped safety backup of the active user crontab (`~/.crontab.pre-restore.<timestamp>.bak`) prior to applying crontab restorations.
 - **Concurrency Locking & Sleep Inhibition**: Uses kernel `flock` and `systemd-inhibit` to prevent overlapping runs and ensure systems do not suspend during backup or restoration.
-- **Graceful Cleanup**: Traps `SIGINT`, `SIGTERM`, and script exit to clean up scratch paths and named pipes safely, and reliably relaunches any closed apps.
-- **Failure & Success Alerts**: Dispatches email alerts on backup failure or success using local MTAs (`msmtp`, `mailx`).
+- **Graceful Cleanup**: Traps `SIGINT`, `SIGTERM`, and script exit to clean up scratch paths, temporary statistics staging directories, and named pipes safely, and reliably relaunches any closed apps.
+- **Standards-Compliant Failure, Success & Size Alerts**: Dispatches automated email alerts on backup failure, successful completion, or when an archive's size changes significantly (>= 15% increase or decrease by default) compared to the previous backup using local MTAs (`msmtp`, `mailx`), complete with `Message-ID` and MIME headers for optimal inbox deliverability.
 
 ---
 
@@ -151,16 +156,17 @@ GPG_RECIPIENT="your_email@domain.com"
 
 ### 3. Configure Storage Destinations
 
-#### Local External Drive
-Locate the UUID of your backup partition using `lsblk -f` or `blkid`:
+#### Local External Drive (Optional)
+If you wish to mirror backups to an external partition, locate its UUID using `lsblk -f` or `blkid`:
 ```bash
 lsblk -f
 ```
 Add the UUID to `~/.config/backup_script/config`:
 ```bash
-LOCAL_DRIVE_UUID="bc3968af-d154-4167-b73c-5a172d2a25b8"
+LOCAL_DRIVE_UUID="your-drive-uuid-here"
 LOCAL_BACKUP_SUBDIR="Backups"
 ```
+*(Leave `LOCAL_DRIVE_UUID=""` to run in cloud-only mode).*
 
 #### Cloud Storage (`rclone`)
 Configure an `rclone` remote (e.g., Google Drive, S3, B2) using `rclone config`. Then point the script to your remote folder (with trailing slash):
@@ -227,12 +233,17 @@ Compression & Applications:
  [  OK  ]  Apps Consistency             Auto-close mode (SIGTERM graceful termination with 10s timeout)
  [  OK  ]  Apps Relaunch                Enabled (closed applications will be automatically relaunched after archive creation)
  [ INFO ]  Active Applications          Currently running: vivaldi-bin
+ [  OK  ]  Failure Email Alert          Configured: rorymobley5@gmail.com
+ [  OK  ]  Mail Transport               MTA detected: msmtp (/usr/bin/msmtp)
+ [  OK  ]  Email Sender                 rorymobley83@vivaldi.net (auto-detected from msmtp)
+ [  OK  ]  Success Email Alert          Enabled: rorymobley5@gmail.com
+ [  OK  ]  Size Change Alert            Enabled: rorymobley5@gmail.com (threshold: ±15%)
 
 ===============================================================================
   Diagnostic Summary
 ===============================================================================
-  Total Checks : 40
-  Passed       : 40
+  Total Checks : 41
+  Passed       : 41
   Warnings     : 0
   Failures     : 0
 -------------------------------------------------------------------------------
@@ -258,7 +269,10 @@ Execute a manual backup immediately:
 - `--verify-checksum`, `-vc`: Run fast SHA-256 bit-rot validation immediately after creation.
 - `--no-verify`: Skip post-backup verification for faster completion.
 - `--asymmetric [key]`: Encrypt with GPG public key.
-- `--alert-email <email>`: Override failure notification address.
+- `--alert-email <email>`: Override failure and size alert notification address.
+- `--alert-on-size-change`: Send email alert if backup size changes by >= threshold% compared to previous backup (default: on).
+- `--no-alert-on-size-change`: Disable email alerts for backup size changes.
+- `--size-change-threshold <pct>`: Percentage threshold for size change alerts (default: 15).
 - `--email-on-success`: Send email notification upon successful backup completion.
 - `--success-email <email>`: Specify recipient address for success notifications (enables success email).
 
@@ -339,6 +353,9 @@ $ ./backup_script.sh find-file "wireguard\.conf" --long
 
 # Limit output to 5 matches per archive
 $ ./backup_script.sh find-file "id_ed25519" --limit 5
+
+# Search for literal text without evaluating regex metacharacters (e.g. brackets, dots)
+$ ./backup_script.sh find-file "backup[1].log" -F
 ```
 
 ```text
@@ -644,6 +661,23 @@ Service Status (Last Run):
 
 ---
 
+### Testing Email Notifications (`test-email`)
+
+Verify mail delivery, sender reputation headers (`Message-ID`, `MIME-Version`), and recipient reachability directly from the command line or interactive menu:
+
+```bash
+# Send test notification to configured ALERT_EMAIL using auto-detected sender
+$ ./backup_script.sh test-email
+
+# Send test notification to an explicit recipient address
+$ ./backup_script.sh test-email user@example.com
+
+# Send test notification with custom recipient and sender addresses
+$ ./backup_script.sh test-email user@example.com alerts@custom-domain.org
+```
+
+---
+
 ## Retention Policies & GFS Pruning
 
 The backup suite supports two distinct pruning strategies for local external drives and cloud storage:
@@ -771,7 +805,10 @@ Key variables configurable in `~/.config/backup_script/config`:
 | Variable | Default | Description |
 | :--- | :--- | :--- |
 | `BACKUP_DIR` | `googledrive:backup/` | `rclone` remote path for cloud backups |
-| `LOCAL_DRIVE_UUID` | *(none)* | Filesystem UUID of external backup drive partition |
+| `RCLONE_DRIVE_CHUNK_SIZE` | `256M` | Chunk size and upload cutoff for cloud transfers (e.g. `64M`, `128M`, `256M`) |
+| `RCLONE_BWLIMIT` | `""` | Optional bandwidth cap for cloud transfers (e.g. `10M`, `5M`, `500k`; empty = unlimited) |
+| `RCLONE_STREAM_OPTS` | `(--retries 3 ...)` | Resilient transfer options for cloud streaming (`--retries 3 --low-level-retries 10 --contimeout 60s --timeout 30m`) |
+| `LOCAL_DRIVE_UUID` | *(none)* | Filesystem UUID of external backup drive partition (leave empty for cloud-only mode) |
 | `LOCAL_BACKUP_SUBDIR` | `Backups` | Subdirectory on external partition for archives |
 | `ENCRYPTION_MODE` | `symmetric` | Encryption method: `symmetric`, `asymmetric`, or `hybrid` |
 | `PASSWORD_FILE` | `~/.config/backup_script/passphrase` | Path to symmetric encryption passphrase file |
@@ -793,7 +830,9 @@ Key variables configurable in `~/.config/backup_script/config`:
 | `ARCHIVE_LIST_PAGER` | `${PAGER:-less -FRX}` | Preferred pager command for viewing archive file listings |
 | `GENERATE_MANIFEST` | `true` | Generate companion JSON manifest (`.manifest.json`) with metadata and inventory |
 | `GENERATE_FILE_INDEX` | `true` | Generate companion file index (`.files.gz`) for fast zero-download search & listing |
-| `ALERT_EMAIL` | `""` | Destination email address for failure alerts |
+| `ALERT_EMAIL` | `""` | Destination email address for failure and size change alerts |
+| `ALERT_ON_SIZE_CHANGE` | `true` | Send email alert when backup size changes significantly compared to previous backup (`true`/`false`) |
+| `SIZE_CHANGE_THRESHOLD` | `15` | Percentage threshold for triggering size change alerts (default: `15` for ±15%) |
 | `ALERT_ON_SUCCESS` | `false` | Send email notification on successful backup completion (`true`/`false`) |
 | `SUCCESS_EMAIL` | `""` | Optional dedicated recipient email address for success notifications |
 | `APT_PACKAGES_FILE` | `apt_packages_manual.txt` | Filename for exported manual APT packages |
