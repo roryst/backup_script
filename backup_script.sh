@@ -215,7 +215,7 @@ RESTORE_VERIFY_CHECKSUM="${RESTORE_VERIFY_CHECKSUM:-true}"
 # When enabled ('checksum', 'quick', 'checksum-local', 'checksum-cloud', 'local', 'cloud', true, or 1),
 # executes integrity verification on the newly created archive.
 # Can also be triggered per-run via 'backup --verify [auto|local|cloud]' or 'backup --verify-checksum'.
-AUTO_VERIFY_BACKUP="${AUTO_VERIFY_BACKUP:-checksum-local}"
+AUTO_VERIFY_BACKUP="${AUTO_VERIFY_BACKUP:-local}"
 
 # Preferred pager for viewing archive file listings in interactive terminals.
 # Set to an empty string ("") to disable pagination by default.
@@ -8531,7 +8531,7 @@ find_file() {
     )
     [ "$cli_yes" = true ] && restore_cmd_args+=("--yes")
 
-    run_restore "${restore_cmd_args[@]}"
+    execute_with_inhibit restore "${restore_cmd_args[@]}"
     return $?
 }
 
@@ -8588,6 +8588,8 @@ run_verify() {
     local backups=()
     local backup_choice=""
     local direct_archive_file=""
+    local expected_cloud_sha=""
+    local actual_cloud_sha=""
     local local_backup_path
     local_backup_path=$(get_local_backup_path)
 
@@ -8874,24 +8876,29 @@ run_verify() {
     else
         # Cloud verification
         local cloud_sha_output
-        cloud_sha_output=$(rclone cat "${RCLONE_STREAM_OPTS[@]}" "${BACKUP_DIR}${backup_choice}.sha256" 2>/dev/null)
+        cloud_sha_output=$(rclone cat "${RCLONE_STREAM_OPTS[@]}" "${BACKUP_DIR}${backup_choice}.sha256" 2>/dev/null || true)
         if [ -n "$cloud_sha_output" ]; then
+            expected_cloud_sha=$(awk '{print $1}' <<< "$cloud_sha_output")
             if [ "$checksum_only" = true ]; then
                 echo "Streaming cloud archive to verify SHA-256 checksum..."
-                local expected_hash actual_hash
-                expected_hash=$(awk '{print $1}' <<< "$cloud_sha_output")
+                local actual_hash
                 actual_hash=$(rclone cat "${RCLONE_STREAM_OPTS[@]}" "${BACKUP_DIR}${backup_choice}" 2>/dev/null | sha256sum | awk '{print $1}')
-                if [ -n "$actual_hash" ] && [ "$actual_hash" = "$expected_hash" ]; then
+                if [ -n "$actual_hash" ] && [ "$actual_hash" = "$expected_cloud_sha" ]; then
                     echo "Cloud SHA-256 checksum verified OK (${actual_hash:0:12}...)."
                     log_message "Cloud SHA-256 checksum valid for ${backup_choice}."
                     echo "SUCCESS: Cloud archive '${backup_choice}' passed SHA-256 checksum verification."
                     send_notification "normal" "Checksum Verified" "Cloud SHA-256 checksum verified OK for ${backup_choice}." "drive-harddisk"
                     return 0
                 else
-                    local ERROR_MSG="ERROR: Cloud SHA-256 checksum mismatch for ${backup_choice} (expected: ${expected_hash}, calculated: ${actual_hash})."
+                    local ERROR_MSG="ERROR: Cloud SHA-256 checksum mismatch for ${backup_choice} (expected: ${expected_cloud_sha}, calculated: ${actual_hash})."
                     log_message "$ERROR_MSG"; echo "$ERROR_MSG" >&2
                     send_notification "critical" "Verification Failed" "Cloud SHA-256 checksum mismatch for ${backup_choice}." "dialog-error"
                     return 1
+                fi
+            else
+                if [ -n "$expected_cloud_sha" ]; then
+                    echo "Cloud SHA-256 sidecar found (${expected_cloud_sha:0:12}...). Enabling single-pass inline checksum verification."
+                    log_message "Cloud SHA-256 sidecar found for ${backup_choice}; single-pass inline checksum verification active."
                 fi
             fi
         else
@@ -8901,6 +8908,7 @@ run_verify() {
                 send_notification "critical" "Verification Failed" "Cloud SHA-256 sidecar missing for ${backup_choice}." "dialog-warning"
                 return 1
             fi
+            echo "Notice: No SHA-256 sidecar found for ${backup_choice} in cloud storage. Proceeding with decryption stream check."
         fi
     fi
 
@@ -8994,41 +9002,94 @@ run_verify() {
         tar_exit_code=${pipe_statuses[1]}
     else
         echo "Streaming archive from cloud storage (${BACKUP_DIR})..."
+        local hash_fifo="" actual_hash_file="" sha_pid=""
+        if [ -n "$expected_cloud_sha" ]; then
+            hash_fifo="${verify_tmp_dir}/hash.fifo"
+            actual_hash_file="${verify_tmp_dir}/actual.sha256"
+            mkfifo "$hash_fifo"
+            sha256sum < "$hash_fifo" | awk '{print $1}' > "$actual_hash_file" &
+            sha_pid=$!
+        fi
+
         if [ "$archive_enc_type" = "asymmetric" ] && [ -z "$ENCRYPTION_PASSWORD" ]; then
-            rclone cat "${RCLONE_STREAM_OPTS[@]}" "${BACKUP_DIR}${backup_choice}" 2>"$rclone_err_file" \
-                | gpg --batch --yes --no-tty --decrypt - 2>"$gpg_err_file" \
-                | tar "${tar_compress_opts[@]}" -tf - 2>"$tar_err_file" \
-                | awk -v cf="$count_file" -v tty="$is_tty" -v label="Verifying cloud archive" '
-                    tty == 1 && NR % 5000 == 0 { printf "\r%s: %d items scanned...", label, NR; fflush() }
-                    tty == 0 && NR % 25000 == 0 { printf "%s: %d items scanned...\n", label, NR; fflush() }
-                    END {
-                        if (tty == 1) {
-                            printf "\rVerification finished: %d items scanned.           \n", NR
-                        } else {
-                            printf "Verification finished: %d items scanned.\n", NR
-                        }
-                        print NR > cf
-                    }'
+            if [ -n "$hash_fifo" ]; then
+                rclone cat "${RCLONE_STREAM_OPTS[@]}" "${BACKUP_DIR}${backup_choice}" 2>"$rclone_err_file" \
+                    | tee "$hash_fifo" \
+                    | gpg --batch --yes --no-tty --decrypt - 2>"$gpg_err_file" \
+                    | tar "${tar_compress_opts[@]}" -tf - 2>"$tar_err_file" \
+                    | awk -v cf="$count_file" -v tty="$is_tty" -v label="Verifying cloud archive" '
+                        tty == 1 && NR % 5000 == 0 { printf "\r%s: %d items scanned...", label, NR; fflush() }
+                        tty == 0 && NR % 25000 == 0 { printf "%s: %d items scanned...\n", label, NR; fflush() }
+                        END {
+                            if (tty == 1) {
+                                printf "\rVerification finished: %d items scanned.           \n", NR
+                            } else {
+                                printf "Verification finished: %d items scanned.\n", NR
+                            }
+                            print NR > cf
+                        }'
+            else
+                rclone cat "${RCLONE_STREAM_OPTS[@]}" "${BACKUP_DIR}${backup_choice}" 2>"$rclone_err_file" \
+                    | gpg --batch --yes --no-tty --decrypt - 2>"$gpg_err_file" \
+                    | tar "${tar_compress_opts[@]}" -tf - 2>"$tar_err_file" \
+                    | awk -v cf="$count_file" -v tty="$is_tty" -v label="Verifying cloud archive" '
+                        tty == 1 && NR % 5000 == 0 { printf "\r%s: %d items scanned...", label, NR; fflush() }
+                        tty == 0 && NR % 25000 == 0 { printf "%s: %d items scanned...\n", label, NR; fflush() }
+                        END {
+                            if (tty == 1) {
+                                printf "\rVerification finished: %d items scanned.           \n", NR
+                            } else {
+                                printf "Verification finished: %d items scanned.\n", NR
+                            }
+                            print NR > cf
+                        }'
+            fi
         else
-            rclone cat "${RCLONE_STREAM_OPTS[@]}" "${BACKUP_DIR}${backup_choice}" 2>"$rclone_err_file" \
-                | gpg --batch --yes --no-tty --pinentry-mode loopback --decrypt --passphrase-fd 3 - 3< <(printf '%s' "$ENCRYPTION_PASSWORD") 2>"$gpg_err_file" \
-                | tar "${tar_compress_opts[@]}" -tf - 2>"$tar_err_file" \
-                | awk -v cf="$count_file" -v tty="$is_tty" -v label="Verifying cloud archive" '
-                    tty == 1 && NR % 5000 == 0 { printf "\r%s: %d items scanned...", label, NR; fflush() }
-                    tty == 0 && NR % 25000 == 0 { printf "%s: %d items scanned...\n", label, NR; fflush() }
-                    END {
-                        if (tty == 1) {
-                            printf "\rVerification finished: %d items scanned.           \n", NR
-                        } else {
-                            printf "Verification finished: %d items scanned.\n", NR
-                        }
-                        print NR > cf
-                    }'
+            if [ -n "$hash_fifo" ]; then
+                rclone cat "${RCLONE_STREAM_OPTS[@]}" "${BACKUP_DIR}${backup_choice}" 2>"$rclone_err_file" \
+                    | tee "$hash_fifo" \
+                    | gpg --batch --yes --no-tty --pinentry-mode loopback --decrypt --passphrase-fd 3 - 3< <(printf '%s' "$ENCRYPTION_PASSWORD") 2>"$gpg_err_file" \
+                    | tar "${tar_compress_opts[@]}" -tf - 2>"$tar_err_file" \
+                    | awk -v cf="$count_file" -v tty="$is_tty" -v label="Verifying cloud archive" '
+                        tty == 1 && NR % 5000 == 0 { printf "\r%s: %d items scanned...", label, NR; fflush() }
+                        tty == 0 && NR % 25000 == 0 { printf "%s: %d items scanned...\n", label, NR; fflush() }
+                        END {
+                            if (tty == 1) {
+                                printf "\rVerification finished: %d items scanned.           \n", NR
+                            } else {
+                                printf "Verification finished: %d items scanned.\n", NR
+                            }
+                            print NR > cf
+                        }'
+            else
+                rclone cat "${RCLONE_STREAM_OPTS[@]}" "${BACKUP_DIR}${backup_choice}" 2>"$rclone_err_file" \
+                    | gpg --batch --yes --no-tty --pinentry-mode loopback --decrypt --passphrase-fd 3 - 3< <(printf '%s' "$ENCRYPTION_PASSWORD") 2>"$gpg_err_file" \
+                    | tar "${tar_compress_opts[@]}" -tf - 2>"$tar_err_file" \
+                    | awk -v cf="$count_file" -v tty="$is_tty" -v label="Verifying cloud archive" '
+                        tty == 1 && NR % 5000 == 0 { printf "\r%s: %d items scanned...", label, NR; fflush() }
+                        tty == 0 && NR % 25000 == 0 { printf "%s: %d items scanned...\n", label, NR; fflush() }
+                        END {
+                            if (tty == 1) {
+                                printf "\rVerification finished: %d items scanned.           \n", NR
+                            } else {
+                                printf "Verification finished: %d items scanned.\n", NR
+                            }
+                            print NR > cf
+                        }'
+            fi
         fi
         local pipe_statuses=("${PIPESTATUS[@]}")
-        rclone_exit_code=${pipe_statuses[0]}
-        gpg_exit_code=${pipe_statuses[1]}
-        tar_exit_code=${pipe_statuses[2]}
+        if [ -n "$hash_fifo" ]; then
+            rclone_exit_code=${pipe_statuses[0]}
+            gpg_exit_code=${pipe_statuses[2]}
+            tar_exit_code=${pipe_statuses[3]}
+            wait "$sha_pid" 2>/dev/null || true
+            [ -f "$actual_hash_file" ] && actual_cloud_sha=$(<"$actual_hash_file")
+        else
+            rclone_exit_code=${pipe_statuses[0]}
+            gpg_exit_code=${pipe_statuses[1]}
+            tar_exit_code=${pipe_statuses[2]}
+        fi
     fi
 
     local gpg_err_msg="" tar_err_msg="" rclone_err_msg="" records_scanned=0
@@ -9036,6 +9097,7 @@ run_verify() {
     [ -f "$tar_err_file" ] && tar_err_msg=$(<"$tar_err_file")
     [ -f "$rclone_err_file" ] && rclone_err_msg=$(<"$rclone_err_file")
     [ -f "$count_file" ] && records_scanned=$(<"$count_file")
+    [ -z "$actual_cloud_sha" ] && [ -n "$actual_hash_file" ] && [ -f "$actual_hash_file" ] && actual_cloud_sha=$(<"$actual_hash_file")
     records_scanned="${records_scanned:-0}"
     rm -rf "$verify_tmp_dir" 2>/dev/null
 
@@ -9090,6 +9152,21 @@ run_verify() {
         return 1
     fi
 
+    # 6. Validate single-pass cloud SHA-256 checksum if active
+    if [ "$verify_source" = "cloud" ] && [ -n "$expected_cloud_sha" ]; then
+        if [ -n "$actual_cloud_sha" ] && [ "$actual_cloud_sha" = "$expected_cloud_sha" ]; then
+            echo "Cloud SHA-256 sidecar checksum verified OK (${actual_cloud_sha:0:12}...). No bit-rot detected."
+            log_message "Cloud SHA-256 sidecar checksum valid for ${backup_choice}."
+            sha256_verified=true
+        else
+            local ERROR_MSG="ERROR: Cloud SHA-256 checksum mismatch for ${backup_choice} (expected: ${expected_cloud_sha}, calculated: ${actual_cloud_sha:-none}). The cloud archive is corrupted."
+            log_message "$ERROR_MSG"
+            echo "$ERROR_MSG" >&2
+            send_notification "critical" "Verification Failed" "Cloud SHA-256 checksum mismatch for ${backup_choice}." "dialog-error"
+            return 1
+        fi
+    fi
+
     local sha_note=""
     if [ "$sha256_verified" = true ]; then
         sha_note=" and SHA-256 sidecar verified"
@@ -9106,6 +9183,7 @@ run_verify() {
 #                records the PID, and reports the blocking PID if lock is held.
 #---
 acquire_lock() {
+    local action="${1:-operation}"
     local lock_dir
     lock_dir=$(dirname "$LOCK_FILE")
     [ -d "$lock_dir" ] || mkdir -p "$lock_dir" 2>/dev/null || true
@@ -9120,8 +9198,16 @@ acquire_lock() {
             blocker=$(fuser "$LOCK_FILE" 2>/dev/null | tr ' ' '\n' | grep -v "^$$$" | grep -v "^$" | head -n 1)
         fi
         [ -n "$blocker" ] && blocker=" (PID: ${blocker})"
-        log_message "Lock held by another instance${blocker}. Aborting."
-        send_notification "normal" "Backup Skipped" "Another backup or restore process is already running${blocker}."
+        log_message "Lock held by another instance${blocker}. Aborting ${action}."
+        local display_action="Operation"
+        case "$action" in
+            backup) display_action="Backup" ;;
+            restore|restore-system|restore_system|system-restore|system_restore) display_action="Restore" ;;
+            verify) display_action="Verification" ;;
+            manage-preserved|clean-preserved) display_action="Archive Management" ;;
+            *) display_action="${action^}" ;;
+        esac
+        send_notification "normal" "${display_action} Skipped" "Another backup or restore process is already running${blocker}."
         echo "ERROR: Another backup or restore process is already running${blocker}." >&2
         return 1
     fi
@@ -9293,8 +9379,16 @@ execute_with_inhibit() {
                 blocker=$(fuser "$LOCK_FILE" 2>/dev/null | tr ' ' '\n' | grep -v "^$$$" | grep -v "^$" | head -n 1)
             fi
             [ -n "$blocker" ] && blocker=" (PID: ${blocker})"
-            log_message "Lock held by another instance${blocker}. Aborting."
-            send_notification "normal" "Backup Skipped" "Another backup or restore process is already running${blocker}."
+            log_message "Lock held by another instance${blocker}. Aborting ${action}."
+            local display_title="Operation"
+            case "$action" in
+                backup) display_title="Backup" ;;
+                restore|restore-system|restore_system|system-restore|system_restore) display_title="Restore" ;;
+                verify) display_title="Verification" ;;
+                manage-preserved|clean-preserved) display_title="Archive Management" ;;
+                *) display_title="${action^}" ;;
+            esac
+            send_notification "normal" "${display_title} Skipped" "Another backup or restore process is already running${blocker}."
             echo "ERROR: Another backup or restore process is already running${blocker}." >&2
             return 1
         fi
@@ -9323,7 +9417,7 @@ execute_with_inhibit() {
         fi
     fi
 
-    if acquire_lock; then
+    if acquire_lock "$action"; then
         local ret=0
         case "$action" in
             backup)  run_backup "$@" || ret=$? ;;
@@ -11197,8 +11291,8 @@ show_main_menu() {
             5) list_backups ;;
             6) display_manifest ;;
             7) show_backup_stats ;;
-            8) execute_with_inhibit list-files ;;
-            9) execute_with_inhibit find-file ;;
+            8) list_archive_contents ;;
+            9) find_file ;;
             10) execute_with_inhibit manage-preserved ;;
             11) manage_systemd_timer ;;
             12) check_config ;;
@@ -11354,11 +11448,11 @@ if [ -n "$1" ]; then
             exit $?
             ;;
         list-files|list_files|view-archive|view_archive|list-contents|list_contents)
-            execute_with_inhibit list-files "${@:2}"
+            list_archive_contents "${@:2}"
             exit $?
             ;;
         find-file|find_file|search-file|search_file)
-            execute_with_inhibit find-file "${@:2}"
+            find_file "${@:2}"
             exit $?
             ;;
         install-timer|install_timer)
