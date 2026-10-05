@@ -23,6 +23,7 @@ A robust, enterprise-grade Bash backup, verification, and disaster-recovery solu
   - [Searching Files Across Backups (`find-file`)](#searching-files-across-backups-find-file)
   - [Inspecting Backup Manifests (`manifest`)](#inspecting-backup-manifests-manifest)
   - [Historical Trends & Analytics (`stats`)](#historical-trends--analytics-stats)
+  - [Zero-Decryption Backup Drift Comparison (`diff-backups`)](#zero-decryption-backup-drift-comparison-diff-backups)
   - [Integrity Verification (`verify`)](#integrity-verification-verify)
   - [Restoring Data (`restore`)](#restoring-data-restore)
   - [System Packages & State Restore (`restore-system`)](#system-packages--state-restore-restore-system)
@@ -69,6 +70,7 @@ A robust, enterprise-grade Bash backup, verification, and disaster-recovery solu
 - **Interactive Archive File Browser**: Search and browse files inside archives using companion `.files.gz` indexes, multi-select items with number ranges (`1, 3-5`), and restore selectively without full downloads.
 - **Companion JSON Manifests (`.manifest.json`)**: Instantly inspect archive metadata, compression ratios, package counts, and checksums without downloading or decrypting the archive.
 - **Zero-Bandwidth Companion File Indexes (`.files.gz`)**: Captures full file tables during archive creation (`tar -vv --index-file`) with zero extra disk passes, enabling instant file search (`find-file`) and zero-download archive exploration (`list-files`) across all local and remote snapshots.
+- **Zero-Decryption Backup Drift Comparison (`diff-backups`)**: Instantly diff any two backups (local or cloud) using companion index sidecars in seconds without decrypting or decompressing multi-gigabyte archives. Categorizes added, removed, and modified files with exact size deltas, net storage drift analytics, interactive filtering, and structured JSON/CSV exports.
 
 ### ⚙️ Reliability & Safety
 - **Application Consistency Guard & Cgroup-Decoupled Relaunch**: Detects running database-heavy applications (Vivaldi, Chrome, Firefox, Thunderbird) and gracefully terminates them with `SIGTERM` and filesystem `sync` before archiving. When `RESTART_CLOSED_APPS=true` (or `--restart-apps`), the script automatically relaunches closed applications. Under systemd services, relaunches are prioritized into independent `app.slice` scopes via `systemd-run` alongside `KillMode=mixed`, preventing cgroup teardown crashes when the backup unit terminates.
@@ -558,6 +560,108 @@ Summary Statistics:
   Avg Compression Ratio  : 2.04x
   Avg Execution Duration : 1m 45s
 ================================================================================================
+```
+
+---
+
+### Zero-Decryption Backup Drift Comparison (`diff-backups`)
+
+Analyze differences, inspect storage growth, and detect file changes across any two backups **without downloading, decrypting, or decompressing multi-gigabyte archives**. By leveraging lightweight companion index sidecars (`.files.gz`), `diff-backups` parses 100,000+ files in under two seconds.
+
+#### Command Syntax
+```bash
+./backup_script.sh diff-backups [archive1] [archive2] [options]
+```
+*(Aliases: `backup-diff`, `drift`)*
+
+- If `[archive1]` and `[archive2]` are omitted, the script automatically compares the **two most recent backups**.
+- The script automatically orders archives chronologically (oldest = baseline, newest = target).
+- Companion indices are automatically discovered across local fast storage and cloud remotes (`rclone cat`).
+
+#### Options & Flags
+
+| Flag | Long Option | Description |
+| :--- | :--- | :--- |
+| `-s` | `--stat`, `--summary` | Display aggregate drift statistics and storage growth without file listing |
+| `-a` | `--added` | Show only newly added files |
+| `-d` | `--removed`, `--deleted` | Show only deleted / removed files |
+| `-m` | `--modified` | Show only modified files |
+| `-f` | `--filter <pattern>` | Filter file paths matching regex or substring pattern |
+| | `--min-size <threshold>` | Only show files with size or delta $\ge$ threshold (e.g., `10M`, `500K`, `1G`) |
+| | `--sort <path\|delta\|size>` | Sort file listing by path (default), size delta, or file size |
+| | `--source <auto\|local\|cloud\|all>` | Select backup source locations |
+| `-j` | `--json` | Output structured JSON for automation or auditing |
+| | `--csv` | Output tabular CSV for spreadsheet analysis |
+| `-i` | `--interactive` | Interactively select baseline and target archives from available snapshots |
+| | `--no-pager` / `--pager` | Disable or force terminal pagination (`less -RFX`) |
+
+---
+
+#### 1. Quick Change Summary (`--stat`)
+Compare the two newest backups to see high-level file count and storage deltas:
+
+```bash
+$ ./backup_script.sh diff-backups --stat
+```
+
+```text
+===============================================================================
+  BACKUP DRIFT & DIFFERENCE ANALYSIS
+===============================================================================
+  Baseline (Older) : rory_home_backup_hp_2026-10-04_005448.tar.zst.gpg (local)
+  Target   (Newer) : rory_home_backup_hp_2026-10-05_004749.tar.zst.gpg (local)
+-------------------------------------------------------------------------------
+  Baseline Files   :     105844  (14.9 GB uncompressed)
+  Target Files     :     105610  (14.8 GB uncompressed)
+-------------------------------------------------------------------------------
+  Summary of Changes:
+    + Added Files    :       1556  (+579.9 MB)
+    - Removed Files  :       1790  (-653.3 MB)
+    ~ Modified Files :        554  (-228.3 KB net delta)
+    = Unchanged Files:     103500  (13.8 GB)
+  -----------------------------------------------------------------------------
+    Net File Drift   :       -234 files
+    Net Size Drift   :   -73.6 MB
+===============================================================================
+```
+
+#### 2. Investigating Storage Spikes
+Identify what files caused an unexpected backup size increase by isolating large size deltas:
+
+```bash
+# Show files whose size changed by at least 10MB, sorted by largest change
+./backup_script.sh diff-backups --min-size 10M --sort delta
+```
+
+#### 3. Filtering by File Status & Path
+Inspect specific configuration or document changes:
+
+```bash
+# List added files under ~/.config
+./backup_script.sh diff-backups --added -f "\.config"
+
+# List all removed files
+./backup_script.sh diff-backups --removed
+```
+
+#### 4. Exporting Structured Reports for Automation
+Export machine-readable drift metrics into JSON or CSV:
+
+```bash
+# JSON export
+./backup_script.sh diff-backups --json > drift_report.json
+
+# CSV export
+./backup_script.sh diff-backups --csv > drift_report.csv
+```
+
+#### 5. Interactive Archive Selection
+Interactively choose any two backups from local drive or cloud storage:
+
+```bash
+./backup_script.sh diff-backups -i
+# Or pass specific snapshot dates or names:
+./backup_script.sh diff-backups 2026-09-20 2026-10-05
 ```
 
 ---
