@@ -21,10 +21,10 @@
 #                 You should have received a copy of the GNU General Public License
 #                 along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #
-#                 Usage: ./backup_script.sh [backup|restore|verify|list|stats|manifest|manage-preserved|pin|unpin|pinned|init-config|check-config|help]
+#                 Usage: ./backup_script.sh [backup|restore|verify|list|stats|diff-backups|manifest|manage-preserved|pin|unpin|pinned|init-config|check-config|help]
 #
 #        AUTHOR:  Rory Mobley, rorymobley5@gmail.com
-#       VERSION:  10.5.0
+#       VERSION:  10.6.0
 #==============================================================================
 
 #------------------------------------------------------------------------------
@@ -238,13 +238,28 @@ POST_BACKUP_COMMAND="${POST_BACKUP_COMMAND:-}"
 # are running during backup pre-flight checks:
 #   'close'   - Gracefully terminate running target applications (SIGTERM) and wait for settlement. (default)
 #   'prompt'  - In interactive terminals, prompt user whether to close apps, sync & proceed, or abort.
-#               In non-interactive runs (cron, systemd timer), falls back to 'sync'.
+#               In non-interactive runs (cron, systemd timer), falls back to UNATTENDED_APPS_ACTION.
 #   'sync'    - Do not terminate applications; log detected apps and flush OS/disk buffers with sync.
 #   'ignore'  - Skip running application detection and buffer flushing entirely.
 RUNNING_APPS_ACTION="${RUNNING_APPS_ACTION:-close}"
 
+# Action to take for running applications during unattended runs (cron, systemd timer, or non-interactive shells):
+#   'close'   - Gracefully terminate running target applications and wait for settlement.
+#               (Recommended when RESTART_CLOSED_APPS=true to ensure 100% database consistency)
+#   'sync'    - Leave applications running; perform safe SQLite WAL checkpointing and flush OS/disk buffers.
+#   'ignore'  - Skip running application detection entirely.
+# Default: If RESTART_CLOSED_APPS is 'true', defaults to 'close'; otherwise defaults to 'sync'
+UNATTENDED_APPS_ACTION="${UNATTENDED_APPS_ACTION:-}"
+
+# Perform safe, passive SQLite WAL checkpointing (PRAGMA wal_checkpoint(PASSIVE))
+# on active browser and email database files when applications remain open during backup ('sync' mode).
+# Flushes committed transactions into database files on disk without holding locks or blocking active readers/writers.
+# Options: true, false
+# Default: true
+SQLITE_WAL_CHECKPOINT="${SQLITE_WAL_CHECKPOINT:-true}"
+
 # List of process names considered sensitive to concurrent file modifications (browsers, email, etc.)
-DEFAULT_TARGET_RUNNING_APPS=("chrome" "chromium" "google-chrome" "firefox" "firefox-bin" "vivaldi" "vivaldi-bin" "brave" "opera" "thunderbird")
+DEFAULT_TARGET_RUNNING_APPS=("chrome" "chromium" "google-chrome" "firefox" "firefox-bin" "firefox-esr" "vivaldi" "vivaldi-bin" "vivaldi-snapshot" "brave" "brave-browser" "opera" "opera-beta" "opera-developer" "thunderbird" "thunderbird-bin" "betterbird" "librewolf" "floorp" "evolution" "microsoft-edge" "msedge" "edge")
 if [ -z "${TARGET_RUNNING_APPS+x}" ]; then
     TARGET_RUNNING_APPS=("${DEFAULT_TARGET_RUNNING_APPS[@]}")
 fi
@@ -260,6 +275,13 @@ RESTART_CLOSED_APPS="${RESTART_CLOSED_APPS:-false}"
 
 # Tracking array for applications closed during pre-flight consistency checks
 ACTUALLY_CLOSED_APPS=()
+declare -A SAVED_APP_REAL_EXES=()
+SAVED_APP_DISPLAY=""
+SAVED_APP_WAYLAND_DISPLAY=""
+SAVED_APP_XAUTHORITY=""
+SAVED_APP_DBUS_ADDRESS=""
+SAVED_APP_DESKTOP=""
+SAVED_APP_SESSION_TYPE=""
 
 # Configurable recipient email address to notify if backup operations fail.
 # Leave empty or unset to disable failure email alerts.
@@ -293,7 +315,7 @@ MAIL_COMMAND="${MAIL_COMMAND:-auto}"
 EMAIL_ALERT_SENT=0
 
 # Script version identifier
-SCRIPT_VERSION="10.5.0"
+SCRIPT_VERSION="10.6.0"
 
 # Path to this script for self-invocation
 SCRIPT_PATH="$(realpath "${BASH_SOURCE[0]}")"
@@ -321,6 +343,7 @@ CURRENT_BACKUP_TMP_DIR=""
 CURRENT_RESTORE_TMP_DIR=""
 CURRENT_SYSTEM_STATE_TMP_DIR=""
 CURRENT_STATS_TMP_DIRS=()
+CURRENT_DIFF_TMP_DIRS=()
 EXPECTED_RESTORE_SHA256=""
 
 # Flag to manage log file overwriting on the first log event.
@@ -1033,6 +1056,10 @@ BACKUP SUMMARY:
   Cloud Remote:       ${BACKUP_DIR} (${cloud_result})
   Local Drive:        ${local_result}
   Verification:       ${verify_result}
+
+DIAGNOSTIC DRIFT INSPECTION:
+  To see exactly which files were added, removed, or modified between these backups, run:
+  ${SCRIPT_PATH} diff-backups "${prev_archive_name}" "${archive_name}"
 
 ================================================================================
 RECENT APPLICATION LOG (${LOG_FILE}):
@@ -2456,16 +2483,122 @@ get_active_app_pids() {
 }
 
 #---
+#   FUNCTION:  checkpoint_running_app_databases()
+#  DESCRIPTION:  Executes safe non-blocking SQLite WAL checkpoints (PRAGMA wal_checkpoint(PASSIVE))
+#                on active databases belonging to detected browser and mail applications.
+#                Flushes committed WAL journal frames to database files on disk without holding
+#                exclusive locks or disturbing active readers and writers.
+#---
+checkpoint_running_app_databases() {
+    local enabled="${SQLITE_WAL_CHECKPOINT:-true}"
+    if [ "$enabled" != "true" ] && [ "$enabled" != "1" ]; then
+        return 0
+    fi
+    if ! command -v sqlite3 &>/dev/null; then
+        return 0
+    fi
+
+    local -a detected_apps=("${@}")
+    if [ ${#detected_apps[@]} -eq 0 ]; then
+        return 0
+    fi
+
+    local -a candidate_dirs=()
+    for app in "${detected_apps[@]}"; do
+        case "$app" in
+            vivaldi*|chrome*|chromium*|brave*|opera*|edge*|msedge*|microsoft-edge*)
+                candidate_dirs+=(
+                    "${SOURCE_DIR}/.config/vivaldi"
+                    "${SOURCE_DIR}/.config/vivaldi-snapshot"
+                    "${SOURCE_DIR}/.config/google-chrome"
+                    "${SOURCE_DIR}/.config/chromium"
+                    "${SOURCE_DIR}/.config/BraveSoftware"
+                    "${SOURCE_DIR}/.config/opera"
+                    "${SOURCE_DIR}/.config/microsoft-edge"
+                )
+                ;;
+            firefox*|librewolf*|floorp*)
+                candidate_dirs+=(
+                    "${SOURCE_DIR}/.mozilla/firefox"
+                    "${SOURCE_DIR}/.librewolf"
+                    "${SOURCE_DIR}/.floorp"
+                )
+                ;;
+            thunderbird*|betterbird*)
+                candidate_dirs+=(
+                    "${SOURCE_DIR}/.thunderbird"
+                    "${SOURCE_DIR}/.betterbird"
+                )
+                ;;
+            evolution*)
+                candidate_dirs+=("${SOURCE_DIR}/.local/share/evolution")
+                ;;
+            *)
+                candidate_dirs+=("${SOURCE_DIR}/.config/${app}")
+                ;;
+        esac
+    done
+
+    local ckpt_count=0
+    for c_dir in "${candidate_dirs[@]}"; do
+        [ -d "$c_dir" ] || continue
+        # Find active SQLite WAL files (shallow search maxdepth 4 for sub-second execution)
+        while IFS= read -r wal_file; do
+            [ -z "$wal_file" ] && continue
+            local db_file="${wal_file%-wal}"
+            if [ -f "$db_file" ] && [ -r "$db_file" ] && [ -w "$db_file" ]; then
+                # PASSIVE checkpoint: non-blocking, flushes dirty pages without waiting for readers/writers
+                if sqlite3 "$db_file" "PRAGMA wal_checkpoint(PASSIVE);" &>/dev/null; then
+                    ((ckpt_count++))
+                fi
+            fi
+        done < <(find "$c_dir" -maxdepth 4 -type f -name "*-wal" 2>/dev/null)
+    done
+
+    if [ "$ckpt_count" -gt 0 ]; then
+        log_message "Safe passive SQLite WAL checkpoints performed on ${ckpt_count} database(s) in active profile(s)."
+        echo "Flushed ${ckpt_count} SQLite WAL database checkpoint(s) in active profile(s)."
+    fi
+}
+
+#---
 #   FUNCTION:  handle_running_applications()
 #  DESCRIPTION:  Detects active applications with open databases or write activity (e.g. browsers,
 #                email clients) prior to archiving. Depending on RUNNING_APPS_ACTION ('prompt',
-#                'close', 'sync', 'ignore'), either prompts user interactively, terminates apps
-#                gracefully with SIGTERM, or logs and flushes OS/filesystem buffers with sync.
+#                'close', 'sync', 'ignore') and UNATTENDED_APPS_ACTION (during non-interactive / timer runs),
+#                either prompts user interactively, terminates apps gracefully with SIGTERM (targeting
+#                root browser processes first to avoid crash recovery prompts), or flushes WAL/filesystem buffers.
 #---
 handle_running_applications() {
     local action="${1:-${RUNNING_APPS_ACTION:-close}}"
     local settle_timeout="${RUNNING_APPS_SETTLE_TIMEOUT:-10}"
     local synced=false
+
+    # Check whether running in an interactive terminal or unattended (cron, timer, background)
+    local is_interactive=false
+    if [ -t 0 ] && [ -z "${UNATTENDED:-}" ] && [ -z "${INVOCATION_ID:-}" ]; then
+        is_interactive=true
+    fi
+
+    # In unattended / non-interactive mode, resolve action:
+    # If UNATTENDED_APPS_ACTION is explicitly configured, use it.
+    # Otherwise, if action is 'prompt':
+    #   If RESTART_CLOSED_APPS is enabled, default to 'close' (safely closes & relaunches after backup)
+    #   Otherwise, default to 'sync' (keeps GUI session uninterrupted and flushes buffers)
+    if [ "$is_interactive" = false ]; then
+        if [ -n "${UNATTENDED_APPS_ACTION:-}" ]; then
+            action="$UNATTENDED_APPS_ACTION"
+            log_message "Unattended run: applying configured UNATTENDED_APPS_ACTION='${action}'."
+        elif [ "$action" = "prompt" ] || [ "$action" = "ask" ]; then
+            if [ "${RESTART_CLOSED_APPS:-false}" = "true" ] || [ "${RESTART_CLOSED_APPS:-false}" = "1" ]; then
+                action="close"
+                log_message "Unattended run: RESTART_CLOSED_APPS=true; resolving 'prompt' to 'close' with automatic post-backup relaunch."
+            else
+                action="sync"
+                log_message "Unattended run: leaving running application(s) active and proceeding with filesystem sync."
+            fi
+        fi
+    fi
 
     # Normalize action
     case "$action" in
@@ -2474,13 +2607,13 @@ handle_running_applications() {
         sync|warn|flush) action="sync" ;;
         ignore|skip|none|false|0) action="ignore" ;;
         *)
-            log_message "WARNING: Unknown RUNNING_APPS_ACTION '${action}'. Defaulting to 'close'."
+            log_message "WARNING: Unknown running applications action '${action}'. Defaulting to 'close'."
             action="close"
             ;;
     esac
 
     if [ "$action" = "ignore" ]; then
-        log_message "Running applications consistency check skipped (RUNNING_APPS_ACTION=ignore)."
+        log_message "Running applications consistency check skipped (action=ignore)."
         return 0
     fi
 
@@ -2501,8 +2634,37 @@ handle_running_applications() {
     if [ ${#running_detected[@]} -gt 0 ]; then
         log_message "Active target application(s) detected: ${running_detected[*]} (Action mode: ${action})"
 
+        # Capture graphical session environment and real executable paths from active processes before altering them
+        for app in "${running_detected[@]}"; do
+            local app_pids=()
+            mapfile -t app_pids < <(get_active_app_pids "$app")
+            for p in "${app_pids[@]}"; do
+                [ -d "/proc/$p" ] || continue
+                # Capture real binary path
+                if [ -z "${SAVED_APP_REAL_EXES[$app]:-}" ]; then
+                    local real_exe
+                    real_exe=$(readlink -f "/proc/$p/exe" 2>/dev/null || true)
+                    [ -n "$real_exe" ] && SAVED_APP_REAL_EXES["$app"]="$real_exe"
+                fi
+                # Capture graphical session environment
+                if [ -r "/proc/$p/environ" ]; then
+                    while IFS= read -r -d '' env_var; do
+                        case "$env_var" in
+                            DISPLAY=*) [ -z "$SAVED_APP_DISPLAY" ] && SAVED_APP_DISPLAY="${env_var#DISPLAY=}" ;;
+                            WAYLAND_DISPLAY=*) [ -z "$SAVED_APP_WAYLAND_DISPLAY" ] && SAVED_APP_WAYLAND_DISPLAY="${env_var#WAYLAND_DISPLAY=}" ;;
+                            XAUTHORITY=*) [ -z "$SAVED_APP_XAUTHORITY" ] && SAVED_APP_XAUTHORITY="${env_var#XAUTHORITY=}" ;;
+                            DBUS_SESSION_BUS_ADDRESS=*) [ -z "$SAVED_APP_DBUS_ADDRESS" ] && SAVED_APP_DBUS_ADDRESS="${env_var#DBUS_SESSION_BUS_ADDRESS=}" ;;
+                            XDG_CURRENT_DESKTOP=*) [ -z "$SAVED_APP_DESKTOP" ] && SAVED_APP_DESKTOP="${env_var#XDG_CURRENT_DESKTOP=}" ;;
+                            XDG_SESSION_TYPE=*) [ -z "$SAVED_APP_SESSION_TYPE" ] && SAVED_APP_SESSION_TYPE="${env_var#XDG_SESSION_TYPE=}" ;;
+                        esac
+                    done < "/proc/$p/environ" 2>/dev/null
+                fi
+                break
+            done
+        done
+
         if [ "$action" = "prompt" ]; then
-            if [ -t 0 ]; then
+            if [ "$is_interactive" = true ]; then
                 echo
                 echo "==============================================================================="
                 echo "  NOTICE: Active Application(s) Detected"
@@ -2537,9 +2699,6 @@ handle_running_applications() {
                         ;;
                 esac
             else
-                # Non-interactive shell (timer, cron, background): keep GUI sessions alive, proceed with sync
-                log_message "Non-interactive run: leaving running application(s) active and proceeding with filesystem sync."
-                echo "Active application(s) detected (${running_detected[*]}). Flushing filesystem buffers and proceeding..."
                 action="sync"
             fi
         fi
@@ -2548,11 +2707,29 @@ handle_running_applications() {
             echo "Closing active application(s) gracefully..."
             local any_closed=false
             for app in "${running_detected[@]}"; do
-                log_message "Sending SIGTERM to process '$app'..."
                 local app_pids=()
                 mapfile -t app_pids < <(get_active_app_pids "$app")
                 if [ ${#app_pids[@]} -gt 0 ]; then
-                    if kill -TERM "${app_pids[@]}" 2>/dev/null; then
+                    # Separate root/main parent processes from child workers/renderers.
+                    # Signaling the main browser process allows it to set clean shutdown flags and
+                    # terminate its own child processes cleanly, avoiding "Restore Session?" crash prompts.
+                    local main_pids=()
+                    for pid in "${app_pids[@]}"; do
+                        local ppid
+                        ppid=$(awk '{print $4}' "/proc/$pid/stat" 2>/dev/null)
+                        local is_child=false
+                        for other_pid in "${app_pids[@]}"; do
+                            if [ "$ppid" = "$other_pid" ]; then
+                                is_child=true
+                                break
+                            fi
+                        done
+                        [ "$is_child" = false ] && main_pids+=("$pid")
+                    done
+                    [ ${#main_pids[@]} -eq 0 ] && main_pids=("${app_pids[@]}")
+
+                    log_message "Sending SIGTERM to main process(es) of '$app' (PID(s): ${main_pids[*]})..."
+                    if kill -TERM "${main_pids[@]}" 2>/dev/null; then
                         any_closed=true
                         local already_tracked=false
                         for ca in "${ACTUALLY_CLOSED_APPS[@]}"; do
@@ -2575,6 +2752,18 @@ handle_running_applications() {
                         fi
                     done
                     [ "$still_running" -eq 0 ] && break
+
+                    # If after 4 seconds child processes still linger, send SIGTERM to remaining PIDs
+                    if [ "$waited" -ge 4 ]; then
+                        for app in "${running_detected[@]}"; do
+                            local rem_pids=()
+                            mapfile -t rem_pids < <(get_active_app_pids "$app")
+                            if [ ${#rem_pids[@]} -gt 0 ]; then
+                                kill -TERM "${rem_pids[@]}" 2>/dev/null || true
+                            fi
+                        done
+                    fi
+
                     sleep 1
                     ((waited++))
                 done
@@ -2600,6 +2789,9 @@ handle_running_applications() {
                 log_message "Filesystem buffers flushed via sync after closing application(s)."
                 synced=true
             fi
+        elif [ "$action" = "sync" ]; then
+            # Applications remain running: perform safe passive SQLite WAL checkpoints on open profiles
+            checkpoint_running_app_databases "${running_detected[@]}"
         fi
     else
         log_message "No sensitive target applications detected running."
@@ -2619,6 +2811,8 @@ handle_running_applications() {
 #   FUNCTION:  relaunch_closed_applications()
 #  DESCRIPTION:  Relaunches GUI applications that were gracefully closed
 #                prior to archiving when RESTART_CLOSED_APPS is enabled.
+#                Restores captured Wayland/X11 display and D-Bus session environment
+#                and passes them through systemd-run --setenv into app.slice.
 #---
 relaunch_closed_applications() {
     if [ "${#ACTUALLY_CLOSED_APPS[@]}" -eq 0 ]; then
@@ -2630,15 +2824,35 @@ relaunch_closed_applications() {
         return 0
     fi
 
+    # Restore captured desktop session environment if available
+    [ -n "$SAVED_APP_DISPLAY" ] && export DISPLAY="$SAVED_APP_DISPLAY"
+    [ -n "$SAVED_APP_WAYLAND_DISPLAY" ] && export WAYLAND_DISPLAY="$SAVED_APP_WAYLAND_DISPLAY"
+    [ -n "$SAVED_APP_XAUTHORITY" ] && export XAUTHORITY="$SAVED_APP_XAUTHORITY"
+    [ -n "$SAVED_APP_DBUS_ADDRESS" ] && export DBUS_SESSION_BUS_ADDRESS="$SAVED_APP_DBUS_ADDRESS"
+    [ -n "$SAVED_APP_DESKTOP" ] && export XDG_CURRENT_DESKTOP="$SAVED_APP_DESKTOP"
+    [ -n "$SAVED_APP_SESSION_TYPE" ] && export XDG_SESSION_TYPE="$SAVED_APP_SESSION_TYPE"
+
     # Ensure D-Bus and display environment are populated for desktop application launching
-    if [ -z "$DBUS_SESSION_BUS_ADDRESS" ]; then
+    if [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]; then
         DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$(id -u)/bus"
         export DBUS_SESSION_BUS_ADDRESS
+    fi
+    if [ -z "${WAYLAND_DISPLAY:-}" ] && [ -S "/run/user/$(id -u)/wayland-0" ]; then
+        export WAYLAND_DISPLAY="wayland-0"
     fi
     export DISPLAY="${DISPLAY:-:0}"
     if [ -z "${XAUTHORITY:-}" ] && [ -f "$HOME/.Xauthority" ]; then
         export XAUTHORITY="$HOME/.Xauthority"
     fi
+
+    # Prepare environment options for systemd-run
+    local -a srun_env_opts=()
+    [ -n "${DISPLAY:-}" ] && srun_env_opts+=(--setenv=DISPLAY="$DISPLAY")
+    [ -n "${WAYLAND_DISPLAY:-}" ] && srun_env_opts+=(--setenv=WAYLAND_DISPLAY="$WAYLAND_DISPLAY")
+    [ -n "${XAUTHORITY:-}" ] && srun_env_opts+=(--setenv=XAUTHORITY="$XAUTHORITY")
+    [ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ] && srun_env_opts+=(--setenv=DBUS_SESSION_BUS_ADDRESS="$DBUS_SESSION_BUS_ADDRESS")
+    [ -n "${XDG_CURRENT_DESKTOP:-}" ] && srun_env_opts+=(--setenv=XDG_CURRENT_DESKTOP="$XDG_CURRENT_DESKTOP")
+    [ -n "${XDG_SESSION_TYPE:-}" ] && srun_env_opts+=(--setenv=XDG_SESSION_TYPE="$XDG_SESSION_TYPE")
 
     echo "Relaunching application(s) closed prior to backup..."
     log_message "Relaunching closed applications: ${ACTUALLY_CLOSED_APPS[*]}"
@@ -2647,55 +2861,106 @@ relaunch_closed_applications() {
         local bin="$app"
         local desktop_candidates=()
         case "$app" in
-            vivaldi-bin|vivaldi)
-                bin="vivaldi"
-                command -v vivaldi &>/dev/null || bin="vivaldi-stable"
+            vivaldi-bin|vivaldi|vivaldi-snapshot)
+                if [ -n "${SAVED_APP_REAL_EXES[$app]:-}" ] && command -v "${SAVED_APP_REAL_EXES[$app]}" &>/dev/null; then
+                    bin="${SAVED_APP_REAL_EXES[$app]}"
+                elif command -v vivaldi &>/dev/null; then
+                    bin="vivaldi"
+                elif command -v vivaldi-stable &>/dev/null; then
+                    bin="vivaldi-stable"
+                elif command -v vivaldi-snapshot &>/dev/null; then
+                    bin="vivaldi-snapshot"
+                fi
                 desktop_candidates=("vivaldi-stable" "vivaldi" "vivaldi-snapshot")
                 ;;
-            firefox-bin|firefox)
-                bin="firefox"
-                command -v firefox &>/dev/null || bin="firefox-esr"
+            firefox-bin|firefox|firefox-esr)
+                if [ -n "${SAVED_APP_REAL_EXES[$app]:-}" ] && command -v "${SAVED_APP_REAL_EXES[$app]}" &>/dev/null; then
+                    bin="${SAVED_APP_REAL_EXES[$app]}"
+                elif command -v firefox &>/dev/null; then
+                    bin="firefox"
+                elif command -v firefox-esr &>/dev/null; then
+                    bin="firefox-esr"
+                fi
                 desktop_candidates=("firefox" "firefox-esr")
                 ;;
             chrome|google-chrome)
-                if command -v google-chrome &>/dev/null; then
+                if [ -n "${SAVED_APP_REAL_EXES[$app]:-}" ] && command -v "${SAVED_APP_REAL_EXES[$app]}" &>/dev/null; then
+                    bin="${SAVED_APP_REAL_EXES[$app]}"
+                elif command -v google-chrome &>/dev/null; then
                     bin="google-chrome"
-                    desktop_candidates=("google-chrome" "google-chrome-stable")
                 elif command -v chrome &>/dev/null; then
                     bin="chrome"
-                    desktop_candidates=("chrome" "google-chrome")
                 elif command -v chromium &>/dev/null; then
                     bin="chromium"
-                    desktop_candidates=("chromium" "chromium-browser")
                 fi
+                desktop_candidates=("google-chrome" "google-chrome-stable" "chrome" "chromium")
                 ;;
-            brave)
-                if command -v brave-browser &>/dev/null; then
+            brave|brave-browser)
+                if [ -n "${SAVED_APP_REAL_EXES[$app]:-}" ] && command -v "${SAVED_APP_REAL_EXES[$app]}" &>/dev/null; then
+                    bin="${SAVED_APP_REAL_EXES[$app]}"
+                elif command -v brave-browser &>/dev/null; then
                     bin="brave-browser"
-                    desktop_candidates=("brave-browser")
                 elif command -v brave &>/dev/null; then
                     bin="brave"
-                    desktop_candidates=("brave" "brave-browser")
                 fi
+                desktop_candidates=("brave-browser" "brave")
                 ;;
-            chromium)
-                if command -v chromium &>/dev/null; then
+            chromium|chromium-browser)
+                if [ -n "${SAVED_APP_REAL_EXES[$app]:-}" ] && command -v "${SAVED_APP_REAL_EXES[$app]}" &>/dev/null; then
+                    bin="${SAVED_APP_REAL_EXES[$app]}"
+                elif command -v chromium &>/dev/null; then
                     bin="chromium"
-                    desktop_candidates=("chromium" "chromium-browser")
                 elif command -v chromium-browser &>/dev/null; then
                     bin="chromium-browser"
-                    desktop_candidates=("chromium-browser" "chromium")
                 fi
+                desktop_candidates=("chromium" "chromium-browser")
                 ;;
-            opera)
-                bin="opera"
-                desktop_candidates=("opera")
+            opera|opera-beta|opera-developer)
+                if [ -n "${SAVED_APP_REAL_EXES[$app]:-}" ] && command -v "${SAVED_APP_REAL_EXES[$app]}" &>/dev/null; then
+                    bin="${SAVED_APP_REAL_EXES[$app]}"
+                else
+                    bin="$app"
+                fi
+                desktop_candidates=("$app" "opera")
                 ;;
-            thunderbird)
-                bin="thunderbird"
+            thunderbird|thunderbird-bin)
+                if [ -n "${SAVED_APP_REAL_EXES[$app]:-}" ] && command -v "${SAVED_APP_REAL_EXES[$app]}" &>/dev/null; then
+                    bin="${SAVED_APP_REAL_EXES[$app]}"
+                elif command -v thunderbird &>/dev/null; then
+                    bin="thunderbird"
+                fi
                 desktop_candidates=("thunderbird")
                 ;;
+            betterbird)
+                bin="betterbird"
+                desktop_candidates=("betterbird")
+                ;;
+            librewolf)
+                bin="librewolf"
+                desktop_candidates=("librewolf")
+                ;;
+            floorp)
+                bin="floorp"
+                desktop_candidates=("floorp")
+                ;;
+            evolution)
+                bin="evolution"
+                desktop_candidates=("evolution" "org.gnome.Evolution")
+                ;;
+            microsoft-edge|msedge|edge)
+                if command -v microsoft-edge &>/dev/null; then
+                    bin="microsoft-edge"
+                elif command -v msedge &>/dev/null; then
+                    bin="msedge"
+                elif command -v edge &>/dev/null; then
+                    bin="edge"
+                fi
+                desktop_candidates=("microsoft-edge" "msedge")
+                ;;
             *)
+                if [ -n "${SAVED_APP_REAL_EXES[$app]:-}" ] && command -v "${SAVED_APP_REAL_EXES[$app]}" &>/dev/null; then
+                    bin="${SAVED_APP_REAL_EXES[$app]}"
+                fi
                 desktop_candidates=("$bin")
                 ;;
         esac
@@ -2707,15 +2972,17 @@ relaunch_closed_applications() {
         [ "$already_done" = true ] && continue
 
         if command -v "$bin" &>/dev/null; then
+            local bin_safe
+            bin_safe=$(basename "$bin" | tr -cd '[:alnum:]_-')
             echo "  Relaunching: $bin..."
             local launched_ok=false
 
             # 1. When running inside a systemd service (INVOCATION_ID set), prioritize systemd-run
-            # to decouple child processes completely from the backup unit's cgroup into app.slice.
+            # with explicit session environment variables passed to decouple completely into app.slice.
             if [ -n "${INVOCATION_ID:-}" ] && command -v systemd-run &>/dev/null && [ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ]; then
-                if systemd-run --user --slice=app.slice --unit="app-${bin}-$(date +%s%N)" "$bin" </dev/null &>/dev/null; then
+                if systemd-run --user --slice=app.slice "${srun_env_opts[@]}" --unit="app-${bin_safe}-$(date +%s%N)" "$bin" </dev/null &>/dev/null; then
                     launched+=("$bin")
-                    log_message "Relaunched $bin via systemd-run (app.slice decoupled from service cgroup)."
+                    log_message "Relaunched $bin via systemd-run (app.slice decoupled from service cgroup with session environment)."
                     launched_ok=true
                 fi
             fi
@@ -2752,16 +3019,16 @@ relaunch_closed_applications() {
                 fi
             fi
 
-            # 3. Decouple from calling cgroup via systemd-run (fallback if not already launched)
+            # 3. Decouple from calling cgroup via systemd-run (fallback if not launched via desktop helper)
             if [ "$launched_ok" = false ] && command -v systemd-run &>/dev/null && [ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ]; then
-                if systemd-run --user --slice=app.slice --unit="app-${bin}-$(date +%s%N)" "$bin" </dev/null &>/dev/null; then
+                if systemd-run --user --slice=app.slice "${srun_env_opts[@]}" --unit="app-${bin_safe}-$(date +%s%N)" "$bin" </dev/null &>/dev/null; then
                     launched+=("$bin")
-                    log_message "Relaunched $bin via systemd-run (app.slice)."
+                    log_message "Relaunched $bin via systemd-run (app.slice with session environment)."
                     launched_ok=true
                 fi
             fi
 
-            # 3. Fallback to process session detachment
+            # 4. Fallback to process session detachment
             if [ "$launched_ok" = false ]; then
                 if command -v setsid &>/dev/null; then
                     setsid "$bin" </dev/null &>/dev/null &
@@ -2903,6 +3170,23 @@ run_backup() {
                 ;;
             --ignore-apps)
                 cli_apps_action="ignore"
+                shift
+                ;;
+            --unattended-apps-action|-uaa)
+                if [[ "${2:-}" =~ ^(close|kill|terminate|sync|warn|flush|ignore|skip|none)$ ]]; then
+                    UNATTENDED_APPS_ACTION="$2"
+                    shift 2
+                else
+                    echo "ERROR: Invalid --unattended-apps-action option '${2:-}'. Use 'close', 'sync', or 'ignore'." >&2
+                    return 1
+                fi
+                ;;
+            --sqlite-checkpoint|--wal-checkpoint)
+                SQLITE_WAL_CHECKPOINT="true"
+                shift
+                ;;
+            --no-sqlite-checkpoint|--no-wal-checkpoint)
+                SQLITE_WAL_CHECKPOINT="false"
                 shift
                 ;;
             --exclude-tag|-et)
@@ -9444,6 +9728,706 @@ find_file() {
 }
 
 #---
+#   FUNCTION:  diff_backups()
+#  DESCRIPTION:  Compares two backup archives to identify added, removed, and
+#                modified files and analyze storage size drift without decrypting
+#                or extracting multi-gigabyte archives, using lightweight companion
+#                file list indices (.files.gz).
+#                Usage: diff-backups [archive1] [archive2] [options]
+#---
+diff_backups() {
+    local start_time=$SECONDS
+    local positional_args=()
+    local source_filter="auto"
+    local stat_only=false
+    local filter_pattern=""
+    local min_size_bytes=0
+    local sort_mode="path"   # path, delta, size
+    local show_filter="all"  # all, added, removed, modified
+    local output_format="text" # text, json, csv
+    local use_pager=false
+    local cli_interactive=false
+    local had_flags=false
+    if [ -t 1 ] && [ "${TERM:-dumb}" != "dumb" ] && [ -n "${ARCHIVE_LIST_PAGER:-}" ]; then
+        use_pager=true
+    fi
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --interactive|-i|--browse|--select)
+                cli_interactive=true
+                shift
+                ;;
+            --stat|--summary|-s)
+                stat_only=true
+                had_flags=true
+                shift
+                ;;
+            --added|-a)
+                show_filter="added"
+                had_flags=true
+                shift
+                ;;
+            --removed|-d|--deleted)
+                show_filter="removed"
+                had_flags=true
+                shift
+                ;;
+            --modified|-m)
+                show_filter="modified"
+                had_flags=true
+                shift
+                ;;
+            --filter|-f|--pattern)
+                had_flags=true
+                if [ -n "${2:-}" ]; then
+                    filter_pattern="$2"
+                    shift 2
+                else
+                    shift
+                fi
+                ;;
+            --min-size|--threshold)
+                had_flags=true
+                if [ -n "${2:-}" ]; then
+                    if command -v numfmt &>/dev/null; then
+                        min_size_bytes=$(numfmt --from=auto "$2" 2>/dev/null || numfmt --from=iec "$2" 2>/dev/null || echo 0)
+                    else
+                        min_size_bytes="$2"
+                    fi
+                    shift 2
+                else
+                    shift
+                fi
+                ;;
+            --sort)
+                had_flags=true
+                if [ -n "${2:-}" ]; then
+                    sort_mode="${2,,}"
+                    shift 2
+                else
+                    shift
+                fi
+                ;;
+            --source)
+                had_flags=true
+                if [ -n "${2:-}" ]; then
+                    source_filter="$2"
+                    shift 2
+                else
+                    shift
+                fi
+                ;;
+            --json|-j)
+                output_format="json"
+                had_flags=true
+                use_pager=false
+                shift
+                ;;
+            --csv)
+                output_format="csv"
+                had_flags=true
+                use_pager=false
+                shift
+                ;;
+            --no-pager)
+                use_pager=false
+                shift
+                ;;
+            --pager)
+                use_pager=true
+                shift
+                ;;
+            help|-h|--help)
+                echo "Usage: $0 diff-backups [archive1] [archive2] [options]"
+                echo
+                echo "Compare two backup archives to identify added, removed, and modified files"
+                echo "and analyze storage size drift without decrypting or extracting archives."
+                echo
+                echo "Arguments:"
+                echo "  [archive1]                        Older baseline archive (or 'latest', 'previous')"
+                echo "  [archive2]                        Newer target archive (defaults to latest if omitted)"
+                echo "                                    If both omitted, compares the two newest backups automatically."
+                echo
+                echo "Options:"
+                echo "  --interactive, -i                 Select backup archives interactively"
+                echo "  --stat, --summary, -s             Summary statistics only (do not list individual files)"
+                echo "  --added, -a                       Show only newly added files"
+                echo "  --removed, -d, --deleted          Show only deleted / removed files"
+                echo "  --modified, -m                    Show only modified files"
+                echo "  --filter, -f <pattern>            Filter file paths matching regex or keyword pattern"
+                echo "  --min-size, --threshold <size>    Show only files with size or delta >= threshold (e.g. 10M, 1G)"
+                echo "  --sort <path|delta|size>          Sort file listing by path, size delta, or file size (default: path)"
+                echo "  --source <auto|local|cloud|all>   Filter backup sources (default: auto)"
+                echo "  --json, -j                        Output in structured JSON format"
+                echo "  --csv                             Output in CSV format"
+                echo "  --no-pager                        Disable terminal pagination"
+                echo "  --pager                           Force terminal pagination"
+                return 0
+                ;;
+            *)
+                positional_args+=("$1")
+                shift
+                ;;
+        esac
+    done
+
+    local local_backup_path
+    local_backup_path=$(get_local_backup_path 2>/dev/null || echo "")
+
+    # Collect available archive companion indices: map of archive_name -> "source_type|location"
+    local -A archive_indices=()
+    local -a archive_order=()
+
+    # 1. Local drive backups
+    if [[ "$source_filter" =~ ^(auto|local|all)$ ]] && [ -n "$local_backup_path" ] && [ -d "$local_backup_path" ]; then
+        local local_idx_files=()
+        mapfile -t local_idx_files < <(find "${local_backup_path}" -maxdepth 1 -type f -name "${TARBALL_BASENAME}_*.files.gz" 2>/dev/null | sort -r)
+        for idx_file in "${local_idx_files[@]}"; do
+            [ -z "$idx_file" ] && continue
+            local arc_name
+            arc_name=$(basename "$idx_file" .files.gz)
+            if [ -z "${archive_indices[$arc_name]+x}" ]; then
+                archive_indices["$arc_name"]="local|${idx_file}"
+                archive_order+=("$arc_name")
+            fi
+        done
+    fi
+
+    # 2. Preserved archives in SOURCE_DIR
+    if [[ "$source_filter" =~ ^(auto|local|all)$ ]]; then
+        local pres_idx_files=()
+        mapfile -t pres_idx_files < <(find "${SOURCE_DIR}" -maxdepth 1 -type f -name "${TARBALL_BASENAME}_*.files.gz" 2>/dev/null | sort -r)
+        for idx_file in "${pres_idx_files[@]}"; do
+            [ -z "$idx_file" ] && continue
+            local arc_name
+            arc_name=$(basename "$idx_file" .files.gz)
+            if [ -z "${archive_indices[$arc_name]+x}" ]; then
+                archive_indices["$arc_name"]="preserved|${idx_file}"
+                archive_order+=("$arc_name")
+            fi
+        done
+    fi
+
+    # 3. Cloud backups
+    if [[ "$source_filter" =~ ^(auto|cloud|all)$ ]]; then
+        if [ "$source_filter" != "auto" ] || [ ${#archive_order[@]} -lt 2 ]; then
+            [ "$output_format" = "text" ] && echo "Querying cloud file indices (${BACKUP_DIR})..." >&2
+            local cloud_indices=()
+            mapfile -t cloud_indices < <(rclone lsf --fast-list "${BACKUP_DIR}" 2>/dev/null | grep -E "${TARBALL_BASENAME}_.*\.files\.gz$" | sort -r)
+            for c_idx in "${cloud_indices[@]}"; do
+                [ -z "$c_idx" ] && continue
+                local arc_name="${c_idx%.files.gz}"
+                if [ -z "${archive_indices[$arc_name]+x}" ]; then
+                    archive_indices["$arc_name"]="cloud|${c_idx}"
+                    archive_order+=("$arc_name")
+                fi
+            done
+        fi
+    fi
+
+    # Interactive menu if explicitly requested or if run interactively without flags/arguments
+    if { [ "$cli_interactive" = true ] || { [ "$had_flags" = false ] && [ ${#positional_args[@]} -eq 0 ]; }; } && [ -t 0 ] && [ ${#archive_order[@]} -ge 2 ]; then
+        echo -e "\n==============================================================================="
+        echo "  Backup Comparison & Drift Analysis"
+        echo "==============================================================================="
+        echo "  1) Compare Latest vs Previous (Default)"
+        echo "     [Older]  ${archive_order[1]}"
+        echo "     [Newer]  ${archive_order[0]}"
+        echo "  2) Select two specific backups to compare"
+        echo "  3) Enter custom archive name or file path"
+        echo "  4) Cancel"
+        echo "-------------------------------------------------------------------------------"
+        local choice_mode=""
+        read -r -p "Please select an option [1-4, default: 1]: " choice_mode
+        case "$choice_mode" in
+            2)
+                echo -e "\nAvailable backup archives (newest to oldest):"
+                local idx=0
+                for arc in "${archive_order[@]}"; do
+                    ((idx++))
+                    local meta="${archive_indices[$arc]}"
+                    local src_t="${meta%%|*}"
+                    printf "  %2d) %s (%s)\n" "$idx" "$arc" "$src_t"
+                done
+                echo
+                local sel_base="" sel_tgt=""
+                read -r -p "Select baseline (older) backup [1-${#archive_order[@]}]: " sel_base
+                read -r -p "Select target   (newer) backup [1-${#archive_order[@]}]: " sel_tgt
+                if [[ "$sel_base" =~ ^[0-9]+$ ]] && [ "$sel_base" -ge 1 ] && [ "$sel_base" -le "${#archive_order[@]}" ] && \
+                   [[ "$sel_tgt" =~ ^[0-9]+$ ]] && [ "$sel_tgt" -ge 1 ] && [ "$sel_tgt" -le "${#archive_order[@]}" ]; then
+                    positional_args=("${archive_order[$((sel_base - 1))]}" "${archive_order[$((sel_tgt - 1))]}")
+                else
+                    echo "Invalid selection. Aborting." >&2
+                    return 1
+                fi
+                ;;
+            3)
+                local custom_arc1="" custom_arc2=""
+                read -r -e -p "Enter baseline (older) archive name or path: " custom_arc1
+                read -r -e -p "Enter target   (newer) archive name or path: " custom_arc2
+                if [ -n "$custom_arc1" ] && [ -n "$custom_arc2" ]; then
+                    positional_args=("$custom_arc1" "$custom_arc2")
+                else
+                    echo "Invalid input. Aborting." >&2
+                    return 1
+                fi
+                ;;
+            4)
+                echo "Cancelled."
+                return 0
+                ;;
+            *)
+                # Option 1 default: newest vs previous
+                positional_args=("${archive_order[1]}" "${archive_order[0]}")
+                ;;
+        esac
+    fi
+
+    local baseline_req="" target_req=""
+    if [ ${#positional_args[@]} -ge 2 ]; then
+        baseline_req="${positional_args[0]}"
+        target_req="${positional_args[1]}"
+    elif [ ${#positional_args[@]} -eq 1 ]; then
+        local single_arg="${positional_args[0]}"
+        if [ "$single_arg" = "latest" ]; then
+            if [ ${#archive_order[@]} -ge 2 ]; then
+                target_req="${archive_order[0]}"
+                baseline_req="${archive_order[1]}"
+            else
+                echo "ERROR: Need at least two backups to compare differences." >&2
+                return 1
+            fi
+        else
+            local found_idx=-1
+            for i in "${!archive_order[@]}"; do
+                if [ "${archive_order[i]}" = "$single_arg" ] || [ "${archive_order[i]}" = "$(basename "$single_arg" .files.gz)" ]; then
+                    found_idx=$i
+                    break
+                fi
+            done
+            if [ "$found_idx" -ge 0 ]; then
+                if [ $((found_idx + 1)) -lt ${#archive_order[@]} ]; then
+                    baseline_req="${archive_order[$((found_idx + 1))]}"
+                    target_req="${archive_order[found_idx]}"
+                elif [ "$found_idx" -gt 0 ]; then
+                    baseline_req="${archive_order[found_idx]}"
+                    target_req="${archive_order[$((found_idx - 1))]}"
+                else
+                    echo "ERROR: Archive '${single_arg}' is the only backup found. Need at least two backups to compare drift." >&2
+                    return 1
+                fi
+            else
+                baseline_req="$single_arg"
+                target_req="${archive_order[0]:-latest}"
+            fi
+        fi
+    else
+        # 0 positional arguments
+        if [ ${#archive_order[@]} -ge 2 ]; then
+            target_req="${archive_order[0]}"
+            baseline_req="${archive_order[1]}"
+        elif [ ${#archive_order[@]} -eq 1 ]; then
+            echo "Notice: Only 1 backup archive index found (${archive_order[0]}). Need at least two backups to compare differences." >&2
+            return 1
+        else
+            echo "ERROR: No backup companion file indices (.files.gz) found on local drive, preserved in ${SOURCE_DIR}, or on cloud storage." >&2
+            return 1
+        fi
+    fi
+
+    # Helper function to resolve an archive identifier to:
+    # 1: canonical_name, 2: source_type (local|preserved|cloud|file), 3: index_location
+    local base_canon="" base_source="local" base_loc=""
+    local tgt_canon="" tgt_source="local" tgt_loc=""
+
+    resolve_index_target() {
+        local input="$1"
+        local -n out_canon="$2"
+        local -n out_source="$3"
+        local -n out_loc="$4"
+
+        # Direct file check
+        if [ -f "$input" ]; then
+            out_canon="$(basename "$input" .files.gz)"
+            out_source="local file"
+            if [[ "$input" == *.files.gz ]]; then
+                out_loc="$input"
+            elif [ -f "${input}.files.gz" ]; then
+                out_loc="${input}.files.gz"
+            else
+                out_loc="$input"
+            fi
+            return 0
+        fi
+
+        local clean_name
+        clean_name="$(basename "$input")"
+        clean_name="${clean_name%.files.gz}"
+
+        if [ -n "${archive_indices[$clean_name]+x}" ]; then
+            local meta="${archive_indices[$clean_name]}"
+            out_canon="$clean_name"
+            out_source="${meta%%|*}"
+            out_loc="${meta#*|}"
+            return 0
+        fi
+
+        # Check local backup path
+        if [ -n "$local_backup_path" ] && [ -f "${local_backup_path}/${clean_name}.files.gz" ]; then
+            out_canon="$clean_name"
+            out_source="local"
+            out_loc="${local_backup_path}/${clean_name}.files.gz"
+            return 0
+        fi
+
+        # Check preserved in SOURCE_DIR
+        if [ -f "${SOURCE_DIR}/${clean_name}.files.gz" ]; then
+            out_canon="$clean_name"
+            out_source="preserved"
+            out_loc="${SOURCE_DIR}/${clean_name}.files.gz"
+            return 0
+        fi
+
+        # Check cloud
+        if rclone lsf "${BACKUP_DIR}${clean_name}.files.gz" &>/dev/null; then
+            out_canon="$clean_name"
+            out_source="cloud"
+            out_loc="${clean_name}.files.gz"
+            return 0
+        fi
+
+        # Fuzzy match in archive_order
+        for arc in "${archive_order[@]}"; do
+            if [[ "$arc" == *"$clean_name"* ]]; then
+                local meta="${archive_indices[$arc]}"
+                out_canon="$arc"
+                out_source="${meta%%|*}"
+                out_loc="${meta#*|}"
+                return 0
+            fi
+        done
+
+        return 1
+    }
+
+    if ! resolve_index_target "$baseline_req" base_canon base_source base_loc; then
+        echo "ERROR: Companion index not found for baseline archive '${baseline_req}'." >&2
+        return 1
+    fi
+
+    if ! resolve_index_target "$target_req" tgt_canon tgt_source tgt_loc; then
+        echo "ERROR: Companion index not found for target archive '${target_req}'." >&2
+        return 1
+    fi
+
+    # Ensure chronological order: if baseline is newer than target, swap them
+    local base_ts tgt_ts
+    base_ts=$(grep -o -E '[0-9]{4}-[0-9]{2}-[0-9]{2}(_[0-9]{6})?' <<< "$base_canon" || echo "")
+    tgt_ts=$(grep -o -E '[0-9]{4}-[0-9]{2}-[0-9]{2}(_[0-9]{6})?' <<< "$tgt_canon" || echo "")
+    if [ -n "$base_ts" ] && [ -n "$tgt_ts" ] && [[ "$base_ts" > "$tgt_ts" ]]; then
+        local tmp_c="$base_canon" tmp_s="$base_source" tmp_l="$base_loc"
+        base_canon="$tgt_canon"; base_source="$tgt_source"; base_loc="$tgt_loc"
+        tgt_canon="$tmp_c"; tgt_source="$tmp_s"; tgt_loc="$tmp_l"
+    fi
+
+    local diff_tmp_dir
+    diff_tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/backup_diff.XXXXXX")
+    CURRENT_DIFF_TMP_DIRS+=("$diff_tmp_dir")
+    cleanup_diff_tmp() {
+        [ -n "$diff_tmp_dir" ] && [ -d "$diff_tmp_dir" ] && rm -rf "$diff_tmp_dir" 2>/dev/null
+        for i in "${!CURRENT_DIFF_TMP_DIRS[@]}"; do
+            if [ "${CURRENT_DIFF_TMP_DIRS[i]:-}" = "$diff_tmp_dir" ]; then
+                unset 'CURRENT_DIFF_TMP_DIRS[i]'
+            fi
+        done
+    }
+    trap cleanup_diff_tmp RETURN INT TERM
+
+    local base_idx_file="${diff_tmp_dir}/base.idx"
+    local tgt_idx_file="${diff_tmp_dir}/tgt.idx"
+
+    # Extract or stream indices
+    fetch_index_to_file() {
+        local src_type="$1"
+        local src_location="$2"
+        local dest_file="$3"
+        local label="$4"
+
+        if [ "$src_type" = "cloud" ]; then
+            [ "$output_format" = "text" ] && echo "Fetching companion index for ${label} from cloud storage..." >&2
+            rclone cat "${RCLONE_STREAM_OPTS[@]}" "${BACKUP_DIR}${src_location}" 2>/dev/null | gzip -dc > "$dest_file" 2>/dev/null
+        else
+            gzip -dc "$src_location" > "$dest_file" 2>/dev/null
+        fi
+        [ -s "$dest_file" ]
+    }
+
+    if ! fetch_index_to_file "$base_source" "$base_loc" "$base_idx_file" "$base_canon"; then
+        echo "ERROR: Failed to read companion index for baseline archive '${base_canon}'." >&2
+        return 1
+    fi
+
+    if ! fetch_index_to_file "$tgt_source" "$tgt_loc" "$tgt_idx_file" "$tgt_canon"; then
+        echo "ERROR: Failed to read companion index for target archive '${tgt_canon}'." >&2
+        return 1
+    fi
+
+    local stat_num=0
+    [ "$stat_only" = true ] && stat_num=1
+
+    local c_bold="" c_green="" c_red="" c_yellow="" c_cyan="" c_reset=""
+    if [ -t 1 ] && [ "$output_format" = "text" ]; then
+        c_bold=$(printf '\033[1m')
+        c_green=$(printf '\033[32m')
+        c_red=$(printf '\033[31m')
+        c_yellow=$(printf '\033[33m')
+        c_cyan=$(printf '\033[36m')
+        c_reset=$(printf '\033[0m')
+    fi
+
+    local pager_cmd=()
+    if [ "$use_pager" = true ]; then
+        if [ -n "${ARCHIVE_LIST_PAGER:-}" ]; then
+            read -r -a pager_cmd <<< "$ARCHIVE_LIST_PAGER"
+        elif [ -n "${PAGER:-}" ]; then
+            read -r -a pager_cmd <<< "$PAGER"
+        elif command -v less &>/dev/null; then
+            pager_cmd=(less -FRX)
+        elif command -v more &>/dev/null; then
+            pager_cmd=(more)
+        fi
+    fi
+    if [ ${#pager_cmd[@]} -eq 0 ] || ! command -v "${pager_cmd[0]}" &>/dev/null; then
+        pager_cmd=(cat)
+    fi
+
+    # Pipeline: awk comparison scanner -> sort -> awk formatter -> pager
+    awk -v filter_pat="$filter_pattern" \
+        -v min_size="$min_size_bytes" \
+        -v show_mode="$show_filter" '
+    BEGIN { FS = "[ \t]+" }
+    function clean_path(line) {
+        sub(/^([^[:space:]]+[[:space:]]+){5}/, "", line)
+        sub(/ (->|link to) .*$/, "", line)
+        return line
+    }
+    NR==FNR {
+        p = clean_path($0)
+        if (p == "./" || p == ".") next
+        f1_size[p] = $3 + 0
+        f1_mtime[p] = $4 " " $5
+        f1_type[p] = substr($1, 1, 1)
+        f1_present[p] = 1
+        f1_count++
+        f1_bytes += ($3 + 0)
+        next
+    }
+    {
+        p = clean_path($0)
+        if (p == "./" || p == ".") next
+        sz2 = $3 + 0
+        mt2 = $4 " " $5
+        tp2 = substr($1, 1, 1)
+        f2_present[p] = 1
+        f2_count++
+        f2_bytes += sz2
+
+        if (!(p in f1_present)) {
+            added_count++
+            added_bytes += sz2
+            if (show_mode == "all" || show_mode == "added") {
+                if (min_size <= sz2 && (filter_pat == "" || p ~ filter_pat)) {
+                    print "A\t" sz2 "\t" sz2 "\t0\t" sz2 "\t-\t" mt2 "\t" p
+                }
+            }
+        } else {
+            sz1 = f1_size[p]
+            mt1 = f1_mtime[p]
+            tp1 = f1_type[p]
+            if (sz1 != sz2 || mt1 != mt2 || tp1 != tp2) {
+                delta = sz2 - sz1
+                abs_delta = (delta < 0 ? -delta : delta)
+                mod_count++
+                mod_delta += delta
+                if (show_mode == "all" || show_mode == "modified") {
+                    if (min_size <= abs_delta && (filter_pat == "" || p ~ filter_pat)) {
+                        print "M\t" abs_delta "\t" delta "\t" sz1 "\t" sz2 "\t" mt1 "\t" mt2 "\t" p
+                    }
+                }
+            } else {
+                unchanged_count++
+                unchanged_bytes += sz2
+            }
+        }
+    }
+    END {
+        for (p in f1_present) {
+            if (!(p in f2_present)) {
+                sz1 = f1_size[p]
+                mt1 = f1_mtime[p]
+                del_count++
+                del_bytes += sz1
+                if (show_mode == "all" || show_mode == "removed") {
+                    if (min_size <= sz1 && (filter_pat == "" || p ~ filter_pat)) {
+                        print "D\t" sz1 "\t" (-sz1) "\t" sz1 "\t0\t" mt1 "\t-\t" p
+                    }
+                }
+            }
+        }
+        printf "SUMMARY\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\n",
+            f1_count, f1_bytes, f2_count, f2_bytes, added_count, added_bytes, del_count, del_bytes, mod_count, mod_delta, unchanged_count, unchanged_bytes
+    }
+    ' "$base_idx_file" "$tgt_idx_file" \
+    | {
+        local summary_line=""
+        local diff_records="${diff_tmp_dir}/records.raw"
+        local diff_sorted="${diff_tmp_dir}/records.sorted"
+        : > "$diff_records"
+
+        while IFS= read -r line; do
+            if [[ "$line" == SUMMARY$'\t'* ]]; then
+                summary_line="$line"
+            else
+                printf '%s\n' "$line" >> "$diff_records"
+            fi
+        done
+
+        if [ "$sort_mode" = "delta" ]; then
+            sort -t$'\t' -k2,2rn -k8,8 "$diff_records" > "$diff_sorted"
+        elif [ "$sort_mode" = "size" ]; then
+            sort -t$'\t' -k5,5rn -k8,8 "$diff_records" > "$diff_sorted"
+        else
+            # Default: sort by path
+            sort -t$'\t' -k8,8 "$diff_records" > "$diff_sorted"
+        fi
+
+        # Pass summary and sorted records into the formatter
+        {
+            [ -n "$summary_line" ] && printf '%s\n' "$summary_line"
+            cat "$diff_sorted"
+        } | awk -v fmt="$output_format" \
+                -v base_name="$base_canon" \
+                -v tgt_name="$tgt_canon" \
+                -v base_src="$base_source" \
+                -v tgt_src="$tgt_source" \
+                -v stat_only="$stat_num" \
+                -v c_bold="$c_bold" \
+                -v c_green="$c_green" \
+                -v c_red="$c_red" \
+                -v c_yellow="$c_yellow" \
+                -v c_cyan="$c_cyan" \
+                -v c_reset="$c_reset" '
+        BEGIN {
+            FS = "\t"
+        }
+        function hr_size(bytes,   neg, b, u, i) {
+            if (bytes < 0) { neg = "-"; b = -bytes }
+            else { neg = ""; b = bytes }
+            if (b < 1024) return sprintf("%s%d B", neg, b)
+            u[1]="KB"; u[2]="MB"; u[3]="GB"; u[4]="TB"
+            i = 0
+            while (b >= 1024 && i < 4) {
+                b /= 1024
+                i++
+            }
+            return sprintf("%s%.1f %s", neg, b, u[i])
+        }
+        function hr_delta(bytes,   sign, b) {
+            if (bytes > 0) return "+" hr_size(bytes)
+            return hr_size(bytes)
+        }
+
+        $1 == "SUMMARY" {
+            f1_count = $2 + 0; f1_bytes = $3 + 0
+            f2_count = $4 + 0; f2_bytes = $5 + 0
+            add_count = $6 + 0; add_bytes = $7 + 0
+            del_count = $8 + 0; del_bytes = $9 + 0
+            mod_count = $10 + 0; mod_delta = $11 + 0
+            unch_count = $12 + 0; unch_bytes = $13 + 0
+            net_drift = add_bytes - del_bytes + mod_delta
+            net_files = f2_count - f1_count
+            next
+        }
+
+        {
+            lines_total++
+            status[lines_total] = $1
+            delta[lines_total] = $3 + 0
+            sz1[lines_total] = $4 + 0
+            sz2[lines_total] = $5 + 0
+            path[lines_total] = $8
+        }
+
+        END {
+            if (fmt == "json") {
+                printf "{\n"
+                printf "  \"baseline\": {\"archive\": \"%s\", \"source\": \"%s\", \"files\": %d, \"bytes\": %d, \"human\": \"%s\"},\n",
+                    base_name, base_src, f1_count, f1_bytes, hr_size(f1_bytes)
+                printf "  \"target\": {\"archive\": \"%s\", \"source\": \"%s\", \"files\": %d, \"bytes\": %d, \"human\": \"%s\"},\n",
+                    tgt_name, tgt_src, f2_count, f2_bytes, hr_size(f2_bytes)
+                printf "  \"summary\": {\"added_files\": %d, \"added_bytes\": %d, \"removed_files\": %d, \"removed_bytes\": %d, \"modified_files\": %d, \"modified_delta_bytes\": %d, \"unchanged_files\": %d, \"net_files\": %d, \"net_bytes_drift\": %d},\n",
+                    add_count, add_bytes, del_count, del_bytes, mod_count, mod_delta, unch_count, net_files, net_drift
+                printf "  \"changes\": [\n"
+                for (i = 1; i <= lines_total; i++) {
+                    st = (status[i] == "A" ? "added" : (status[i] == "D" ? "removed" : "modified"))
+                    printf "    {\"status\": \"%s\", \"path\": \"%s\", \"baseline_bytes\": %d, \"target_bytes\": %d, \"delta_bytes\": %d}%s\n",
+                        st, path[i], sz1[i], sz2[i], delta[i], (i == lines_total ? "" : ",")
+                }
+                printf "  ]\n}\n"
+            } else if (fmt == "csv") {
+                print "status,path,baseline_bytes,target_bytes,delta_bytes,delta_human"
+                for (i = 1; i <= lines_total; i++) {
+                    st = (status[i] == "A" ? "added" : (status[i] == "D" ? "removed" : "modified"))
+                    printf "%s,\"%s\",%d,%d,%d,\"%s\"\n", st, path[i], sz1[i], sz2[i], delta[i], hr_delta(delta[i])
+                }
+            } else {
+                print "==============================================================================="
+                print "  BACKUP DRIFT & DIFFERENCE ANALYSIS"
+                print "==============================================================================="
+                printf "  Baseline (Older) : %s (%s)\n", base_name, base_src
+                printf "  Target   (Newer) : %s (%s)\n", tgt_name, tgt_src
+                print "-------------------------------------------------------------------------------"
+                printf "  Baseline Files   : %10d  (%s uncompressed)\n", f1_count, hr_size(f1_bytes)
+                printf "  Target Files     : %10d  (%s uncompressed)\n", f2_count, hr_size(f2_bytes)
+                print "-------------------------------------------------------------------------------"
+                print "  Summary of Changes:"
+                printf "    %s+ Added Files    :%s %10d  (+%s)\n", c_green, c_reset, add_count, hr_size(add_bytes)
+                printf "    %s- Removed Files  :%s %10d  (-%s)\n", c_red, c_reset, del_count, hr_size(del_bytes)
+                printf "    %s~ Modified Files :%s %10d  (%s net delta)\n", c_yellow, c_reset, mod_count, hr_delta(mod_delta)
+                printf "    = Unchanged Files: %10d  (%s)\n", unch_count, hr_size(unch_bytes)
+                print "  -----------------------------------------------------------------------------"
+                printf "    Net File Drift   : %+10d %s\n", net_files, (net_files == 1 || net_files == -1 ? "file" : "files")
+                printf "    Net Size Drift   : %10s\n", hr_delta(net_drift)
+                print "==============================================================================="
+                if (stat_only == 0 && lines_total > 0) {
+                    print ""
+                    for (i = 1; i <= lines_total; i++) {
+                        if (status[i] == "A") {
+                            printf "%s+ [ADDED]   %s %-55s  (+%s)\n", c_green, c_reset, path[i], hr_size(sz2[i])
+                        } else if (status[i] == "D") {
+                            printf "%s- [REMOVED] %s %-55s  (-%s)\n", c_red, c_reset, path[i], hr_size(sz1[i])
+                        } else {
+                            if (delta[i] != 0) {
+                                printf "%s~ [MODIFIED]%s %-55s  (%s -> %s, %s)\n", c_yellow, c_reset, path[i], hr_size(sz1[i]), hr_size(sz2[i]), hr_delta(delta[i])
+                            } else {
+                                printf "%s~ [MODIFIED]%s %-55s  (%s, metadata/timestamp changed)\n", c_yellow, c_reset, path[i], hr_size(sz2[i])
+                            }
+                        }
+                    }
+                } else if (stat_only == 0 && lines_total == 0) {
+                    print "\n  No file changes matched the filter criteria."
+                }
+            }
+        }' | "${pager_cmd[@]}"
+    }
+
+    local elapsed=$((SECONDS - start_time))
+    [ "$output_format" = "text" ] && log_message "Backup drift comparison completed in $(format_duration "$elapsed")."
+    return 0
+}
+
+#---
 #   FUNCTION:  run_verify()
 #  DESCRIPTION:  Verifies the integrity of a backup archive (decryption and
 #                tar/zstd stream structure) without writing files to disk.
@@ -10198,6 +11182,14 @@ cleanup() {
             CURRENT_STATS_TMP_DIRS=()
         fi
 
+        # Clean up any temporary backup drift diff directories
+        if [ ${#CURRENT_DIFF_TMP_DIRS[@]} -gt 0 ]; then
+            for d in "${CURRENT_DIFF_TMP_DIRS[@]}"; do
+                [ -n "$d" ] && [ -d "$d" ] && rm -rf "$d" 2>/dev/null
+            done
+            CURRENT_DIFF_TMP_DIRS=()
+        fi
+
         # Relaunch applications if they were closed and not yet relaunched
         relaunch_closed_applications
 
@@ -10349,6 +11341,7 @@ execute_with_inhibit() {
             verify)  run_verify "$@" || ret=$? ;;
             list-files|view-archive|list-contents) list_archive_contents "$@" || ret=$? ;;
             find-file|find_file|search-file|search_file) find_file "$@" || ret=$? ;;
+            diff-backups|diff_backups|backup-diff|backup_diff|drift|diff) diff_backups "$@" || ret=$? ;;
             manage-preserved|clean-preserved) manage_preserved_archives "$@" || ret=$? ;;
             pin)     pin_archive "$@" || ret=$? ;;
             unpin)   unpin_archive "$@" || ret=$? ;;
@@ -10408,6 +11401,7 @@ ExecStart=${SCRIPT_PATH} backup
 TimeoutStartSec=0
 KillMode=mixed
 Environment="PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin"
+PassEnvironment=DISPLAY WAYLAND_DISPLAY XDG_CURRENT_DESKTOP XAUTHORITY DBUS_SESSION_BUS_ADDRESS
 Nice=19
 IOSchedulingClass=best-effort
 IOSchedulingPriority=7
@@ -11178,11 +12172,27 @@ init_config() {
 # Options:
 #   'close'   - Gracefully terminate target applications (SIGTERM) and wait for settlement. (default)
 #   'prompt'  - In interactive terminals, prompt whether to close apps, sync & proceed, or abort.
-#               In non-interactive runs (cron, systemd timer), falls back to 'sync'.
+#               In non-interactive runs (cron, systemd timer), falls back to UNATTENDED_APPS_ACTION.
 #   'sync'    - Leave applications running; log detected apps and flush OS/disk write buffers.
 #   'ignore'  - Skip application checks and buffer flushing entirely.
 # Default: close
 #RUNNING_APPS_ACTION="close"
+
+# Action to take when target applications are running during unattended runs (cron, systemd timer):
+# Options:
+#   'close'   - Safely close target applications and relaunch them after archive creation
+#               (Recommended when RESTART_CLOSED_APPS="true" for 100% database consistency)
+#   'sync'    - Leave applications running; perform safe SQLite WAL checkpointing and flush disk buffers.
+#   'ignore'  - Skip application consistency checks entirely.
+# Default: If RESTART_CLOSED_APPS="true", defaults to 'close'; otherwise defaults to 'sync'
+#UNATTENDED_APPS_ACTION="close"
+
+# Perform safe, passive SQLite WAL checkpointing (PRAGMA wal_checkpoint(PASSIVE))
+# on active browser and email database files when applications remain open during backup ('sync' mode).
+# Flushes committed transactions into database files on disk without holding locks or blocking active readers/writers.
+# Options: true, false
+# Default: true
+#SQLITE_WAL_CHECKPOINT="true"
 
 # Automatically relaunch closed applications after the backup archive has been created.
 # Remembers exactly which applications were actively running and gracefully closed by the script,
@@ -11192,8 +12202,8 @@ init_config() {
 #RESTART_CLOSED_APPS="false"
 
 # Process names to check for open database activity before archiving.
-# Default: ("chrome" "chromium" "google-chrome" "firefox" "firefox-bin" "vivaldi" "vivaldi-bin" "brave" "opera" "thunderbird")
-#TARGET_RUNNING_APPS=("chrome" "chromium" "google-chrome" "firefox" "firefox-bin" "vivaldi" "vivaldi-bin" "brave" "opera" "thunderbird")
+# Default: ("chrome" "chromium" "google-chrome" "firefox" "firefox-bin" "firefox-esr" "vivaldi" "vivaldi-bin" "vivaldi-snapshot" "brave" "brave-browser" "opera" "opera-beta" "opera-developer" "thunderbird" "thunderbird-bin" "betterbird" "librewolf" "floorp" "evolution" "microsoft-edge" "msedge" "edge")
+#TARGET_RUNNING_APPS=("chrome" "chromium" "google-chrome" "firefox" "firefox-bin" "firefox-esr" "vivaldi" "vivaldi-bin" "vivaldi-snapshot" "brave" "brave-browser" "opera" "opera-beta" "opera-developer" "thunderbird" "thunderbird-bin" "betterbird" "librewolf" "floorp" "evolution" "microsoft-edge" "msedge" "edge")
 
 # Seconds to wait for applications to exit and flush state after SIGTERM (when action is 'close').
 # Default: 10
@@ -11926,19 +12936,44 @@ check_config() {
 
     case "${RUNNING_APPS_ACTION:-close}" in
         prompt|ask)
-            report_ok "Apps Consistency" "Interactive prompt mode (non-interactive fallback: sync)"
+            report_ok "Apps Consistency (Interactive)" "Interactive prompt mode (prompts user when run in terminal)"
             ;;
         close|kill|terminate)
-            report_ok "Apps Consistency" "Auto-close mode (SIGTERM graceful termination with ${RUNNING_APPS_SETTLE_TIMEOUT:-5}s timeout)"
+            report_ok "Apps Consistency (Interactive)" "Auto-close mode (SIGTERM graceful termination with ${RUNNING_APPS_SETTLE_TIMEOUT:-10}s timeout)"
             ;;
         sync|warn|flush)
-            report_ok "Apps Consistency" "Filesystem sync mode (apps remain running; disk buffers flushed)"
+            report_ok "Apps Consistency (Interactive)" "Filesystem sync mode (apps remain running; disk buffers flushed)"
             ;;
         ignore|skip|none|false|0)
-            report_info "Apps Consistency" "Disabled (running apps detection skipped)"
+            report_info "Apps Consistency (Interactive)" "Disabled (running apps detection skipped)"
             ;;
         *)
-            report_warn "Apps Consistency" "Unrecognized RUNNING_APPS_ACTION setting '${RUNNING_APPS_ACTION}'"
+            report_warn "Apps Consistency (Interactive)" "Unrecognized RUNNING_APPS_ACTION setting '${RUNNING_APPS_ACTION}'"
+            ;;
+    esac
+
+    local eff_unattended="${UNATTENDED_APPS_ACTION:-}"
+    if [ -z "$eff_unattended" ]; then
+        if [ "${RESTART_CLOSED_APPS:-false}" = "true" ] || [ "${RESTART_CLOSED_APPS:-false}" = "1" ]; then
+            eff_unattended="close (auto: RESTART_CLOSED_APPS=true)"
+        elif [ "${RUNNING_APPS_ACTION:-close}" = "prompt" ] || [ "${RUNNING_APPS_ACTION:-close}" = "ask" ]; then
+            eff_unattended="sync (fallback for prompt)"
+        else
+            eff_unattended="${RUNNING_APPS_ACTION:-close}"
+        fi
+    fi
+    case "$eff_unattended" in
+        close*|kill*|terminate*)
+            report_ok "Apps Consistency (Unattended)" "Auto-close mode (${eff_unattended})"
+            ;;
+        sync*|warn*|flush*)
+            report_ok "Apps Consistency (Unattended)" "Filesystem sync mode (${eff_unattended})"
+            ;;
+        ignore*|skip*|none*|false*|0*)
+            report_info "Apps Consistency (Unattended)" "Disabled (${eff_unattended})"
+            ;;
+        *)
+            report_warn "Apps Consistency (Unattended)" "Unrecognized UNATTENDED_APPS_ACTION '${UNATTENDED_APPS_ACTION}'"
             ;;
     esac
 
@@ -11946,6 +12981,16 @@ check_config() {
         report_ok "Apps Relaunch" "Enabled (closed applications will be automatically relaunched after archive creation)"
     else
         report_info "Apps Relaunch" "Disabled (closed applications will not be automatically restarted; enable with RESTART_CLOSED_APPS=true)"
+    fi
+
+    if [ "${SQLITE_WAL_CHECKPOINT:-true}" = "true" ] || [ "${SQLITE_WAL_CHECKPOINT:-true}" = "1" ]; then
+        if command -v sqlite3 &>/dev/null; then
+            report_ok "SQLite Checkpoint" "Enabled (safe passive WAL checkpointing active via sqlite3)"
+        else
+            report_info "SQLite Checkpoint" "Enabled, but sqlite3 is not installed (install sqlite3 for passive WAL flushing)"
+        fi
+    else
+        report_info "SQLite Checkpoint" "Disabled (SQLITE_WAL_CHECKPOINT=false)"
     fi
 
     # Check which target applications are currently active (excluding defunct zombies)
@@ -12054,7 +13099,7 @@ check_config() {
         report_warn "Tar Capability" "Installed tar does not appear to support --exclude-tag-all (GNU tar recommended)"
     fi
 
-    local opt_tools=("dconf" "flatpak" "pipx" "apt-mark" "dnf" "systemd-inhibit" "notify-send" "udisksctl")
+    local opt_tools=("dconf" "flatpak" "pipx" "apt-mark" "dnf" "systemd-inhibit" "notify-send" "udisksctl" "sqlite3")
     local present_opt=() missing_opt=()
     for tool in "${opt_tools[@]}"; do
         if command -v "$tool" &>/dev/null; then
@@ -12202,7 +13247,7 @@ show_main_menu() {
         local preserved_count
         preserved_count=$(get_preserved_archives | wc -l)
         if [ "$preserved_count" -gt 0 ]; then
-            echo "* NOTICE: ${preserved_count} preserved archive(s) from failed upload(s) in ~ (Select 10 to manage)"
+            echo "* NOTICE: ${preserved_count} preserved archive(s) from failed upload(s) in ~ (Select 11 to manage)"
         fi
         echo "1. Backup Home Directory"
         echo "2. Restore Home Directory"
@@ -12213,18 +13258,19 @@ show_main_menu() {
         echo "7. Backup Trends & Storage Analytics"
         echo "8. View Files Inside Archive (list-files)"
         echo "9. Search Across All Backups (find-file)"
+        echo "10. Compare Two Backups / Drift (diff-backups)"
         if [ "$preserved_count" -gt 0 ]; then
-            echo "10. Manage Preserved Archives (* ${preserved_count} pending *)"
+            echo "11. Manage Preserved Archives (* ${preserved_count} pending *)"
         else
-            echo "10. Manage Preserved Archives"
+            echo "11. Manage Preserved Archives"
         fi
-        echo "11. Manage Pinned Archives (Retention Hold)"
-        echo "12. Systemd Backup Timer (Schedule/Status)"
-        echo "13. Check Configuration & Environment"
-        echo "14. Initialize Configuration File"
-        echo "15. Send Test Email Notification"
-        echo "16. Exit"
-        if ! read -r -p "Please enter your choice [1-16]: " choice; then
+        echo "12. Manage Pinned Archives (Retention Hold)"
+        echo "13. Systemd Backup Timer (Schedule/Status)"
+        echo "14. Check Configuration & Environment"
+        echo "15. Initialize Configuration File"
+        echo "16. Send Test Email Notification"
+        echo "17. Exit"
+        if ! read -r -p "Please enter your choice [1-17]: " choice; then
             echo -e "\nExiting."
             break
         fi
@@ -12239,13 +13285,14 @@ show_main_menu() {
             7) show_backup_stats ;;
             8) list_archive_contents ;;
             9) find_file ;;
-            10) execute_with_inhibit manage-preserved ;;
-            11) execute_with_inhibit manage-pinned ;;
-            12) manage_systemd_timer ;;
-            13) check_config ;;
-            14) init_config ;;
-            15) test_email ;;
-            16) echo "Exiting."; break ;;
+            10) diff_backups ;;
+            11) execute_with_inhibit manage-preserved ;;
+            12) execute_with_inhibit manage-pinned ;;
+            13) manage_systemd_timer ;;
+            14) check_config ;;
+            15) init_config ;;
+            16) test_email ;;
+            17) echo "Exiting."; break ;;
             *) echo "Invalid option." ;;
         esac
     done
@@ -12273,11 +13320,14 @@ case "${1:-}" in
         echo "                                  --alert-from, -af <email>         Sender email address for failure/success notifications"
         echo "                                  --apps-action, -aa <mode>         Running applications consistency action"
         echo "                                                                    ('close', 'prompt', 'sync', or 'ignore')"
+        echo "                                  --unattended-apps-action, -uaa    Action for unattended/timer runs ('close', 'sync', 'ignore')"
         echo "                                  --close-apps                      Gracefully terminate running target apps (default)"
         echo "                                  --prompt-apps                     Prompt whether to close running apps interactively"
         echo "                                  --no-close-apps                   Keep running apps open; flush buffers via sync"
         echo "                                  --restart-apps, -ra               Relaunch apps closed for consistency after backup"
         echo "                                  --no-restart-apps, -nra           Do not relaunch closed apps after backup"
+        echo "                                  --sqlite-checkpoint               Perform passive SQLite WAL checkpoints before sync (default)"
+        echo "                                  --no-sqlite-checkpoint            Disable passive SQLite WAL checkpoints"
         echo "                                  --exclude-tag, -et <tag>          Add per-directory exclusion tag (default: .nobackup)"
         echo "                                  --no-exclude-tags                 Disable per-directory tag exclusion"
         echo "                                  --exclude-ignore, -ei <file>      Add recursive ignore pattern file (default: .backupignore)"
@@ -12362,6 +13412,22 @@ case "${1:-}" in
         echo "                                         --limit, -n <count>       (limit matches per archive)"
         echo "                                         --no-pager                (disable pager)"
         echo "                                         --yes, -y, --batch        (auto-confirm single match restore)"
+        echo "  diff-backups [arc1] [arc2]    Compare two backup archives to identify added, removed, and"
+        echo "                                modified files and size drift without decrypting archives"
+        echo "                                [arc1] [arc2] can be: archive names, paths, or 'latest', 'previous'."
+        echo "                                If omitted, automatically compares the two newest backups."
+        echo "                                Options:"
+        echo "                                  --stat, --summary                 Summary statistics only (no file list)"
+        echo "                                  --added, -a                       Show only added files"
+        echo "                                  --removed, -d, --deleted          Show only removed files"
+        echo "                                  --modified, -m                    Show only modified files"
+        echo "                                  --filter, -f <pattern>            Filter files by keyword or regex pattern"
+        echo "                                  --min-size, --threshold <size>    Show only files with delta >= size (e.g. 10M, 1G)"
+        echo "                                  --sort <path|delta|size>          Sort files by path, size delta, or file size"
+        echo "                                  --source, -s <auto|local|cloud|all>"
+        echo "                                  --json, -j                        Structured JSON output"
+        echo "                                  --csv                             CSV export"
+        echo "                                  --no-pager                        Disable terminal pagination"
         echo "  manage-preserved [opt]        Manage, retry upload, or delete preserved failed-upload archives"
         echo "                                [opt] can be: '--retry' (or -r), '--delete' (or -d), or '--list' (or -l)."
         echo "                                Runs interactively if no option is specified."
@@ -12420,6 +13486,10 @@ if [ -n "$1" ]; then
             ;;
         find-file|find_file|search-file|search_file)
             find_file "${@:2}"
+            exit $?
+            ;;
+        diff-backups|diff_backups|backup-diff|backup_diff|drift|diff)
+            diff_backups "${@:2}"
             exit $?
             ;;
         install-timer|install_timer)
