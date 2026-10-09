@@ -29,9 +29,15 @@ A robust, enterprise-grade Bash backup, verification, and disaster-recovery solu
   - [System Packages & State Restore (`restore-system`)](#system-packages--state-restore-restore-system)
   - [Automated Scheduling (`systemd` Timer)](#automated-scheduling-systemd-timer)
   - [Testing Email Notifications (`test-email`)](#testing-email-notifications-test-email)
+  - [Disaster Recovery Escrow Exports (`export-rclone-config`, `export-gpg-keys`)](#disaster-recovery-escrow-exports-export-rclone-config-export-gpg-keys)
 - [Retention Policies, GFS Pruning & Retention Holds](#retention-policies-gfs-pruning--retention-holds)
 - [Exclusion Rules](#exclusion-rules)
 - [Disaster Recovery Bootstrapping](#disaster-recovery-bootstrapping)
+  - [1. Package Prerequisites by Linux Distribution](#1-package-prerequisites-by-linux-distribution)
+  - [2. Bootstrapping Cloud Storage Access (`rclone`)](#2-bootstrapping-cloud-storage-access-rclone)
+  - [3. GPG Secret Key Escrow & Key Import](#3-gpg-secret-key-escrow--key-import)
+  - [4. Restoring Archives on a Clean Machine](#4-restoring-archives-on-a-clean-machine)
+- [Operational Resilience & Logging](#operational-resilience--logging)
 - [Configuration Reference](#configuration-reference)
 - [License](#license)
 
@@ -42,10 +48,13 @@ A robust, enterprise-grade Bash backup, verification, and disaster-recovery solu
 ### 🛡️ Security & Encryption
 - **Multi-Mode Encryption**: Supports symmetric AES-256 (`gpg`), asymmetric public-key encryption (ideal for headless servers with zero secret keys on disk), or hybrid encryption.
 - **Strict Permission Enforcement**: Automatically ensures configuration files and passphrase secrets are locked to `chmod 700` and `600`.
+- **Disaster Recovery Escrow Exports**: Built-in CLI commands to export OAuth cloud configurations (`export-rclone-config`) and ASCII-armored GPG public and secret keys (`export-gpg-keys`) with automated strict `chmod 600` permission enforcement for offline paper/USB vaults.
 - **Zero Temporary Secret Leakage**: Passphrases and encryption pipes are handled in memory and secure file descriptors.
 
 ### ⚡ Compression & Performance
 - **Modern Zstandard (`zstd`)**: Tuned compression (default level 6) with **Long Distance Matching (`--long=27`)** to dramatically compress repetitive text, code repositories, and container structures.
+- **Live Terminal Throughput (`pv`)**: Automatically pipes archive streaming operations through Pipe Viewer (`pv`) in interactive terminals to display real-time throughput rates and transferred data counters without disrupting `tar`/`gpg` exit status codes.
+- **Non-Disruptive Process Priority (`nice` & `ionice`)**: Automatically lowers execution priority to background levels (`nice -n 19`, `ionice -c 2 -n 7`), preventing workstation UI freezes or I/O stalls during intensive backups and restores.
 - **Adaptive Cloud Streaming**: Restore directly from cloud storage via `rclone cat` without downloading full multi-gigabyte archives to local disk, falling back to local staging when disk permits.
 - **Resilient Network Streaming**: All `rclone cat` streaming operations (restores, verifications, index queries) incorporate multi-level retries (`--retries 3 --low-level-retries 10`), socket timeouts, and optional bandwidth throttling to resist transient socket drops.
 - **Parallel Companion Uploads**: Companion sidecars (`.sha256`, `.manifest.json`, `.files.gz`, `.pinned`) and disaster recovery bootstrap files upload concurrently in parallel background threads, cutting round-trip API latency.
@@ -73,6 +82,7 @@ A robust, enterprise-grade Bash backup, verification, and disaster-recovery solu
 - **Zero-Decryption Backup Drift Comparison (`diff-backups`)**: Instantly diff any two backups (local or cloud) using companion index sidecars in seconds without decrypting or decompressing multi-gigabyte archives. Categorizes added, removed, and modified files with exact size deltas, net storage drift analytics, interactive filtering, and structured JSON/CSV exports.
 
 ### ⚙️ Reliability & Safety
+- **Multi-Run Historical Log Retention**: Retains timestamped per-run logs in `~/.config/backup_script/logs` (`backup_rory_YYYY-MM-DD_HHMMSS.log`) with configurable pruning retention (`LOG_RETENTION_COUNT=14`) while maintaining backwards-compatible active `$LOG_FILE` pointer.
 - **Application Consistency Guard & Cgroup-Decoupled Relaunch**: Detects running database-heavy applications (Vivaldi, Chrome, Firefox, Thunderbird) and gracefully terminates them with `SIGTERM` and filesystem `sync` before archiving. When `RESTART_CLOSED_APPS=true` (or `--restart-apps`), the script automatically relaunches closed applications. Under systemd services, relaunches are prioritized into independent `app.slice` scopes via `systemd-run` alongside `KillMode=mixed`, preventing cgroup teardown crashes when the backup unit terminates.
 - **Passphrase Memory Isolation**: Explicitly wipes plaintext passphrases from shell environment memory (`unset`) upon exit or signal interruption.
 - **Pre-Restore Safety Backups**: Automatically generates a timestamped safety backup of the active user crontab (`~/.crontab.pre-restore.<timestamp>.bak`) prior to applying crontab restorations.
@@ -112,16 +122,28 @@ Ensure the following tools are installed on your Linux system:
 | `dconf` | Exporting GNOME/desktop settings snapshot |
 | `crontab` | Exporting user scheduled jobs |
 | `systemd` | Managing automated `--user` timers and services |
+| `pv` | Live terminal progress and throughput rate display |
+| `ionice` | Background I/O scheduling class and priority control |
 
 To install common dependencies on Debian/Ubuntu/Mint:
 ```bash
 sudo apt update
-sudo apt install -y bash tar zstd gnupg rclone coreutils util-linux gzip msmtp
+sudo apt install -y bash tar zstd gnupg rclone coreutils util-linux gzip msmtp pv
 ```
 
 To install common dependencies on Fedora/RHEL/CentOS Stream/Rocky/AlmaLinux:
 ```bash
-sudo dnf install -y bash tar zstd gnupg2 rclone coreutils util-linux gzip msmtp
+sudo dnf install -y bash tar zstd gnupg2 rclone coreutils util-linux gzip msmtp pv
+```
+
+To install common dependencies on Arch Linux:
+```bash
+sudo pacman -S --needed bash tar zstd gnupg rclone coreutils util-linux gzip msmtp pv
+```
+
+To install common dependencies on openSUSE (Leap / Tumbleweed):
+```bash
+sudo zypper install -y bash tar zstd gpg2 rclone coreutils util-linux gzip msmtp pv
 ```
 
 ---
@@ -861,6 +883,37 @@ $ ./backup_script.sh test-email user@example.com alerts@custom-domain.org
 
 ---
 
+### Disaster Recovery Escrow Exports (`export-rclone-config`, `export-gpg-keys`)
+
+Export critical cloud OAuth tokens and cryptographic keys to offline, isolated media (such as an encrypted paper backup or air-gapped USB drive) so you can recover your data from a clean machine without circular dependencies:
+
+#### 1. Export Rclone Cloud Storage Configuration (`export-rclone-config`)
+Exports your authenticated `rclone.conf` with automated `chmod 600` permissions:
+
+```bash
+# Export to default location (~/rclone_disaster_recovery_backup.conf)
+./backup_script.sh export-rclone-config
+
+# Export directly to an external secure mount or USB drive
+./backup_script.sh export-rclone-config /media/rory/SECURE_USB/rclone.conf
+```
+
+#### 2. Export GPG Public & Secret Keys (`export-gpg-keys`)
+Exports ASCII-armored public (`.pub.asc`) and secret (`.sec.asc`) keyrings for every configured GPG recipient with automated `chmod 600` permissions:
+
+```bash
+# Export to default directory (~/gpg_disaster_recovery_keys)
+./backup_script.sh export-gpg-keys
+
+# Export directly to an external secure mount or USB drive
+./backup_script.sh export-gpg-keys /media/rory/SECURE_USB/gpg_keys
+```
+
+> [!CAUTION]
+> The exported `.sec.asc` and `rclone.conf` files contain highly sensitive credentials. Store them in an encrypted password manager vault or offline hardware token—never on unencrypted network shares.
+
+---
+
 ## Retention Policies, GFS Pruning & Retention Holds
 
 The backup suite supports two distinct pruning strategies for local external drives and cloud storage, alongside an immutable retention hold system:
@@ -942,8 +995,85 @@ Every backup automatically mirrors:
 
 both to your local drive (`Backups/`) and your cloud storage root.
 
-### Restoring on a Bare Machine Without This Script
+### 1. Package Prerequisites by Linux Distribution
 
+Before beginning bare-metal restoration, install the foundational utilities for your distribution:
+
+- **Debian / Ubuntu / Linux Mint**:
+  ```bash
+  sudo apt-get update && sudo apt-get install -y bash tar zstd gnupg rclone coreutils util-linux gzip msmtp pv
+  ```
+
+- **Fedora / RHEL / CentOS Stream / Rocky / AlmaLinux**:
+  ```bash
+  sudo dnf install -y bash tar zstd gnupg2 rclone coreutils util-linux gzip msmtp pv
+  ```
+
+- **Arch Linux / Manjaro / EndeavourOS**:
+  ```bash
+  sudo pacman -S --needed bash tar zstd gnupg rclone coreutils util-linux gzip msmtp pv
+  ```
+
+- **openSUSE (Leap / Tumbleweed)**:
+  ```bash
+  sudo zypper install -y bash tar zstd gpg2 rclone coreutils util-linux gzip msmtp pv
+  ```
+
+### 2. Bootstrapping Cloud Storage Access (`rclone`)
+
+If restoring from cloud storage onto a new machine or live USB environment:
+
+#### Option A: Restore Pre-Exported Configuration
+If you exported your config using `./backup_script.sh export-rclone-config`:
+```bash
+mkdir -p ~/.config/rclone && chmod 700 ~/.config/rclone
+cp /path/to/exported/rclone.conf ~/.config/rclone/rclone.conf
+chmod 600 ~/.config/rclone/rclone.conf
+```
+
+#### Option B: Configure Headless Remote via OAuth
+If setting up a headless recovery server without an existing configuration:
+1. Run `rclone authorize "<provider>"` on another machine with a web browser (e.g., `rclone authorize "drive"`).
+2. On the recovery machine, run:
+   ```bash
+   rclone config
+   ```
+   Create a new remote and paste the authorization token block when prompted.
+
+#### Option C: Test Remote Connectivity
+Confirm communication with your backup bucket/folder before initiating transfers:
+```bash
+rclone lsd "googledrive:backup/"
+```
+
+### 3. GPG Secret Key Escrow & Key Import
+
+For asymmetric or hybrid encrypted backups, the target system must possess the GPG secret key:
+
+#### Step 1: Import Keypair from Escrow
+```bash
+# Import secret key exported via ./backup_script.sh export-gpg-keys
+gpg --import /path/to/gpg_keys/*.sec.asc
+
+# Import public key
+gpg --import /path/to/gpg_keys/*.pub.asc
+```
+
+#### Step 2: Set Ultimate Key Trust
+To allow non-interactive decryption without trust prompts:
+```bash
+KEY_FP=$(gpg --list-secret-keys --with-colons | awk -F: '$1=="fpr"{print $10; exit}')
+echo -e "5\ny\n" | gpg --command-fd 0 --edit-key "$KEY_FP" trust
+```
+
+#### Step 3: Decryption Verification Smoke Test
+```bash
+echo "DR test payload" | gpg --encrypt -r "$KEY_FP" | gpg --decrypt
+```
+
+### 4. Restoring Archives on a Clean Machine
+
+#### Single-Pipeline Extraction (Without This Script)
 If you are on a completely clean machine with only stock GNU tools installed:
 
 ```bash
@@ -959,8 +1089,7 @@ gpg --decrypt "rory_home_backup_hp_2026-09-21_005151.tar.zst.gpg" \
   | tar -xvf - -C /target/restore/dir
 ```
 
-#### Replaying Package Managers & System State
-
+#### Automated System State & Package Replay
 > [!TIP]
 > If `backup_script.sh` is mirrored or installed, you can replay all package manager manifests, Flatpaks, pipx packages, desktop settings, systemd user units, and crontabs automatically with a single command:
 > ```bash
@@ -992,6 +1121,28 @@ If performing manual bare-metal recovery without `backup_script.sh`, the exporte
   ```bash
   dconf load / < dconf_settings.ini
   ```
+
+---
+
+## Operational Resilience & Logging
+
+### Multi-Run Historical Log Retention
+The script maintains isolated, timestamped log records for every execution:
+- **Run Log Directory**: Saved to `~/.config/backup_script/logs/backup_<user>_<YYYY-MM-DD_HHMMSS>.log`.
+- **Active Log Pointer**: The active log file is also maintained at `~/backup_<user>.log` for backward compatibility with standard log monitoring tools and scripts.
+- **Automated Log Pruning**: Historical logs beyond `LOG_RETENTION_COUNT` (default: 14 runs) are automatically purged on each run to conserve disk space.
+
+### Process Priority & Resource Politeness
+Heavy backups and decompressions can saturate CPU cores and storage I/O bandwidth. When enabled (`ENABLE_PROCESS_PRIORITY=true`):
+- **CPU Scheduling**: Renices the script and all subprocesses (`tar`, `zstd`, `gpg`, `rclone`) to nice level `19` (lowest CPU priority).
+- **Disk I/O Scheduling**: Applies `ionice -c 2 -n 7` (Best Effort scheduling class, lowest priority level 7) using the kernel CFQ/BFQ I/O scheduler.
+- **Workstation Responsiveness**: The desktop environment remains completely fluid, responsive, and stutter-free even during multi-gigabyte compression runs.
+
+### Live Terminal Progress Monitoring (`pv`)
+When running in an interactive terminal, the suite automatically pipes archive data streams through Pipe Viewer (`pv`):
+- Provides real-time transferred data volume, streaming throughput rate, and elapsed run timer.
+- Labeled progress headers (`Writing Archive`, `Extracting Archive`) keep terminal users informed.
+- If `pv` is not installed or when running in unattended/cron/systemd timers, the pipeline seamlessly falls back to direct standard pipes without disruption or warnings.
 
 ---
 
@@ -1027,6 +1178,10 @@ Key variables configurable in `~/.config/backup_script/config`:
 | `ARCHIVE_LIST_PAGER` | `${PAGER:-less -FRX}` | Preferred pager command for viewing archive file listings |
 | `GENERATE_MANIFEST` | `true` | Generate companion JSON manifest (`.manifest.json`) with metadata and inventory |
 | `GENERATE_FILE_INDEX` | `true` | Generate companion file index (`.files.gz`) for fast zero-download search & listing |
+| `LOG_DIR` | `~/.config/backup_script/logs` | Directory path for multi-run timestamped execution logs |
+| `LOG_RETENTION_COUNT` | `14` | Number of historical run log files to retain before automated rotation |
+| `ENABLE_PV` | `auto` | Pipe Viewer integration for live archive transfer throughput (`auto`, `true`, `false`) |
+| `ENABLE_PROCESS_PRIORITY` | `true` | Lower CPU (`nice 19`) and disk I/O (`ionice -c 2 -n 7`) priorities for silent background runs |
 | `ALERT_EMAIL` | `""` | Destination email address for failure and size change alerts |
 | `ALERT_ON_SIZE_CHANGE` | `true` | Send email alert when backup size changes significantly compared to previous backup (`true`/`false`) |
 | `SIZE_CHANGE_THRESHOLD` | `15` | Percentage threshold for triggering size change alerts (default: `15` for ±15%) |
