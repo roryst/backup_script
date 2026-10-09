@@ -21,10 +21,10 @@
 #                 You should have received a copy of the GNU General Public License
 #                 along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #
-#                 Usage: ./backup_script.sh [backup|restore|verify|list|stats|diff-backups|manifest|manage-preserved|pin|unpin|pinned|init-config|check-config|help]
+#                 Usage: ./backup_script.sh [backup|restore|verify|list|stats|diff-backups|manifest|manage-preserved|pin|unpin|pinned|export-rclone-config|export-gpg-keys|init-config|check-config|help]
 #
 #        AUTHOR:  Rory Mobley, rorymobley5@gmail.com
-#       VERSION:  10.6.0
+#       VERSION:  10.7.0
 #==============================================================================
 
 #------------------------------------------------------------------------------
@@ -150,6 +150,15 @@ MIN_FREE_SPACE_GB="${MIN_FREE_SPACE_GB:-15}"
 # The log file for the backup/restore operation
 LOG_FILE="${LOG_FILE:-${SOURCE_DIR}/backup_${CURRENT_USER}.log}"
 
+# Directory for retaining historical timestamped run logs (chmod 700)
+LOG_DIR="${LOG_DIR:-${CONFIG_DIR}/logs}"
+
+# Number of historical run logs to retain in LOG_DIR (default: 14 runs)
+LOG_RETENTION_COUNT="${LOG_RETENTION_COUNT:-14}"
+
+# Active run log file for the current execution
+CURRENT_RUN_LOG=""
+
 # The lockfile to prevent multiple instances from running.
 # Determines path dynamically: prefers /run/user/<UID> if present and writable, even if XDG_RUNTIME_DIR is not exported
 _user_runtime="/run/user/$(id -u 2>/dev/null || echo 1000)"
@@ -227,6 +236,15 @@ GENERATE_MANIFEST="${GENERATE_MANIFEST:-true}"
 
 # Generate lightweight companion file list index (.files.gz) for zero-bandwidth file queries.
 GENERATE_FILE_INDEX="${GENERATE_FILE_INDEX:-true}"
+
+# Terminal progress visualization via Pipe Viewer (pv) during archiving, extraction, and verification.
+# Options: 'auto' (activates in interactive terminal when pv is installed; default),
+#          'true' (force pv pipe), 'false' (disable pv).
+ENABLE_PV="${ENABLE_PV:-auto}"
+
+# Manage process and I/O scheduling priorities for background/ad-hoc runs (nice 19 and ionice best-effort class 2 priority 7).
+# Prevents backup, restore, or verification workloads from starving desktop GUI responsiveness.
+ENABLE_PROCESS_PRIORITY="${ENABLE_PROCESS_PRIORITY:-true}"
 
 # Lifecycle hook commands and directory for pre/post backup triggers
 # Supports executable scripts (${HOOKS_DIR}/pre-backup.sh, ${HOOKS_DIR}/post-backup.sh)
@@ -316,7 +334,7 @@ MAIL_COMMAND="${MAIL_COMMAND:-auto}"
 EMAIL_ALERT_SENT=0
 
 # Script version identifier
-SCRIPT_VERSION="10.6.0"
+SCRIPT_VERSION="10.7.0"
 
 # Path to this script for self-invocation
 SCRIPT_PATH="$(realpath "${BASH_SOURCE[0]}")"
@@ -685,18 +703,47 @@ detect_archive_encryption() {
 
 #---
 #   FUNCTION:  log_message()
-#  DESCRIPTION:  Logs a message. Overwrites the log on the first call of a
-#                script run, and appends for all subsequent calls.
+#  DESCRIPTION:  Logs a message with timestamp. Overwrites $LOG_FILE on the first
+#                call of a run, keeps $LOG_FILE.prev, and archives historical run
+#                logs into $LOG_DIR with automatic retention pruning.
 #---
 log_message() {
+    local timestamp
+    timestamp="$(date '+%Y-%m-%d %H:%M:%S')"
     if [ "$LOG_INITIALIZED" -eq 0 ]; then
         if [ -f "$LOG_FILE" ] && [ -s "$LOG_FILE" ]; then
             mv -f "$LOG_FILE" "${LOG_FILE}.prev" 2>/dev/null || true
         fi
-        echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" > "$LOG_FILE"
+        local log_parent
+        log_parent=$(dirname "$LOG_FILE")
+        [ -d "$log_parent" ] || mkdir -p "$log_parent" 2>/dev/null || true
+        echo "${timestamp} - $1" > "$LOG_FILE"
+
+        # Initialize multi-run timestamped log file if LOG_DIR is enabled
+        if [ -n "${LOG_DIR:-}" ]; then
+            mkdir -p "$LOG_DIR" 2>/dev/null || true
+            chmod 700 "$LOG_DIR" 2>/dev/null || true
+            CURRENT_RUN_LOG="${LOG_DIR}/backup_${CURRENT_USER}_$(date '+%Y-%m-%d_%H%M%S').log"
+            echo "${timestamp} - $1" > "$CURRENT_RUN_LOG" 2>/dev/null || true
+
+            # Prune historical logs beyond LOG_RETENTION_COUNT
+            if [[ "${LOG_RETENTION_COUNT:-14}" =~ ^[0-9]+$ ]] && [ "${LOG_RETENTION_COUNT:-14}" -gt 0 ]; then
+                local old_logs=()
+                mapfile -t old_logs < <(find "$LOG_DIR" -maxdepth 1 -type f -name "backup_${CURRENT_USER}_*.log" 2>/dev/null | sort -r)
+                if [ ${#old_logs[@]} -gt "${LOG_RETENTION_COUNT}" ]; then
+                    local i
+                    for ((i=LOG_RETENTION_COUNT; i<${#old_logs[@]}; i++)); do
+                        rm -f "${old_logs[i]}" 2>/dev/null || true
+                    done
+                fi
+            fi
+        fi
         LOG_INITIALIZED=1
     else
-        echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "$LOG_FILE"
+        echo "${timestamp} - $1" >> "$LOG_FILE"
+        if [ -n "$CURRENT_RUN_LOG" ]; then
+            echo "${timestamp} - $1" >> "$CURRENT_RUN_LOG" 2>/dev/null || true
+        fi
     fi
 }
 
@@ -1692,10 +1739,61 @@ Prerequisites for recovery on a new or clean system:
   - GNU Tar: 'tar'
   - Coreutils: 'sha256sum' (for archive integrity and bit-rot detection)
   - Rclone: 'rclone' (required for cloud storage download / streaming)
-  Install via APT:
+  Install via APT (Debian, Ubuntu, Linux Mint):
     sudo apt update && sudo apt install -y gpg zstd tar coreutils rclone
-  Install via DNF:
+  Install via DNF (Fedora, RHEL):
     sudo dnf install -y gnupg2 zstd tar coreutils rclone
+  Install via Pacman (Arch Linux, Manjaro, EndeavourOS):
+    sudo pacman -Sy --needed gnupg zstd tar coreutils rclone
+  Install via Zypper (openSUSE):
+    sudo zypper install -y gpg2 zstd tar coreutils rclone
+
+--------------------------------------------------------------------------------
+BOOTSTRAPPING CLOUD STORAGE ACCESS (RCLONE)
+--------------------------------------------------------------------------------
+If restoring on a new system or live USB environment, rclone must be configured
+to access your remote backup repository (${BACKUP_DIR}).
+
+1. Restoring from Configuration Escrow (Recommended):
+   If you exported your rclone config using './backup_script.sh export-rclone-config'
+   or backed up ~/.config/rclone/rclone.conf to a secure password manager or USB:
+     mkdir -p ~/.config/rclone && chmod 700 ~/.config/rclone
+     cp /path/to/rclone.conf.escrow ~/.config/rclone/rclone.conf
+     chmod 600 ~/.config/rclone/rclone.conf
+
+2. Interactive Rclone Reconfiguration:
+   To configure the cloud remote from scratch:
+     rclone config
+   Create or select the remote named '${BACKUP_DIR%%:*}' matching your cloud provider.
+
+3. Headless / Live Recovery Environment (Without Web Browser):
+   If your disaster recovery environment lacks a graphical web browser for OAuth:
+     a. Run on any machine with a browser:
+        rclone authorize "drive"
+     b. Copy the generated authorization token and paste it into the recovery system prompt.
+
+4. Test Cloud Reachability:
+     rclone lsd ${BACKUP_DIR}
+
+--------------------------------------------------------------------------------
+GPG SECRET KEY ESCROW & DISASTER RECOVERY KEY IMPORT
+--------------------------------------------------------------------------------
+For asymmetric and hybrid backups, decryption requires your private GPG key.
+Backups cannot be restored without either the symmetric passphrase or the private key!
+
+1. Exporting Keys for Secure Vaulting / Escrow (Prior to Disaster):
+   Run the built-in helper:
+     ./backup_script.sh export-gpg-keys
+   Or manually export ASCII-armored keys:
+     gpg --armor --export "${GPG_RECIPIENT:-your-key-id}" > gpg_backup_public.key
+     gpg --armor --export-secret-keys "${GPG_RECIPIENT:-your-key-id}" > gpg_backup_secret.key
+     chmod 600 gpg_backup_secret.key
+   Keep gpg_backup_secret.key in an encrypted password manager, offline flash drive, or paper vault.
+
+2. Importing Keys on the Recovery Machine:
+     gpg --import /path/to/gpg_backup_secret.key
+     # Mark the key as ultimately trusted for automated restoration:
+     gpg --batch --yes --import-ownertrust < <(gpg --fingerprint "${GPG_RECIPIENT:-your-key-id}" 2>/dev/null | awk '/Key fingerprint/ {print $NF ":6:"}')
 
 --------------------------------------------------------------------------------
 VERIFYING ARCHIVE INTEGRITY & INSPECTING MANIFEST INVENTORY
@@ -3867,6 +3965,14 @@ run_backup() {
     tee "$tar_err_file" < "$tar_fifo" >&2 &
     local tee_pid=$!
 
+    local use_pv=false
+    if [ "${ENABLE_PV:-auto}" = "true" ] || [ "${ENABLE_PV:-auto}" = "1" ] || \
+       ( [ "${ENABLE_PV:-auto}" = "auto" ] && [ -t 1 ] && [ "${TERM:-dumb}" != "dumb" ] ); then
+        if command -v pv &>/dev/null; then
+            use_pv=true
+        fi
+    fi
+
     local gpg_encrypt_args=(--batch --yes --no-tty)
     if [ "$ENCRYPTION_MODE" = "asymmetric" ]; then
         gpg_encrypt_args+=(--trust-model always)
@@ -3874,28 +3980,48 @@ run_backup() {
             gpg_encrypt_args+=(-r "$r")
         done
         gpg_encrypt_args+=(-z 0 --encrypt -o "${FULL_ENCRYPTED_PATH}")
-        tar "${tar_fs_opts[@]}" "${tar_index_opts[@]}" --totals --sparse --exclude-caches-all "${tar_tag_opts[@]}" "${tar_ignore_opts[@]}" -l --acls --xattrs --xattrs-include='*' -I "${zstd_compress_cmd}" "${tar_checkpoint_opts[@]}" -cpf - "${TAR_EXCLUDE_OPTS[@]}" "${tar_staging_opts[@]}" -C "${SOURCE_DIR}" . 2>"$tar_fifo" \
-            | gpg "${gpg_encrypt_args[@]}" 2>"$gpg_err_file"
+        if [ "$use_pv" = true ]; then
+            tar "${tar_fs_opts[@]}" "${tar_index_opts[@]}" --totals --sparse --exclude-caches-all "${tar_tag_opts[@]}" "${tar_ignore_opts[@]}" -l --acls --xattrs --xattrs-include='*' -I "${zstd_compress_cmd}" "${tar_checkpoint_opts[@]}" -cpf - "${TAR_EXCLUDE_OPTS[@]}" "${tar_staging_opts[@]}" -C "${SOURCE_DIR}" . 2>"$tar_fifo" \
+                | pv -c -N "Writing Archive" \
+                | gpg "${gpg_encrypt_args[@]}" 2>"$gpg_err_file"
+        else
+            tar "${tar_fs_opts[@]}" "${tar_index_opts[@]}" --totals --sparse --exclude-caches-all "${tar_tag_opts[@]}" "${tar_ignore_opts[@]}" -l --acls --xattrs --xattrs-include='*' -I "${zstd_compress_cmd}" "${tar_checkpoint_opts[@]}" -cpf - "${TAR_EXCLUDE_OPTS[@]}" "${tar_staging_opts[@]}" -C "${SOURCE_DIR}" . 2>"$tar_fifo" \
+                | gpg "${gpg_encrypt_args[@]}" 2>"$gpg_err_file"
+        fi
     elif [ "$ENCRYPTION_MODE" = "hybrid" ]; then
         gpg_encrypt_args+=(--pinentry-mode loopback --trust-model always)
         for r in "${GPG_RECIPIENTS[@]}"; do
             gpg_encrypt_args+=(-r "$r")
         done
         gpg_encrypt_args+=(--encrypt --symmetric --cipher-algo AES256 -z 0 --s2k-mode 3 --s2k-count 65011712 --s2k-digest-algo SHA512 --passphrase-fd 3 -o "${FULL_ENCRYPTED_PATH}")
-        tar "${tar_fs_opts[@]}" "${tar_index_opts[@]}" --totals --sparse --exclude-caches-all "${tar_tag_opts[@]}" "${tar_ignore_opts[@]}" -l --acls --xattrs --xattrs-include='*' -I "${zstd_compress_cmd}" "${tar_checkpoint_opts[@]}" -cpf - "${TAR_EXCLUDE_OPTS[@]}" "${tar_staging_opts[@]}" -C "${SOURCE_DIR}" . 2>"$tar_fifo" \
-            | gpg "${gpg_encrypt_args[@]}" 3< <(printf '%s' "$ENCRYPTION_PASSWORD") 2>"$gpg_err_file"
+        if [ "$use_pv" = true ]; then
+            tar "${tar_fs_opts[@]}" "${tar_index_opts[@]}" --totals --sparse --exclude-caches-all "${tar_tag_opts[@]}" "${tar_ignore_opts[@]}" -l --acls --xattrs --xattrs-include='*' -I "${zstd_compress_cmd}" "${tar_checkpoint_opts[@]}" -cpf - "${TAR_EXCLUDE_OPTS[@]}" "${tar_staging_opts[@]}" -C "${SOURCE_DIR}" . 2>"$tar_fifo" \
+                | pv -c -N "Writing Archive" \
+                | gpg "${gpg_encrypt_args[@]}" 3< <(printf '%s' "$ENCRYPTION_PASSWORD") 2>"$gpg_err_file"
+        else
+            tar "${tar_fs_opts[@]}" "${tar_index_opts[@]}" --totals --sparse --exclude-caches-all "${tar_tag_opts[@]}" "${tar_ignore_opts[@]}" -l --acls --xattrs --xattrs-include='*' -I "${zstd_compress_cmd}" "${tar_checkpoint_opts[@]}" -cpf - "${TAR_EXCLUDE_OPTS[@]}" "${tar_staging_opts[@]}" -C "${SOURCE_DIR}" . 2>"$tar_fifo" \
+                | gpg "${gpg_encrypt_args[@]}" 3< <(printf '%s' "$ENCRYPTION_PASSWORD") 2>"$gpg_err_file"
+        fi
     else
         # Default: symmetric
-        tar "${tar_fs_opts[@]}" "${tar_index_opts[@]}" --totals --sparse --exclude-caches-all "${tar_tag_opts[@]}" "${tar_ignore_opts[@]}" -l --acls --xattrs --xattrs-include='*' -I "${zstd_compress_cmd}" "${tar_checkpoint_opts[@]}" -cpf - "${TAR_EXCLUDE_OPTS[@]}" "${tar_staging_opts[@]}" -C "${SOURCE_DIR}" . 2>"$tar_fifo" \
-            | gpg --batch --yes --no-tty --pinentry-mode loopback --symmetric --cipher-algo AES256 \
-                  -z 0 --s2k-mode 3 --s2k-count 65011712 --s2k-digest-algo SHA512 \
-                  --passphrase-fd 3 -o "${FULL_ENCRYPTED_PATH}" 3< <(printf '%s' "$ENCRYPTION_PASSWORD") 2>"$gpg_err_file"
+        if [ "$use_pv" = true ]; then
+            tar "${tar_fs_opts[@]}" "${tar_index_opts[@]}" --totals --sparse --exclude-caches-all "${tar_tag_opts[@]}" "${tar_ignore_opts[@]}" -l --acls --xattrs --xattrs-include='*' -I "${zstd_compress_cmd}" "${tar_checkpoint_opts[@]}" -cpf - "${TAR_EXCLUDE_OPTS[@]}" "${tar_staging_opts[@]}" -C "${SOURCE_DIR}" . 2>"$tar_fifo" \
+                | pv -c -N "Writing Archive" \
+                | gpg --batch --yes --no-tty --pinentry-mode loopback --symmetric --cipher-algo AES256 \
+                      -z 0 --s2k-mode 3 --s2k-count 65011712 --s2k-digest-algo SHA512 \
+                      --passphrase-fd 3 -o "${FULL_ENCRYPTED_PATH}" 3< <(printf '%s' "$ENCRYPTION_PASSWORD") 2>"$gpg_err_file"
+        else
+            tar "${tar_fs_opts[@]}" "${tar_index_opts[@]}" --totals --sparse --exclude-caches-all "${tar_tag_opts[@]}" "${tar_ignore_opts[@]}" -l --acls --xattrs --xattrs-include='*' -I "${zstd_compress_cmd}" "${tar_checkpoint_opts[@]}" -cpf - "${TAR_EXCLUDE_OPTS[@]}" "${tar_staging_opts[@]}" -C "${SOURCE_DIR}" . 2>"$tar_fifo" \
+                | gpg --batch --yes --no-tty --pinentry-mode loopback --symmetric --cipher-algo AES256 \
+                      -z 0 --s2k-mode 3 --s2k-count 65011712 --s2k-digest-algo SHA512 \
+                      --passphrase-fd 3 -o "${FULL_ENCRYPTED_PATH}" 3< <(printf '%s' "$ENCRYPTION_PASSWORD") 2>"$gpg_err_file"
+        fi
     fi
     local pipe_statuses=("${PIPESTATUS[@]}")
     wait "$tee_pid" 2>/dev/null || true
     [ -t 1 ] && echo
     local tar_exit_code=${pipe_statuses[0]}
-    local gpg_exit_code=${pipe_statuses[1]}
+    local gpg_exit_code=${pipe_statuses[${#pipe_statuses[@]}-1]}
 
     local gpg_err_msg=""
     [ -f "$gpg_err_file" ] && gpg_err_msg=$(<"$gpg_err_file")
@@ -6110,6 +6236,7 @@ run_restore_system() {
 #---
 run_restore() {
     local start_time=$SECONDS
+    apply_process_priority
     local cli_patterns=()
     local cli_dest=""
     local cli_archive=""
@@ -6819,21 +6946,41 @@ run_restore() {
     local expected_stream_sha=""
     local actual_stream_sha=""
 
+    local use_pv=false
+    if [ "${ENABLE_PV:-auto}" = "true" ] || [ "${ENABLE_PV:-auto}" = "1" ] || \
+       ( [ "${ENABLE_PV:-auto}" = "auto" ] && [ -t 1 ] && [ "${TERM:-dumb}" != "dumb" ] ); then
+        if command -v pv &>/dev/null; then
+            use_pv=true
+        fi
+    fi
+
     if [ -n "$direct_archive_file" ] || [ "$restore_source" = "local" ]; then
         local SOURCE_ENCRYPTED_FILE="${direct_archive_file:-${local_backup_path}/${ENCRYPTED_TARBALL_NAME}}"
         echo "Decrypting and extracting archive directly from ${restore_source}..."
         log_message "Decrypting and extracting ${SOURCE_ENCRYPTED_FILE} directly to ${restore_target}"
         if [ "$archive_enc_type" = "asymmetric" ] && [ -z "$ENCRYPTION_PASSWORD" ]; then
-            gpg --batch --yes --no-tty --decrypt "$SOURCE_ENCRYPTED_FILE" 2>"$gpg_err_file" \
-                | tar "${tar_wildcard_opts[@]}" --acls --xattrs "${tar_compress_opts[@]}" "${tar_checkpoint_opts[@]}" -xpf - -C "${restore_target}" "${restore_patterns[@]}"
+            if [ "$use_pv" = true ]; then
+                gpg --batch --yes --no-tty --decrypt "$SOURCE_ENCRYPTED_FILE" 2>"$gpg_err_file" \
+                    | pv -c -N "Extracting Archive" \
+                    | tar "${tar_wildcard_opts[@]}" --acls --xattrs "${tar_compress_opts[@]}" "${tar_checkpoint_opts[@]}" -xpf - -C "${restore_target}" "${restore_patterns[@]}"
+            else
+                gpg --batch --yes --no-tty --decrypt "$SOURCE_ENCRYPTED_FILE" 2>"$gpg_err_file" \
+                    | tar "${tar_wildcard_opts[@]}" --acls --xattrs "${tar_compress_opts[@]}" "${tar_checkpoint_opts[@]}" -xpf - -C "${restore_target}" "${restore_patterns[@]}"
+            fi
         else
-            gpg --batch --yes --no-tty --pinentry-mode loopback --decrypt --passphrase-fd 3 "$SOURCE_ENCRYPTED_FILE" 3< <(printf '%s' "$ENCRYPTION_PASSWORD") 2>"$gpg_err_file" \
-                | tar "${tar_wildcard_opts[@]}" --acls --xattrs "${tar_compress_opts[@]}" "${tar_checkpoint_opts[@]}" -xpf - -C "${restore_target}" "${restore_patterns[@]}"
+            if [ "$use_pv" = true ]; then
+                gpg --batch --yes --no-tty --pinentry-mode loopback --decrypt --passphrase-fd 3 "$SOURCE_ENCRYPTED_FILE" 3< <(printf '%s' "$ENCRYPTION_PASSWORD") 2>"$gpg_err_file" \
+                    | pv -c -N "Extracting Archive" \
+                    | tar "${tar_wildcard_opts[@]}" --acls --xattrs "${tar_compress_opts[@]}" "${tar_checkpoint_opts[@]}" -xpf - -C "${restore_target}" "${restore_patterns[@]}"
+            else
+                gpg --batch --yes --no-tty --pinentry-mode loopback --decrypt --passphrase-fd 3 "$SOURCE_ENCRYPTED_FILE" 3< <(printf '%s' "$ENCRYPTION_PASSWORD") 2>"$gpg_err_file" \
+                    | tar "${tar_wildcard_opts[@]}" --acls --xattrs "${tar_compress_opts[@]}" "${tar_checkpoint_opts[@]}" -xpf - -C "${restore_target}" "${restore_patterns[@]}"
+            fi
         fi
         local local_pipe_statuses=("${PIPESTATUS[@]}")
         [ -t 1 ] && echo
         gpg_exit_code=${local_pipe_statuses[0]}
-        tar_exit_code=${local_pipe_statuses[1]}
+        tar_exit_code=${local_pipe_statuses[${#local_pipe_statuses[@]}-1]}
     elif [ "$effective_stream_restore" = true ]; then
         echo "Streaming and extracting archive from cloud storage (${BACKUP_DIR}${ENCRYPTED_TARBALL_NAME})..."
         log_message "Streaming and extracting ${BACKUP_DIR}${ENCRYPTED_TARBALL_NAME} directly to ${restore_target} via rclone cat"
@@ -7007,16 +7154,28 @@ run_restore() {
         echo "Decrypting and extracting archive..."
         log_message "Decrypting and extracting ${FULL_ENCRYPTED_PATH} directly to ${restore_target}"
         if [ "$archive_enc_type" = "asymmetric" ] && [ -z "$ENCRYPTION_PASSWORD" ]; then
-            gpg --batch --yes --no-tty --decrypt "$FULL_ENCRYPTED_PATH" 2>"$gpg_err_file" \
-                | tar "${tar_wildcard_opts[@]}" --acls --xattrs "${tar_compress_opts[@]}" "${tar_checkpoint_opts[@]}" -xpf - -C "${restore_target}" "${restore_patterns[@]}"
+            if [ "$use_pv" = true ]; then
+                gpg --batch --yes --no-tty --decrypt "$FULL_ENCRYPTED_PATH" 2>"$gpg_err_file" \
+                    | pv -c -N "Extracting Archive" \
+                    | tar "${tar_wildcard_opts[@]}" --acls --xattrs "${tar_compress_opts[@]}" "${tar_checkpoint_opts[@]}" -xpf - -C "${restore_target}" "${restore_patterns[@]}"
+            else
+                gpg --batch --yes --no-tty --decrypt "$FULL_ENCRYPTED_PATH" 2>"$gpg_err_file" \
+                    | tar "${tar_wildcard_opts[@]}" --acls --xattrs "${tar_compress_opts[@]}" "${tar_checkpoint_opts[@]}" -xpf - -C "${restore_target}" "${restore_patterns[@]}"
+            fi
         else
-            gpg --batch --yes --no-tty --pinentry-mode loopback --decrypt --passphrase-fd 3 "$FULL_ENCRYPTED_PATH" 3< <(printf '%s' "$ENCRYPTION_PASSWORD") 2>"$gpg_err_file" \
-                | tar "${tar_wildcard_opts[@]}" --acls --xattrs "${tar_compress_opts[@]}" "${tar_checkpoint_opts[@]}" -xpf - -C "${restore_target}" "${restore_patterns[@]}"
+            if [ "$use_pv" = true ]; then
+                gpg --batch --yes --no-tty --pinentry-mode loopback --decrypt --passphrase-fd 3 "$FULL_ENCRYPTED_PATH" 3< <(printf '%s' "$ENCRYPTION_PASSWORD") 2>"$gpg_err_file" \
+                    | pv -c -N "Extracting Archive" \
+                    | tar "${tar_wildcard_opts[@]}" --acls --xattrs "${tar_compress_opts[@]}" "${tar_checkpoint_opts[@]}" -xpf - -C "${restore_target}" "${restore_patterns[@]}"
+            else
+                gpg --batch --yes --no-tty --pinentry-mode loopback --decrypt --passphrase-fd 3 "$FULL_ENCRYPTED_PATH" 3< <(printf '%s' "$ENCRYPTION_PASSWORD") 2>"$gpg_err_file" \
+                    | tar "${tar_wildcard_opts[@]}" --acls --xattrs "${tar_compress_opts[@]}" "${tar_checkpoint_opts[@]}" -xpf - -C "${restore_target}" "${restore_patterns[@]}"
+            fi
         fi
         local staged_pipe_statuses=("${PIPESTATUS[@]}")
         [ -t 1 ] && echo
         gpg_exit_code=${staged_pipe_statuses[0]}
-        tar_exit_code=${staged_pipe_statuses[1]}
+        tar_exit_code=${staged_pipe_statuses[${#staged_pipe_statuses[@]}-1]}
 
         rm -f "${FULL_ENCRYPTED_PATH}" # Clean up downloaded file regardless of outcome
         CURRENT_ENCRYPTED_ARCHIVE=""
@@ -10460,6 +10619,7 @@ run_verify() {
     local target_arg=""
     local forced_source=""
     local checksum_only=false
+    apply_process_priority
 
     while [ $# -gt 0 ]; do
         case "$1" in
@@ -11265,10 +11425,39 @@ cleanup() {
     # Clean up inhibition sentinel if trapped before normal completion
     [ -n "${INHIBIT_SENTINEL:-}" ] && rm -f "$INHIBIT_SENTINEL" 2>/dev/null
 
+    # Finalize historical run log if active
+    if [ -n "${CURRENT_RUN_LOG:-}" ] && [ -f "$LOG_FILE" ] && [ -s "$LOG_FILE" ]; then
+        cp -f "$LOG_FILE" "$CURRENT_RUN_LOG" 2>/dev/null || true
+    fi
+
     # Secure memory isolation: wipe plaintext passphrases from shell environment
     unset ENCRYPTION_PASSWORD BACKUP_ENCRYPTION_PASSWORD pass1 pass2 _cred_val _sec_val
 
     exit "$exit_code"
+}
+
+#---
+#   FUNCTION:  apply_process_priority()
+#  DESCRIPTION:  Applies low CPU priority (nice 19) and low I/O priority (ionice
+#                best-effort class 2, priority 7) to background or ad-hoc backup,
+#                restore, or verify runs to preserve desktop responsiveness.
+#---
+apply_process_priority() {
+    local enable_priority="${ENABLE_PROCESS_PRIORITY:-true}"
+    if [ "$enable_priority" != "true" ] && [ "$enable_priority" != "1" ]; then
+        return 0
+    fi
+
+    # Only adjust if nice level is currently standard or higher priority (< 19)
+    local cur_nice=0
+    if cur_nice=$(nice 2>/dev/null) && [ "$cur_nice" -lt 19 ] 2>/dev/null; then
+        renice -n 19 -p $$ &>/dev/null || true
+    fi
+
+    # Best-effort I/O scheduling class (2), lowest priority (7)
+    if command -v ionice &>/dev/null; then
+        ionice -c 2 -n 7 -p $$ &>/dev/null || true
+    fi
 }
 
 #---
@@ -11357,6 +11546,7 @@ execute_with_inhibit() {
     fi
 
     if acquire_lock "$action"; then
+        apply_process_priority
         local ret=0
         case "$action" in
             backup)  run_backup "$@" || ret=$? ;;
@@ -12302,6 +12492,28 @@ init_config() {
 # Filenames that contain recursive ignore patterns.
 # Default: (".backupignore")
 #EXCLUDE_IGNORE_FILES=(".backupignore")
+
+#------------------------------------------------------------------------------
+# 17. Operational Logging & Process Niceness
+#------------------------------------------------------------------------------
+# Directory for retaining historical timestamped run logs (chmod 700).
+# Keeps individual logs for each backup run to prevent failure logs from being overwritten.
+# Default: ~/.config/backup_script/logs
+#LOG_DIR="${CONFIG_DIR}/logs"
+
+# Number of historical run logs to retain in LOG_DIR.
+# Default: 14
+#LOG_RETENTION_COUNT="14"
+
+# Terminal progress visualization via Pipe Viewer (pv) during archiving and extraction.
+# Options: 'auto' (active in interactive terminal if pv installed), 'true', 'false'
+# Default: auto
+#ENABLE_PV="auto"
+
+# Manage process and I/O scheduling niceness for background/ad-hoc runs (nice 19 and ionice best-effort class 2 priority 7).
+# Prevents backup/restore operations from degrading desktop GUI responsiveness.
+# Default: true
+#ENABLE_PROCESS_PRIORITY="true"
 EOF
     ) || {
         echo "ERROR: Failed to write configuration file '${target_file}'." >&2
@@ -12323,6 +12535,286 @@ EOF
         echo "Tip: Or to use zero-knowledge/passphrase-less asymmetric backups via GPG public key:"
         echo "  Set ENCRYPTION_MODE=\"asymmetric\" and GPG_RECIPIENT=\"your-key-or-email\" in ${target_file}"
     fi
+}
+
+#---
+#   FUNCTION:  export_rclone_config()
+#  DESCRIPTION:  Securely exports the active rclone cloud configuration or token
+#                into an offline escrow file (chmod 600) for disaster recovery bootstrapping.
+#---
+export_rclone_config() {
+    local target_file=""
+    local opt_force=false
+    local opt_print=false
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --force|-f|-y|--yes)
+                opt_force=true
+                shift
+                ;;
+            --print|-p|--show)
+                opt_print=true
+                shift
+                ;;
+            help|-h|--help)
+                echo "Usage: $0 export-rclone-config [target_file] [options]"
+                echo
+                echo "Securely exports the active rclone cloud configuration for disaster recovery."
+                echo "Saves an offline escrow file with strict 600 permissions for vaulting in a"
+                echo "password manager, encrypted drive, or disaster recovery kit."
+                echo
+                echo "Options:"
+                echo "  [target_file]     Destination file path (default: ${CONFIG_DIR}/rclone.conf.escrow)"
+                echo "  --print, -p       Print the remote configuration block to stdout"
+                echo "  --force, -f       Overwrite destination file if it already exists"
+                echo "  --help, -h        Show this help message"
+                return 0
+                ;;
+            *)
+                if [ -z "$target_file" ]; then
+                    target_file="$1"
+                else
+                    echo "WARNING: Unexpected argument '$1' ignored." >&2
+                fi
+                shift
+                ;;
+        esac
+    done
+
+    if ! command -v rclone &>/dev/null; then
+        echo "ERROR: 'rclone' command not found." >&2
+        return 1
+    fi
+
+    local src_conf
+    src_conf=$(rclone config file 2>/dev/null | awk -F': ' '/stored at:/ {print $2; exit}' || true)
+    if [ -z "$src_conf" ] || [ ! -f "$src_conf" ]; then
+        # Fallback to default locations
+        if [ -f "${HOME}/.config/rclone/rclone.conf" ]; then
+            src_conf="${HOME}/.config/rclone/rclone.conf"
+        else
+            echo "ERROR: No rclone configuration file found on this system." >&2
+            echo "Configure cloud access with 'rclone config' first." >&2
+            return 1
+        fi
+    fi
+
+    local remote_name="${BACKUP_DIR%%:*}"
+
+    if [ "$opt_print" = true ]; then
+        echo "==============================================================================="
+        echo "  Rclone Cloud Configuration: [${remote_name}] (${src_conf})"
+        echo "==============================================================================="
+        if [ -n "$remote_name" ] && rclone config show "$remote_name" &>/dev/null; then
+            rclone config show "$remote_name"
+        else
+            cat "$src_conf"
+        fi
+        echo "==============================================================================="
+        return 0
+    fi
+
+    target_file="${target_file:-${CONFIG_DIR}/rclone.conf.escrow}"
+
+    if [ -f "$target_file" ] && [ "$opt_force" = false ]; then
+        if [ -t 0 ]; then
+            local overwrite_confirm
+            read -r -p "Destination '${target_file}' already exists. Overwrite? [y/N]: " overwrite_confirm
+            case "$overwrite_confirm" in
+                [yY]|[yY][eE][sS]) ;;
+                *) echo "Aborted: Existing file was not modified."; return 0 ;;
+            esac
+        else
+            echo "ERROR: Target file '${target_file}' already exists. Use --force to overwrite." >&2
+            return 1
+        fi
+    fi
+
+    local parent_dir
+    parent_dir=$(dirname "$target_file")
+    [ -d "$parent_dir" ] || mkdir -p "$parent_dir" 2>/dev/null || true
+    chmod 700 "$parent_dir" 2>/dev/null || true
+
+    if cp -p "$src_conf" "$target_file" 2>/dev/null; then
+        chmod 600 "$target_file" 2>/dev/null || true
+        echo "==============================================================================="
+        echo "  Rclone Disaster Recovery Escrow Export"
+        echo "==============================================================================="
+        echo "Successfully exported rclone configuration to:"
+        echo "  ${target_file} (permissions: $(stat -c "%a" "$target_file" 2>/dev/null || echo "600"))"
+        echo
+        echo "CRITICAL: Store this file in a secure location (such as an encrypted password"
+        echo "manager, encrypted USB drive, or paper vault). It contains your OAuth access tokens."
+        echo
+        echo "To restore on a clean recovery system or live USB:"
+        echo "  mkdir -p ~/.config/rclone && chmod 700 ~/.config/rclone"
+        echo "  cp \"${target_file}\" ~/.config/rclone/rclone.conf"
+        echo "  chmod 600 ~/.config/rclone/rclone.conf"
+        echo "==============================================================================="
+        log_message "Exported rclone disaster recovery configuration to ${target_file}"
+        return 0
+    else
+        echo "ERROR: Failed to copy '${src_conf}' to '${target_file}'." >&2
+        return 1
+    fi
+}
+
+#---
+#   FUNCTION:  export_gpg_keys()
+#  DESCRIPTION:  Securely exports ASCII-armored GPG public and secret keys into
+#                an escrow directory or files (chmod 600) for disaster recovery vaulting.
+#---
+export_gpg_keys() {
+    local target_dir=""
+    local opt_force=false
+    local opt_recipient=""
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --force|-f|-y|--yes)
+                opt_force=true
+                shift
+                ;;
+            --recipient|-r)
+                if [ -n "${2:-}" ]; then
+                    opt_recipient="$2"
+                    shift 2
+                else
+                    shift
+                fi
+                ;;
+            help|-h|--help)
+                echo "Usage: $0 export-gpg-keys [target_dir] [options]"
+                echo
+                echo "Securely exports ASCII-armored GPG public and secret keys for disaster recovery."
+                echo "Creates files with strict 600 permissions for offline vaulting."
+                echo
+                echo "Options:"
+                echo "  [target_dir]      Destination directory (default: ${CONFIG_DIR}/gpg_escrow)"
+                echo "  --recipient, -r   GPG Key ID, fingerprint, or email to export"
+                echo "  --force, -f       Overwrite existing key files in destination directory"
+                echo "  --help, -h        Show this help message"
+                return 0
+                ;;
+            *)
+                if [ -z "$target_dir" ]; then
+                    target_dir="$1"
+                else
+                    echo "WARNING: Unexpected argument '$1' ignored." >&2
+                fi
+                shift
+                ;;
+        esac
+    done
+
+    if ! command -v gpg &>/dev/null; then
+        echo "ERROR: 'gpg' command not found." >&2
+        return 1
+    fi
+
+    # Determine recipient key ID
+    local key_id="$opt_recipient"
+    if [ -z "$key_id" ]; then
+        if [ ${#GPG_RECIPIENTS[@]} -gt 0 ]; then
+            key_id="${GPG_RECIPIENTS[0]}"
+        elif [ -n "$GPG_RECIPIENT" ]; then
+            key_id="$GPG_RECIPIENT"
+        fi
+    fi
+
+    if [ -z "$key_id" ]; then
+        # Try to find a secret key in the local keyring
+        local avail_keys=()
+        mapfile -t avail_keys < <(gpg --batch --list-secret-keys --with-colons 2>/dev/null | awk -F: '$1=="sec" {print $5}')
+        if [ ${#avail_keys[@]} -eq 1 ]; then
+            key_id="${avail_keys[0]}"
+        elif [ ${#avail_keys[@]} -gt 1 ]; then
+            if [ -t 0 ]; then
+                echo "Multiple secret keys found in GPG keyring:"
+                local idx=1
+                for k in "${avail_keys[@]}"; do
+                    local uid_info
+                    uid_info=$(gpg --batch --list-keys --with-colons "$k" 2>/dev/null | awk -F: '$1=="uid" {print $10; exit}')
+                    echo "  $idx) $k (${uid_info})"
+                    ((idx++))
+                done
+                read -r -p "Select key [1-${#avail_keys[@]}]: " choice
+                if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "${#avail_keys[@]}" ]; then
+                    key_id="${avail_keys[$((choice - 1))]}"
+                fi
+            else
+                key_id="${avail_keys[0]}"
+            fi
+        fi
+    fi
+
+    if [ -z "$key_id" ]; then
+        echo "ERROR: No GPG recipient or secret key specified. Specify with -r <key_id> or set GPG_RECIPIENT in config." >&2
+        return 1
+    fi
+
+    target_dir="${target_dir:-${CONFIG_DIR}/gpg_escrow}"
+    mkdir -p "$target_dir" 2>/dev/null || true
+    chmod 700 "$target_dir" 2>/dev/null || true
+
+    local pub_file="${target_dir}/gpg_backup_public.key"
+    local sec_file="${target_dir}/gpg_backup_secret.key"
+
+    if { [ -f "$pub_file" ] || [ -f "$sec_file" ]; } && [ "$opt_force" = false ]; then
+        if [ -t 0 ]; then
+            local overwrite_confirm
+            read -r -p "Key files already exist in '${target_dir}'. Overwrite? [y/N]: " overwrite_confirm
+            case "$overwrite_confirm" in
+                [yY]|[yY][eE][sS]) ;;
+                *) echo "Aborted: Existing key files were not modified."; return 0 ;;
+            esac
+        else
+            echo "ERROR: Key files already exist in '${target_dir}'. Use --force to overwrite." >&2
+            return 1
+        fi
+    fi
+
+    echo "Exporting public key for '${key_id}'..."
+    if ! gpg --batch --yes --armor --export "$key_id" > "$pub_file" 2>/dev/null; then
+        echo "ERROR: Failed to export public key for '${key_id}'." >&2
+        return 1
+    fi
+    chmod 600 "$pub_file" 2>/dev/null || true
+
+    local has_secret=false
+    if gpg --batch --list-secret-keys "$key_id" &>/dev/null; then
+        echo "Exporting secret key for '${key_id}'..."
+        if gpg --batch --yes --armor --export-secret-keys "$key_id" > "$sec_file" 2>/dev/null; then
+            chmod 600 "$sec_file" 2>/dev/null || true
+            has_secret=true
+        else
+            echo "WARNING: Could not export secret key for '${key_id}' (pinentry or gpg-agent rejected export)." >&2
+        fi
+    else
+        echo "Notice: Secret key for '${key_id}' is not in local keyring (encryption-only host)."
+    fi
+
+    echo "==============================================================================="
+    echo "  GPG Disaster Recovery Key Escrow"
+    echo "==============================================================================="
+    echo "Export directory: ${target_dir} (permissions: 700)"
+    echo "  Public Key: ${pub_file} (permissions: 600)"
+    if [ "$has_secret" = true ]; then
+        echo "  Secret Key: ${sec_file} (permissions: 600)"
+        echo
+        echo "CRITICAL SECURITY WARNING:"
+        echo "The secret key file (${sec_file}) contains your private decryption key."
+        echo "Store it securely offline (e.g. in a password manager vault, encrypted flash drive,"
+        echo "or printed paper key). Anyone with this key and your passphrase can decrypt your data."
+        echo
+        echo "To import on a disaster recovery machine:"
+        echo "  gpg --import \"${sec_file}\""
+        echo "  gpg --batch --yes --import-ownertrust < <(gpg --fingerprint \"${key_id}\" 2>/dev/null | awk '/Key fingerprint/ {print \$NF \":6:\"}')"
+    fi
+    echo "==============================================================================="
+    log_message "Exported GPG escrow keys for ${key_id} to ${target_dir}"
+    return 0
 }
 
 #---
@@ -12738,6 +13230,25 @@ check_config() {
         report_fail "Log File Location" "Parent directory of ${LOG_FILE} (${log_dir}) is not writable"
     fi
 
+    if [ -n "$LOG_DIR" ]; then
+        if [ -d "$LOG_DIR" ]; then
+            local ldir_perms
+            ldir_perms=$(stat -c "%a" "$LOG_DIR" 2>/dev/null)
+            if [ "$ldir_perms" = "700" ]; then
+                report_ok "Multi-Run Log Directory" "${LOG_DIR} (permissions: 700, retention: ${LOG_RETENTION_COUNT:-14} runs)"
+            else
+                if [ "$opt_fix" = true ]; then
+                    chmod 700 "$LOG_DIR" 2>/dev/null
+                    report_ok "Multi-Run Log Directory" "Corrected permissions on ${LOG_DIR} to 700 (--fix)"
+                else
+                    report_warn "Multi-Run Log Directory" "${LOG_DIR} has permissions ${ldir_perms} (expected 700; run with --fix)"
+                fi
+            fi
+        else
+            report_ok "Multi-Run Log Directory" "${LOG_DIR} will be initialized on first run (retention: ${LOG_RETENTION_COUNT:-14} runs)"
+        fi
+    fi
+
     local lock_dir
     lock_dir=$(dirname "$LOCK_FILE")
     if [ -d "$lock_dir" ] && [ -w "$lock_dir" ]; then
@@ -13123,7 +13634,7 @@ check_config() {
         report_warn "Tar Capability" "Installed tar does not appear to support --exclude-tag-all (GNU tar recommended)"
     fi
 
-    local opt_tools=("dconf" "flatpak" "pipx" "apt-mark" "dnf" "systemd-inhibit" "notify-send" "udisksctl" "sqlite3")
+    local opt_tools=("dconf" "flatpak" "pipx" "apt-mark" "dnf" "systemd-inhibit" "notify-send" "udisksctl" "sqlite3" "pv" "ionice")
     local present_opt=() missing_opt=()
     for tool in "${opt_tools[@]}"; do
         if command -v "$tool" &>/dev/null; then
@@ -13136,6 +13647,22 @@ check_config() {
         report_ok "Optional Helpers" "All optional integrations available (${#opt_tools[@]} tools)"
     else
         report_info "Optional Helpers" "Present: ${present_opt[*]}; not installed: ${missing_opt[*]}"
+    fi
+
+    if [ "$ENABLE_PROCESS_PRIORITY" = true ] || [ "$ENABLE_PROCESS_PRIORITY" = "1" ]; then
+        report_ok "Process Priority Control" "Enabled (renice 19 + ionice class 2 priority 7 active for non-disruptive execution)"
+    else
+        report_info "Process Priority Control" "Disabled (ENABLE_PROCESS_PRIORITY=false)"
+    fi
+
+    if [ "$ENABLE_PV" = true ] || [ "$ENABLE_PV" = "1" ] || [ "$ENABLE_PV" = "auto" ]; then
+        if command -v pv &>/dev/null; then
+            report_ok "Terminal Progress (pv)" "Active (Pipe Viewer integrated for real-time throughput)"
+        else
+            report_info "Terminal Progress (pv)" "Enabled (${ENABLE_PV}), but pv is not installed (install pv for live throughput)"
+        fi
+    else
+        report_info "Terminal Progress (pv)" "Disabled (ENABLE_PV=false)"
     fi
 
     # 8. Systemd User Timer & Service
@@ -13293,8 +13820,10 @@ show_main_menu() {
         echo "14. Check Configuration & Environment"
         echo "15. Initialize Configuration File"
         echo "16. Send Test Email Notification"
-        echo "17. Exit"
-        if ! read -r -p "Please enter your choice [1-17]: " choice; then
+        echo "17. Export Rclone Cloud Config (Disaster Recovery Escrow)"
+        echo "18. Export GPG Encryption Keys (Disaster Recovery Escrow)"
+        echo "19. Exit"
+        if ! read -r -p "Please enter your choice [1-19]: " choice; then
             echo -e "\nExiting."
             break
         fi
@@ -13316,7 +13845,9 @@ show_main_menu() {
             14) check_config ;;
             15) init_config ;;
             16) test_email ;;
-            17) echo "Exiting."; break ;;
+            17) export_rclone_config ;;
+            18) export_gpg_keys ;;
+            19) echo "Exiting."; break ;;
             *) echo "Invalid option." ;;
         esac
     done
@@ -13466,6 +13997,8 @@ case "${1:-}" in
         echo "  timer [status|journal|install|remove] Manage systemd backup timer interactively or via subcommand"
         echo "  test-email [addr] [sender]    Send a test email notification to verify MTA delivery and recipient reachability"
         echo "  init-config [path] [--force]  Generate a template configuration file with all configurable settings"
+        echo "  export-rclone-config [target] Export rclone configuration file for disaster recovery escrow (chmod 600)"
+        echo "  export-gpg-keys [target_dir]  Export ASCII-armored GPG public and secret keys for disaster recovery (chmod 600)"
         echo "  help, -h, --help              Display this help message"
         echo
         echo "Run without arguments to launch the interactive menu."
@@ -13477,6 +14010,14 @@ case "${1:-}" in
         ;;
     test-email|test_email|send-test-email)
         test_email "${@:2}"
+        exit $?
+        ;;
+    export-rclone-config|export_rclone_config|rclone-config|export-rclone)
+        export_rclone_config "${@:2}"
+        exit $?
+        ;;
+    export-gpg-keys|export_gpg_keys|export-keys|export-gpg)
+        export_gpg_keys "${@:2}"
         exit $?
         ;;
 esac
