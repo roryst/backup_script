@@ -93,6 +93,7 @@ CLOUD_KEEP_COUNT="${CLOUD_KEEP_COUNT:-10}"
 LOCAL_KEEP_COUNT="${LOCAL_KEEP_COUNT:-10}"
 
 # Tiered / GFS Retention Settings (evaluated when RETENTION_MODE is 'tiered' or 'gfs')
+# Retains the newest archive for each distinct day, week, month, and past calendar year(s).
 RETENTION_DAILY="${RETENTION_DAILY:-7}"
 RETENTION_WEEKLY="${RETENTION_WEEKLY:-4}"
 RETENTION_MONTHLY="${RETENTION_MONTHLY:-6}"
@@ -215,7 +216,7 @@ RESTORE_VERIFY_CHECKSUM="${RESTORE_VERIFY_CHECKSUM:-true}"
 # When enabled ('checksum', 'quick', 'checksum-local', 'checksum-cloud', 'local', 'cloud', true, or 1),
 # executes integrity verification on the newly created archive.
 # Can also be triggered per-run via 'backup --verify [auto|local|cloud]' or 'backup --verify-checksum'.
-AUTO_VERIFY_BACKUP="${AUTO_VERIFY_BACKUP:-local}"
+AUTO_VERIFY_BACKUP="${AUTO_VERIFY_BACKUP:-checksum-local}"
 
 # Preferred pager for viewing archive file listings in interactive terminals.
 # Set to an empty string ("") to disable pagination by default.
@@ -1241,7 +1242,7 @@ update_manifest_destination_status() {
 #                - RETENTION_DAILY (default: 7 daily archives)
 #                - RETENTION_WEEKLY (default: 4 weekly archives)
 #                - RETENTION_MONTHLY (default: 6 monthly archives)
-#                - RETENTION_YEARLY (default: 1 yearly archive)
+#                - RETENTION_YEARLY (default: 1 yearly archive for past years)
 #                Outputs filenames that should be pruned.
 #---
 # shellcheck disable=SC2120
@@ -1273,6 +1274,16 @@ calculate_tiered_retention_prune_list() {
     # Sort newest to oldest:
     # Since filenames contain YYYY-MM-DD_HHMMSS, reverse lexical sort is chronological descending
     mapfile -t all_archives < <(printf '%s\n' "${all_archives[@]}" | sort -r)
+
+    # Identify the year of the most recent archive to prevent the active year
+    # from consuming the historical yearly retention quota.
+    local newest_archive_year=""
+    for _arch in "${all_archives[@]}"; do
+        if [[ "$_arch" =~ ([0-9]{4})-[0-9]{2}-[0-9]{2}_[0-9]{6} ]]; then
+            newest_archive_year="${BASH_REMATCH[1]}"
+            break
+        fi
+    done
 
     local day_count=0 week_count=0 month_count=0 year_count=0
     local overall_idx=0
@@ -1320,10 +1331,17 @@ calculate_tiered_retention_prune_list() {
             fi
 
             # Yearly bucket (keep newest for each distinct year)
-            if [ -z "${year_buckets[$year_str]+x}" ] && [ "$year_count" -lt "$yearly_limit" ]; then
-                year_buckets["$year_str"]=1
-                ((year_count++))
-                keep=true
+            # The active/newest year is always preserved by finer tiers (daily/weekly/monthly);
+            # do not let the active year consume the historical yearly retention limit.
+            if [ "$yearly_limit" -gt 0 ] 2>/dev/null && [ -z "${year_buckets[$year_str]+x}" ]; then
+                if [ -n "$newest_archive_year" ] && [ "$year_str" = "$newest_archive_year" ]; then
+                    year_buckets["$year_str"]=1
+                    keep=true
+                elif [ "$year_count" -lt "$yearly_limit" ]; then
+                    year_buckets["$year_str"]=1
+                    ((year_count++))
+                    keep=true
+                fi
             fi
 
             if [ "$keep" = true ]; then
@@ -1353,13 +1371,17 @@ run_rotation() {
     local cloud_listing=""
     cloud_listing=$(rclone lsf --fast-list "${BACKUP_DIR}" 2>/dev/null)
 
-    # Discover pinned archives on cloud remote
+    # Discover pinned archives and index existing files on cloud remote
     local -A cloud_pinned_map=()
-    while IFS= read -r pin_file; do
-        [ -z "$pin_file" ] && continue
-        local base_arch="${pin_file%.pinned}"
-        cloud_pinned_map["$base_arch"]=1
-    done < <(grep -E "${TARBALL_BASENAME}_.*\.tar\.(zst|gz|xz)\.gpg\.pinned$" <<< "$cloud_listing")
+    local -A cloud_files_map=()
+    while IFS= read -r f; do
+        [ -z "$f" ] && continue
+        cloud_files_map["$f"]=1
+        if [[ "$f" == *.pinned ]]; then
+            local base_arch="${f%.pinned}"
+            cloud_pinned_map["$base_arch"]=1
+        fi
+    done <<< "$cloud_listing"
 
     # Filter unpinned candidates for rotation evaluation
     local -a candidate_cloud_files=()
@@ -1396,11 +1418,13 @@ run_rotation() {
         fi
         log_message "Trashing old cloud backup: ${file_to_delete}"
         echo "Trashing old cloud backup: ${file_to_delete}"
-        rclone deletefile "${BACKUP_DIR}${file_to_delete}" >> "$LOG_FILE" 2>&1
-        rclone deletefile "${BACKUP_DIR}${file_to_delete}.sha256" >> "$LOG_FILE" 2>&1 || true
-        rclone deletefile "${BACKUP_DIR}${file_to_delete}.manifest.json" >> "$LOG_FILE" 2>&1 || true
-        rclone deletefile "${BACKUP_DIR}${file_to_delete}.files.gz" >> "$LOG_FILE" 2>&1 || true
-        rclone deletefile "${BACKUP_DIR}${file_to_delete}.pinned" >> "$LOG_FILE" 2>&1 || true
+        rclone deletefile "${BACKUP_DIR}${file_to_delete}" >> "$LOG_FILE" 2>&1 || true
+        for ext in ".sha256" ".manifest.json" ".files.gz" ".pinned"; do
+            local sidecar="${file_to_delete}${ext}"
+            if [ -n "${cloud_files_map[$sidecar]+x}" ]; then
+                rclone deletefile "${BACKUP_DIR}${sidecar}" >> "$LOG_FILE" 2>&1 || true
+            fi
+        done
     done
 
     log_message "Cloud backup rotation complete."
@@ -11824,7 +11848,7 @@ init_config() {
 #LOCAL_KEEP_COUNT=10
 
 # Tiered / GFS Retention Limits (active when RETENTION_MODE is 'tiered' or 'gfs')
-# Keep the newest backup for each distinct day, week, month, and year.
+# Keep the newest backup for each distinct day, week, month, and past calendar year(s).
 # Default: daily=7, weekly=4, monthly=6, yearly=1
 #RETENTION_DAILY=7
 #RETENTION_WEEKLY=4
@@ -11931,15 +11955,15 @@ init_config() {
 # Automatically verify archive integrity immediately following a successful backup.
 # When enabled, tests archive structure or checksum sidecar without extracting files to disk.
 # Valid values:
-#   "local"           - Full decryption stream and tar integrity test against local copy (default)
+#   "local"           - Full decryption stream and tar integrity test against local copy
 #   "cloud"           - Full decryption stream and tar integrity test against cloud copy
 #   "checksum"        - Fast SHA-256 sidecar checksum verification (detects bit-rot in ~10s)
-#   "checksum-local"  - Fast SHA-256 sidecar checksum verification forced against local copy
+#   "checksum-local"  - Fast SHA-256 sidecar checksum verification forced against local copy (default)
 #   "checksum-cloud"  - Fast SHA-256 sidecar checksum verification forced against cloud copy
 #   "false"           - Disable automatic post-backup verification
 # Can also be triggered per-run via 'backup --verify [auto|local|cloud]' or 'backup --verify-checksum'.
-# Default: local
-#AUTO_VERIFY_BACKUP="local"
+# Default: checksum-local
+#AUTO_VERIFY_BACKUP="checksum-local"
 
 # Generate lightweight companion JSON manifest (.manifest.json) alongside archive and checksum.
 # Allows instantaneous inspection of archive inventory, metadata, system configurations, and sizes
