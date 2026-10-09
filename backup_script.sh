@@ -24,7 +24,7 @@
 #                 Usage: ./backup_script.sh [backup|restore|verify|list|stats|diff-backups|manifest|manage-preserved|pin|unpin|pinned|export-rclone-config|export-gpg-keys|init-config|check-config|help]
 #
 #        AUTHOR:  Rory Mobley, rorymobley5@gmail.com
-#       VERSION:  10.7.0
+#       VERSION:  10.8.1
 #==============================================================================
 
 #------------------------------------------------------------------------------
@@ -221,6 +221,15 @@ STREAM_CLOUD_RESTORE="${STREAM_CLOUD_RESTORE:-auto}"
 # Can be overridden per-run via 'restore --verify-checksum' (-vc) or '--no-verify-checksum'.
 RESTORE_VERIFY_CHECKSUM="${RESTORE_VERIFY_CHECKSUM:-true}"
 
+# Fast single-file and non-wildcard extraction via tar --occurrence=1.
+# When enabled ('auto', 'true', or '1'), passes --occurrence=1 to GNU tar for exact file restores,
+# causing tar to stop decompression immediately once matching items are extracted.
+# Options: 'auto' (automatically enables for exact non-wildcard patterns; default),
+#          'true' (force --occurrence=1 for all selective extractions),
+#          'false' (disable; scan complete archive).
+# Can be overridden per-run via 'restore --occurrence[=N]' (-oc) or '--no-occurrence'.
+RESTORE_FAST_OCCURRENCE="${RESTORE_FAST_OCCURRENCE:-auto}"
+
 # Automatically verify archive integrity immediately following a successful backup.
 # When enabled ('checksum', 'quick', 'checksum-local', 'checksum-cloud', 'local', 'cloud', true, or 1),
 # executes integrity verification on the newly created archive.
@@ -334,7 +343,7 @@ MAIL_COMMAND="${MAIL_COMMAND:-auto}"
 EMAIL_ALERT_SENT=0
 
 # Script version identifier
-SCRIPT_VERSION="10.7.0"
+SCRIPT_VERSION="10.8.1"
 
 # Path to this script for self-invocation
 SCRIPT_PATH="$(realpath "${BASH_SOURCE[0]}")"
@@ -6245,6 +6254,8 @@ run_restore() {
     local cli_verify_checksum=""
     local cli_stream=""
     local cli_interactive_select=false
+    local cli_occurrence=""
+    local cli_occurrence_count=1
 
     while [ $# -gt 0 ]; do
         case "$1" in
@@ -6254,6 +6265,26 @@ run_restore() {
                 ;;
             --yes|-y|--batch)
                 cli_yes=true
+                shift
+                ;;
+            --occurrence=*|-oc=*)
+                cli_occurrence=true
+                cli_occurrence_count="${1#*=}"
+                [[ ! "$cli_occurrence_count" =~ ^[0-9]+$ || "$cli_occurrence_count" -le 0 ]] && cli_occurrence_count=1
+                shift
+                ;;
+            --occurrence|-oc|--single|--fast-single)
+                cli_occurrence=true
+                if [[ "${2:-}" =~ ^[0-9]+$ ]] && [ "$2" -gt 0 ]; then
+                    cli_occurrence_count="$2"
+                    shift 2
+                else
+                    cli_occurrence_count=1
+                    shift
+                fi
+                ;;
+            --no-occurrence|--all-occurrences)
+                cli_occurrence=false
                 shift
                 ;;
             --verify-checksum|--check-checksum|-vc)
@@ -6314,6 +6345,9 @@ run_restore() {
                 echo "  --dest, -d, --target <dir>        Destination directory (default: ${SOURCE_DIR})"
                 echo "  --source, -s <local|cloud>        Force restore source"
                 echo "  --archive, -a <name|path>         Specify archive filename, path, or 'latest'"
+                echo "  --occurrence[=N], -oc [N]         Process only Nth occurrence (default: 1); stops decompressing"
+                echo "                                    archive immediately after match to avoid full archive scan"
+                echo "  --no-occurrence                   Scan full archive for duplicates (disable early-exit optimization)"
                 echo "  --verify-checksum, -vc            Verify SHA-256 sidecar checksum before restoring"
                 echo "  --no-verify-checksum, --no-vc     Skip pre-restore SHA-256 sidecar checksum verification"
                 echo "  --stream                          Force single-pass cloud streaming directly without scratch space"
@@ -6934,6 +6968,39 @@ run_restore() {
         tar_wildcard_opts=("--wildcards" "--wildcards-match-slash" "--no-anchored")
     fi
 
+    # Determine whether to use tar --occurrence=1 for fast single/non-wildcard extraction
+    local tar_occurrence_opts=()
+    local use_occurrence=false
+    if [ "$is_selective" = true ]; then
+        if [ "$cli_occurrence" = true ]; then
+            use_occurrence=true
+        elif [ "$cli_occurrence" = false ]; then
+            use_occurrence=false
+        elif [ "$RESTORE_FAST_OCCURRENCE" = "true" ] || [ "$RESTORE_FAST_OCCURRENCE" = "1" ]; then
+            use_occurrence=true
+        elif [ "$RESTORE_FAST_OCCURRENCE" != "false" ] && [ "$RESTORE_FAST_OCCURRENCE" != "0" ]; then
+            # auto mode: enable --occurrence if no pattern contains wildcard characters (*, ?, [)
+            local has_wildcards=false
+            for p in "${restore_patterns[@]}"; do
+                if [[ "$p" == *"*"* || "$p" == *"?"* || "$p" == *"["* ]]; then
+                    has_wildcards=true
+                    break
+                fi
+            done
+            if [ "$has_wildcards" = false ]; then
+                use_occurrence=true
+            fi
+        fi
+    fi
+
+    if [ "$use_occurrence" = true ]; then
+        if tar --help 2>&1 | grep -q -- '--occurrence'; then
+            tar_occurrence_opts=("--occurrence=${cli_occurrence_count:-1}")
+            log_message "Fast single-pass extraction active: passing --occurrence=${cli_occurrence_count:-1} to GNU tar."
+            echo "Fast single-file extraction enabled (tar --occurrence=${cli_occurrence_count:-1})."
+        fi
+    fi
+
     # --- Step 1 & 2: Obtain, Decrypt & Extract Archive (streamed) ---
     local restore_tmp_dir
     restore_tmp_dir=$(mktemp -d)
@@ -6962,19 +7029,19 @@ run_restore() {
             if [ "$use_pv" = true ]; then
                 gpg --batch --yes --no-tty --decrypt "$SOURCE_ENCRYPTED_FILE" 2>"$gpg_err_file" \
                     | pv -c -N "Extracting Archive" \
-                    | tar "${tar_wildcard_opts[@]}" --acls --xattrs "${tar_compress_opts[@]}" "${tar_checkpoint_opts[@]}" -xpf - -C "${restore_target}" "${restore_patterns[@]}"
+                    | tar "${tar_wildcard_opts[@]}" "${tar_occurrence_opts[@]}" --acls --xattrs "${tar_compress_opts[@]}" "${tar_checkpoint_opts[@]}" -xpf - -C "${restore_target}" "${restore_patterns[@]}"
             else
                 gpg --batch --yes --no-tty --decrypt "$SOURCE_ENCRYPTED_FILE" 2>"$gpg_err_file" \
-                    | tar "${tar_wildcard_opts[@]}" --acls --xattrs "${tar_compress_opts[@]}" "${tar_checkpoint_opts[@]}" -xpf - -C "${restore_target}" "${restore_patterns[@]}"
+                    | tar "${tar_wildcard_opts[@]}" "${tar_occurrence_opts[@]}" --acls --xattrs "${tar_compress_opts[@]}" "${tar_checkpoint_opts[@]}" -xpf - -C "${restore_target}" "${restore_patterns[@]}"
             fi
         else
             if [ "$use_pv" = true ]; then
                 gpg --batch --yes --no-tty --pinentry-mode loopback --decrypt --passphrase-fd 3 "$SOURCE_ENCRYPTED_FILE" 3< <(printf '%s' "$ENCRYPTION_PASSWORD") 2>"$gpg_err_file" \
                     | pv -c -N "Extracting Archive" \
-                    | tar "${tar_wildcard_opts[@]}" --acls --xattrs "${tar_compress_opts[@]}" "${tar_checkpoint_opts[@]}" -xpf - -C "${restore_target}" "${restore_patterns[@]}"
+                    | tar "${tar_wildcard_opts[@]}" "${tar_occurrence_opts[@]}" --acls --xattrs "${tar_compress_opts[@]}" "${tar_checkpoint_opts[@]}" -xpf - -C "${restore_target}" "${restore_patterns[@]}"
             else
                 gpg --batch --yes --no-tty --pinentry-mode loopback --decrypt --passphrase-fd 3 "$SOURCE_ENCRYPTED_FILE" 3< <(printf '%s' "$ENCRYPTION_PASSWORD") 2>"$gpg_err_file" \
-                    | tar "${tar_wildcard_opts[@]}" --acls --xattrs "${tar_compress_opts[@]}" "${tar_checkpoint_opts[@]}" -xpf - -C "${restore_target}" "${restore_patterns[@]}"
+                    | tar "${tar_wildcard_opts[@]}" "${tar_occurrence_opts[@]}" --acls --xattrs "${tar_compress_opts[@]}" "${tar_checkpoint_opts[@]}" -xpf - -C "${restore_target}" "${restore_patterns[@]}"
             fi
         fi
         local local_pipe_statuses=("${PIPESTATUS[@]}")
@@ -6989,6 +7056,10 @@ run_restore() {
             check_inline_checksum=true
         elif [ "$cli_verify_checksum" = false ]; then
             check_inline_checksum=false
+        elif [ "$use_occurrence" = true ]; then
+            # Fast occurrence exits early; full-archive stream hash would mismatch intentionally
+            check_inline_checksum=false
+            log_message "Skipping inline full-archive SHA-256 verification (fast --occurrence extraction active)."
         elif [ "$RESTORE_VERIFY_CHECKSUM" != false ] && [ "$RESTORE_VERIFY_CHECKSUM" != "0" ] && [ "$RESTORE_VERIFY_CHECKSUM" != "none" ]; then
             check_inline_checksum=true
         fi
@@ -7027,12 +7098,12 @@ run_restore() {
                 rclone cat "${RCLONE_STREAM_OPTS[@]}" "${BACKUP_DIR}${ENCRYPTED_TARBALL_NAME}" 2>"$rclone_err_file" \
                     | tee "$hash_fifo" \
                     | gpg --batch --yes --no-tty --decrypt - 2>"$gpg_err_file" \
-                    | tar "${tar_wildcard_opts[@]}" --acls --xattrs "${tar_compress_opts[@]}" "${tar_checkpoint_opts[@]}" -xpf - -C "${restore_target}" "${restore_patterns[@]}"
+                    | tar "${tar_wildcard_opts[@]}" "${tar_occurrence_opts[@]}" --acls --xattrs "${tar_compress_opts[@]}" "${tar_checkpoint_opts[@]}" -xpf - -C "${restore_target}" "${restore_patterns[@]}"
             else
                 rclone cat "${RCLONE_STREAM_OPTS[@]}" "${BACKUP_DIR}${ENCRYPTED_TARBALL_NAME}" 2>"$rclone_err_file" \
                     | tee "$hash_fifo" \
                     | gpg --batch --yes --no-tty --pinentry-mode loopback --decrypt --passphrase-fd 3 - 3< <(printf '%s' "$ENCRYPTION_PASSWORD") 2>"$gpg_err_file" \
-                    | tar "${tar_wildcard_opts[@]}" --acls --xattrs "${tar_compress_opts[@]}" "${tar_checkpoint_opts[@]}" -xpf - -C "${restore_target}" "${restore_patterns[@]}"
+                    | tar "${tar_wildcard_opts[@]}" "${tar_occurrence_opts[@]}" --acls --xattrs "${tar_compress_opts[@]}" "${tar_checkpoint_opts[@]}" -xpf - -C "${restore_target}" "${restore_patterns[@]}"
             fi
             local cloud_pipe_statuses=("${PIPESTATUS[@]}")
             [ -t 1 ] && echo
@@ -7046,11 +7117,11 @@ run_restore() {
             if [ "$archive_enc_type" = "asymmetric" ] && [ -z "$ENCRYPTION_PASSWORD" ]; then
                 rclone cat "${RCLONE_STREAM_OPTS[@]}" "${BACKUP_DIR}${ENCRYPTED_TARBALL_NAME}" 2>"$rclone_err_file" \
                     | gpg --batch --yes --no-tty --decrypt - 2>"$gpg_err_file" \
-                    | tar "${tar_wildcard_opts[@]}" --acls --xattrs "${tar_compress_opts[@]}" "${tar_checkpoint_opts[@]}" -xpf - -C "${restore_target}" "${restore_patterns[@]}"
+                    | tar "${tar_wildcard_opts[@]}" "${tar_occurrence_opts[@]}" --acls --xattrs "${tar_compress_opts[@]}" "${tar_checkpoint_opts[@]}" -xpf - -C "${restore_target}" "${restore_patterns[@]}"
             else
                 rclone cat "${RCLONE_STREAM_OPTS[@]}" "${BACKUP_DIR}${ENCRYPTED_TARBALL_NAME}" 2>"$rclone_err_file" \
                     | gpg --batch --yes --no-tty --pinentry-mode loopback --decrypt --passphrase-fd 3 - 3< <(printf '%s' "$ENCRYPTION_PASSWORD") 2>"$gpg_err_file" \
-                    | tar "${tar_wildcard_opts[@]}" --acls --xattrs "${tar_compress_opts[@]}" "${tar_checkpoint_opts[@]}" -xpf - -C "${restore_target}" "${restore_patterns[@]}"
+                    | tar "${tar_wildcard_opts[@]}" "${tar_occurrence_opts[@]}" --acls --xattrs "${tar_compress_opts[@]}" "${tar_checkpoint_opts[@]}" -xpf - -C "${restore_target}" "${restore_patterns[@]}"
             fi
             local cloud_pipe_statuses=("${PIPESTATUS[@]}")
             [ -t 1 ] && echo
@@ -7157,19 +7228,19 @@ run_restore() {
             if [ "$use_pv" = true ]; then
                 gpg --batch --yes --no-tty --decrypt "$FULL_ENCRYPTED_PATH" 2>"$gpg_err_file" \
                     | pv -c -N "Extracting Archive" \
-                    | tar "${tar_wildcard_opts[@]}" --acls --xattrs "${tar_compress_opts[@]}" "${tar_checkpoint_opts[@]}" -xpf - -C "${restore_target}" "${restore_patterns[@]}"
+                    | tar "${tar_wildcard_opts[@]}" "${tar_occurrence_opts[@]}" --acls --xattrs "${tar_compress_opts[@]}" "${tar_checkpoint_opts[@]}" -xpf - -C "${restore_target}" "${restore_patterns[@]}"
             else
                 gpg --batch --yes --no-tty --decrypt "$FULL_ENCRYPTED_PATH" 2>"$gpg_err_file" \
-                    | tar "${tar_wildcard_opts[@]}" --acls --xattrs "${tar_compress_opts[@]}" "${tar_checkpoint_opts[@]}" -xpf - -C "${restore_target}" "${restore_patterns[@]}"
+                    | tar "${tar_wildcard_opts[@]}" "${tar_occurrence_opts[@]}" --acls --xattrs "${tar_compress_opts[@]}" "${tar_checkpoint_opts[@]}" -xpf - -C "${restore_target}" "${restore_patterns[@]}"
             fi
         else
             if [ "$use_pv" = true ]; then
                 gpg --batch --yes --no-tty --pinentry-mode loopback --decrypt --passphrase-fd 3 "$FULL_ENCRYPTED_PATH" 3< <(printf '%s' "$ENCRYPTION_PASSWORD") 2>"$gpg_err_file" \
                     | pv -c -N "Extracting Archive" \
-                    | tar "${tar_wildcard_opts[@]}" --acls --xattrs "${tar_compress_opts[@]}" "${tar_checkpoint_opts[@]}" -xpf - -C "${restore_target}" "${restore_patterns[@]}"
+                    | tar "${tar_wildcard_opts[@]}" "${tar_occurrence_opts[@]}" --acls --xattrs "${tar_compress_opts[@]}" "${tar_checkpoint_opts[@]}" -xpf - -C "${restore_target}" "${restore_patterns[@]}"
             else
                 gpg --batch --yes --no-tty --pinentry-mode loopback --decrypt --passphrase-fd 3 "$FULL_ENCRYPTED_PATH" 3< <(printf '%s' "$ENCRYPTION_PASSWORD") 2>"$gpg_err_file" \
-                    | tar "${tar_wildcard_opts[@]}" --acls --xattrs "${tar_compress_opts[@]}" "${tar_checkpoint_opts[@]}" -xpf - -C "${restore_target}" "${restore_patterns[@]}"
+                    | tar "${tar_wildcard_opts[@]}" "${tar_occurrence_opts[@]}" --acls --xattrs "${tar_compress_opts[@]}" "${tar_checkpoint_opts[@]}" -xpf - -C "${restore_target}" "${restore_patterns[@]}"
             fi
         fi
         local staged_pipe_statuses=("${PIPESTATUS[@]}")
@@ -7204,7 +7275,7 @@ run_restore() {
     if [ "$gpg_exit_code" -ne 0 ] && [ "$gpg_exit_code" -ne 141 ]; then
         if [[ "$gpg_err_msg" == *"decryption failed"* || "$gpg_err_msg" == *"Bad session key"* || "$gpg_err_msg" == *"bad passphrase"* || "$gpg_err_msg" == *"No secret key"* ]]; then
             gpg_is_decryption_error=true
-        elif [[ "$gpg_err_msg" != *"Broken pipe"* && "$tar_exit_code" -eq 0 ]]; then
+        elif [[ "$gpg_err_msg" != *"[Bb]roken pipe"* && "$tar_exit_code" -eq 0 ]]; then
             gpg_is_decryption_error=true
         fi
     fi
@@ -7232,7 +7303,16 @@ run_restore() {
     fi
 
     # 4. Catch-all for any unhandled pipeline error (SIGPIPE or unexpected failure)
-    if [ "$tar_exit_code" -gt 1 ] || { [ "$gpg_exit_code" -ne 0 ] && [ "$gpg_exit_code" -ne 141 ]; } || { [ "$restore_source" = "cloud" ] && [ "$rclone_exit_code" -ne 0 ] && [ "$rclone_exit_code" -ne 141 ] && [[ "$rclone_err_msg" != *"broken pipe"* ]]; }; then
+    local gpg_pipeline_failed=false
+    if [ "$gpg_exit_code" -ne 0 ] && [ "$gpg_exit_code" -ne 141 ]; then
+        if [ "$tar_exit_code" -eq 0 ] && [[ "$gpg_err_msg" == *"[Bb]roken pipe"* ]]; then
+            gpg_pipeline_failed=false
+        else
+            gpg_pipeline_failed=true
+        fi
+    fi
+
+    if [ "$tar_exit_code" -gt 1 ] || [ "$gpg_pipeline_failed" = true ] || { [ "$restore_source" = "cloud" ] && [ "$rclone_exit_code" -ne 0 ] && [ "$rclone_exit_code" -ne 141 ] && [[ "$rclone_err_msg" != *"broken pipe"* ]]; }; then
         local ERROR_MSG="Extraction pipeline failed (rclone: ${rclone_exit_code}, gpg: ${gpg_exit_code}, tar: ${tar_exit_code})."
         log_message "$ERROR_MSG: ${gpg_err_msg}"
         echo "$ERROR_MSG" >&2
@@ -7243,7 +7323,9 @@ run_restore() {
 
     # 5. Validate inline streaming SHA-256 checksum if active
     if [ "$restore_source" = "cloud" ] && [ "$check_inline_checksum" = true ] && [ -n "$expected_stream_sha" ]; then
-        if [ -n "$actual_stream_sha" ] && [ "$actual_stream_sha" = "$expected_stream_sha" ]; then
+        if [ "$use_occurrence" = true ] && [ "$tar_exit_code" -eq 0 ]; then
+            log_message "Early-exit extraction (--occurrence) completed successfully; partial-stream SHA-256 validation skipped."
+        elif [ -n "$actual_stream_sha" ] && [ "$actual_stream_sha" = "$expected_stream_sha" ]; then
             echo "Cloud SHA-256 checksum verified OK (${actual_stream_sha:0:12}...) [single-pass inline stream]."
             log_message "Cloud SHA-256 checksum valid for ${ENCRYPTED_TARBALL_NAME} (single-pass inline stream)."
         else
@@ -12222,6 +12304,15 @@ init_config() {
 # Default: true
 #RESTORE_VERIFY_CHECKSUM="true"
 
+# Fast single-file and non-wildcard extraction via tar --occurrence=1.
+# Valid values:
+#   "auto"  - Automatically pass --occurrence=1 when all selective restore patterns are exact paths without wildcards (default)
+#   "true"  - Force --occurrence=1 for all selective extractions
+#   "false" - Disable early-exit optimization; always scan complete archive
+# Can also be overridden per-run via 'restore --occurrence[=N]' (-oc) or '--no-occurrence'.
+# Default: auto
+#RESTORE_FAST_OCCURRENCE="auto"
+
 # Preferred pager command for viewing archive file listings in interactive terminals.
 # Set to an empty string ("") to disable pagination by default.
 # Default: "${PAGER:-less -FRX}"
@@ -13469,6 +13560,22 @@ check_config() {
             ;;
     esac
 
+    # Restore Fast Occurrence Mode
+    case "${RESTORE_FAST_OCCURRENCE:-auto}" in
+        auto)
+            report_ok "Fast Single-File Restore" "Adaptive (passes --occurrence=1 automatically for exact non-wildcard file restores)"
+            ;;
+        true|1|yes)
+            report_ok "Fast Single-File Restore" "Enabled (always passes --occurrence=1 for selective extractions)"
+            ;;
+        false|0|no)
+            report_info "Fast Single-File Restore" "Disabled (always scans full archive to the end)"
+            ;;
+        *)
+            report_warn "Fast Single-File Restore" "Unrecognized RESTORE_FAST_OCCURRENCE setting '${RESTORE_FAST_OCCURRENCE}'"
+            ;;
+    esac
+
     case "${RUNNING_APPS_ACTION:-close}" in
         prompt|ask)
             report_ok "Apps Consistency (Interactive)" "Interactive prompt mode (prompts user when run in terminal)"
@@ -13910,6 +14017,9 @@ case "${1:-}" in
         echo "                                  --dest, -d, --target <dir>        Destination directory (default: $SOURCE_DIR)"
         echo "                                  --source, -s <local|cloud>        Force restore source (local drive or cloud)"
         echo "                                  --archive, -a <name|path>         Specify archive filename, path, or 'latest'"
+        echo "                                  --occurrence[=N], -oc [N]         Process only Nth occurrence (default: 1); stops"
+        echo "                                                                    archive decompression immediately after finding match"
+        echo "                                  --no-occurrence                   Scan complete archive for duplicates (disable early exit)"
         echo "                                  --verify-checksum, -vc            Verify SHA-256 sidecar checksum before restore"
         echo "                                  --no-verify-checksum, --no-vc     Skip pre-restore SHA-256 sidecar check"
         echo "                                  --stream                          Force single-pass cloud streaming without staging to scratch"
