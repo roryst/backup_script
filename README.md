@@ -777,6 +777,21 @@ Always protect existing working trees by restoring to a staging directory first:
 ./backup_script.sh restore latest --dest /tmp/restore_test
 ```
 
+#### 5. Fast Single-File Extraction (`--occurrence=1`)
+When extracting individual files or exact paths (e.g. `restore --pattern ".bashrc"` or `find-file <file> --restore`), GNU tar normally decompresses the entire multi-gigabyte archive from beginning to end in case duplicate entries exist.
+
+`backup_script.sh` features adaptive fast extraction:
+- **Adaptive Optimization (`RESTORE_FAST_OCCURRENCE="auto"`)**: When all requested patterns are exact paths without wildcards (`*`, `?`, `[`), the script automatically passes `--occurrence=1` to GNU tar. Tar immediately exits once the file is extracted, closing the pipe early and stopping `zstd`, `gpg`, and `rclone cat` streaming instantly.
+- **Explicit CLI Flag**: Force early exit via `--occurrence` / `--occurrence=N` (`-oc`) or disable early exit to scan for duplicate members via `--no-occurrence`.
+
+```bash
+# Fast extraction of a single file from cloud with early stream termination
+./backup_script.sh restore latest --pattern ".bashrc" --occurrence
+
+# Full archive scan for duplicate versions of a file
+./backup_script.sh restore latest --pattern ".bashrc" --no-occurrence
+```
+
 ---
 
 ### System Packages & State Restore (`restore-system`)
@@ -1175,6 +1190,7 @@ Key variables configurable in `~/.config/backup_script/config`:
 | `RESTART_CLOSED_APPS` | `false` | Automatically relaunch closed applications after archive creation completes (`true`/`false`) |
 | `STREAM_CLOUD_RESTORE`| `auto` | Cloud restore streaming policy (`auto`, `true`, `false`) |
 | `RESTORE_VERIFY_CHECKSUM`| `true` | Verify SHA-256 sidecar checksum before restoring |
+| `RESTORE_FAST_OCCURRENCE`| `auto` | Fast single-file extraction via `tar --occurrence=1` (`auto`, `true`, `false`) |
 | `ARCHIVE_LIST_PAGER` | `${PAGER:-less -FRX}` | Preferred pager command for viewing archive file listings |
 | `GENERATE_MANIFEST` | `true` | Generate companion JSON manifest (`.manifest.json`) with metadata and inventory |
 | `GENERATE_FILE_INDEX` | `true` | Generate companion file index (`.files.gz`) for fast zero-download search & listing |
