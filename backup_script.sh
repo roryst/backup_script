@@ -24,7 +24,7 @@
 #                 Usage: ./backup_script.sh [backup|restore|verify|list|stats|diff-backups|manifest|manage-preserved|pin|unpin|pinned|export-rclone-config|export-gpg-keys|init-config|check-config|help]
 #
 #        AUTHOR:  Rory Mobley, rorymobley5@gmail.com
-#       VERSION:  10.8.1
+#       VERSION:  10.8.5
 #==============================================================================
 
 #------------------------------------------------------------------------------
@@ -292,8 +292,8 @@ if [ -z "${TARGET_RUNNING_APPS+x}" ]; then
     TARGET_RUNNING_APPS=("${DEFAULT_TARGET_RUNNING_APPS[@]}")
 fi
 
-# Timeout (in seconds) to wait for applications to gracefully exit after SIGTERM (when action is 'close')
-RUNNING_APPS_SETTLE_TIMEOUT="${RUNNING_APPS_SETTLE_TIMEOUT:-10}"
+# Timeout (in seconds) to wait for applications to gracefully exit (when action is 'close')
+RUNNING_APPS_SETTLE_TIMEOUT="${RUNNING_APPS_SETTLE_TIMEOUT:-25}"
 
 # Automatically relaunch applications that were gracefully closed by the consistency guard
 # after archive creation finishes. (e.g. browsers, email clients)
@@ -343,7 +343,7 @@ MAIL_COMMAND="${MAIL_COMMAND:-auto}"
 EMAIL_ALERT_SENT=0
 
 # Script version identifier
-SCRIPT_VERSION="10.8.1"
+SCRIPT_VERSION="10.8.5"
 
 # Path to this script for self-invocation
 SCRIPT_PATH="$(realpath "${BASH_SOURCE[0]}")"
@@ -1292,6 +1292,129 @@ update_manifest_destination_status() {
 }
 
 #---
+#   FUNCTION:  escape_regex_literal()
+#  DESCRIPTION:  Escapes special regex metacharacters in a string so it can be safely
+#                used as a literal match in grep -E or bash regexes.
+#---
+escape_regex_literal() {
+    sed 's/[][()\.^$?*+{}|]/\\&/g' <<< "${1:-}"
+}
+
+#---
+#   FUNCTION:  get_archive_filename_regex()
+#  DESCRIPTION:  Returns an anchored ERE regex matching archive filenames strictly belonging
+#                to TARBALL_BASENAME with timestamp YYYY-MM-DD_HHMMSS (and optional retry/part suffix).
+#                Anchoring with ^ and strict timestamp matching prevents partial basename overlaps
+#                (e.g., host matching host_laptop) or leading prefix matches in shared directories.
+#---
+get_archive_filename_regex() {
+    local escaped_base
+    escaped_base=$(escape_regex_literal "$TARBALL_BASENAME")
+    echo "^${escaped_base}_[0-9]{4}-[0-9]{2}-[0-9]{2}_[0-9]{6}([-_][0-9]+)?\.tar\.(zst|gz|xz)\.gpg$"
+}
+
+#---
+#   FUNCTION:  get_archive_path_regex()
+#  DESCRIPTION:  Returns an ERE regex matching either a bare archive filename or a full file path
+#                strictly belonging to TARBALL_BASENAME (starts at line start or right after /).
+#---
+get_archive_path_regex() {
+    local escaped_base
+    escaped_base=$(escape_regex_literal "$TARBALL_BASENAME")
+    echo "(^|/)${escaped_base}_[0-9]{4}-[0-9]{2}-[0-9]{2}_[0-9]{6}([-_][0-9]+)?\.tar\.(zst|gz|xz)\.gpg$"
+}
+
+
+#---
+#   FUNCTION:  get_archive_lsf_sp_regex()
+#  DESCRIPTION:  Returns an anchored ERE regex matching "size;filename" output from
+#                rclone lsf --format "sp".
+#---
+get_archive_lsf_sp_regex() {
+    local escaped_base
+    escaped_base=$(escape_regex_literal "$TARBALL_BASENAME")
+    echo "^[0-9]+;${escaped_base}_[0-9]{4}-[0-9]{2}-[0-9]{2}_[0-9]{6}([-_][0-9]+)?\.tar\.(zst|gz|xz)\.gpg$"
+}
+
+#---
+#   FUNCTION:  get_archive_lsl_regex()
+#  DESCRIPTION:  Returns an ERE regex matching "size date time filename" lines from rclone lsl.
+#---
+get_archive_lsl_regex() {
+    local escaped_base
+    escaped_base=$(escape_regex_literal "$TARBALL_BASENAME")
+    echo "[[:space:]]${escaped_base}_[0-9]{4}-[0-9]{2}-[0-9]{2}_[0-9]{6}([-_][0-9]+)?\.tar\.(zst|gz|xz)\.gpg$"
+}
+
+#---
+#   FUNCTION:  get_pinned_filename_regex()
+#  DESCRIPTION:  Returns an anchored ERE regex matching .pinned marker filenames strictly
+#                belonging to TARBALL_BASENAME.
+#---
+get_pinned_filename_regex() {
+    local escaped_base
+    escaped_base=$(escape_regex_literal "$TARBALL_BASENAME")
+    echo "^${escaped_base}_[0-9]{4}-[0-9]{2}-[0-9]{2}_[0-9]{6}([-_][0-9]+)?(\.tar\.(zst|gz|xz)\.gpg)?\.pinned$"
+}
+
+#---
+#   FUNCTION:  get_pinned_path_regex()
+#  DESCRIPTION:  Returns an ERE regex matching either a bare .pinned filename or full file path
+#                strictly belonging to TARBALL_BASENAME (starts at line start or right after /).
+#---
+get_pinned_path_regex() {
+    local escaped_base
+    escaped_base=$(escape_regex_literal "$TARBALL_BASENAME")
+    echo "(^|/)${escaped_base}_[0-9]{4}-[0-9]{2}-[0-9]{2}_[0-9]{6}([-_][0-9]+)?(\.tar\.(zst|gz|xz)\.gpg)?\.pinned$"
+}
+
+
+#---
+#   FUNCTION:  get_pinned_lsl_regex()
+#  DESCRIPTION:  Returns an ERE regex matching .pinned lines from rclone lsl.
+#---
+get_pinned_lsl_regex() {
+    local escaped_base
+    escaped_base=$(escape_regex_literal "$TARBALL_BASENAME")
+    echo "[[:space:]]${escaped_base}_[0-9]{4}-[0-9]{2}-[0-9]{2}_[0-9]{6}([-_][0-9]+)?(\.tar\.(zst|gz|xz)\.gpg)?\.pinned$"
+}
+
+
+#---
+#   FUNCTION:  get_manifest_filename_regex()
+#  DESCRIPTION:  Returns an anchored ERE regex matching manifest filenames strictly
+#                belonging to TARBALL_BASENAME.
+#---
+get_manifest_filename_regex() {
+    local escaped_base
+    escaped_base=$(escape_regex_literal "$TARBALL_BASENAME")
+    echo "^${escaped_base}_[0-9]{4}-[0-9]{2}-[0-9]{2}_[0-9]{6}([-_][0-9]+)?(\.tar\.(zst|gz|xz)\.gpg)?\.manifest\.json$"
+}
+
+#---
+#   FUNCTION:  get_manifest_path_regex()
+#  DESCRIPTION:  Returns an ERE regex matching either a bare manifest filename or full file path
+#                strictly belonging to TARBALL_BASENAME (starts at line start or right after /).
+#---
+get_manifest_path_regex() {
+    local escaped_base
+    escaped_base=$(escape_regex_literal "$TARBALL_BASENAME")
+    echo "(^|/)${escaped_base}_[0-9]{4}-[0-9]{2}-[0-9]{2}_[0-9]{6}([-_][0-9]+)?(\.tar\.(zst|gz|xz)\.gpg)?\.manifest\.json$"
+}
+
+
+#---
+#   FUNCTION:  get_file_index_regex()
+#  DESCRIPTION:  Returns an anchored ERE regex matching .files.gz filenames strictly
+#                belonging to TARBALL_BASENAME.
+#---
+get_file_index_regex() {
+    local escaped_base
+    escaped_base=$(escape_regex_literal "$TARBALL_BASENAME")
+    echo "^${escaped_base}_[0-9]{4}-[0-9]{2}-[0-9]{2}_[0-9]{6}([-_][0-9]+)?(\.tar\.(zst|gz|xz)\.gpg)?\.files\.gz$"
+}
+
+#---
 #   FUNCTION:  calculate_tiered_retention_prune_list()
 #  DESCRIPTION:  Evaluates a list of backup archive filenames and determines which
 #                archives to prune based on Grandfather-Father-Son (GFS) tiered retention:
@@ -1423,9 +1546,28 @@ calculate_tiered_retention_prune_list() {
 #                Supports count-based retention (default) and GFS tiered retention.
 #---
 run_rotation() {
+    local expected_archive="${1:-${ENCRYPTED_TARBALL_NAME:-${target_name:-}}}"
+    local expected_base=""
+    [ -n "$expected_archive" ] && expected_base="$(basename "$expected_archive")"
+
     local -a files_to_delete=()
     local cloud_listing=""
-    cloud_listing=$(rclone lsf --fast-list "${BACKUP_DIR}" 2>/dev/null)
+    local lsf_err=""
+    local lsf_status=0
+    local lsf_err_file
+
+    lsf_err_file=$(mktemp "${TMPDIR:-/tmp}/rclone_lsf_err.XXXXXX")
+    cloud_listing=$(rclone lsf --fast-list "${BACKUP_DIR}" 2>"$lsf_err_file")
+    lsf_status=$?
+    lsf_err=$(<"$lsf_err_file")
+    rm -f "$lsf_err_file"
+
+    if [ "$lsf_status" -ne 0 ]; then
+        local err_detail="${lsf_err:-${cloud_listing}}"
+        log_message "ERROR: Cloud rotation aborted. Failed to query cloud storage (${BACKUP_DIR}) with rclone lsf (exit code ${lsf_status}): ${err_detail}"
+        echo "ERROR: Cloud rotation aborted. Failed to query cloud storage (${BACKUP_DIR}): ${err_detail}" >&2
+        return 1
+    fi
 
     # Discover pinned archives and index existing files on cloud remote
     local -A cloud_pinned_map=()
@@ -1439,6 +1581,16 @@ run_rotation() {
         fi
     done <<< "$cloud_listing"
 
+    # Confirm the just-uploaded archive exists remotely before rotating anything
+    if [ -n "$expected_base" ]; then
+        if [ -z "${cloud_files_map[$expected_base]+x}" ]; then
+            log_message "CRITICAL SAFETY: Just-uploaded archive '${expected_base}' was not found in remote cloud listing (${BACKUP_DIR}). Cloud rotation ABORTED to prevent data loss."
+            echo "ERROR: Cloud rotation aborted! Just-uploaded archive '${expected_base}' was not found on remote storage (${BACKUP_DIR})." >&2
+            return 1
+        fi
+        log_message "Verified just-uploaded archive '${expected_base}' exists remotely on ${BACKUP_DIR} before proceeding with rotation."
+    fi
+
     # Filter unpinned candidates for rotation evaluation
     local -a candidate_cloud_files=()
     while IFS= read -r cloud_arch; do
@@ -1448,7 +1600,7 @@ run_rotation() {
         else
             candidate_cloud_files+=("$cloud_arch")
         fi
-    done < <(grep -E "${TARBALL_BASENAME}_.*\.tar\.(zst|gz|xz)\.gpg$" <<< "$cloud_listing")
+    done < <(grep -E "$(get_archive_filename_regex)" <<< "$cloud_listing")
 
     if [ "$RETENTION_MODE" = "tiered" ] || [ "$RETENTION_MODE" = "gfs" ]; then
         log_message "Running tiered cloud backup rotation (daily=${RETENTION_DAILY:-7}, weekly=${RETENTION_WEEKLY:-4}, monthly=${RETENTION_MONTHLY:-6}, yearly=${RETENTION_YEARLY:-1})."
@@ -1468,6 +1620,10 @@ run_rotation() {
 
     for file_to_delete in "${files_to_delete[@]}"; do
         [ -z "$file_to_delete" ] && continue
+        if [ -n "$expected_base" ] && [ "$file_to_delete" = "$expected_base" ]; then
+            log_message "CRITICAL SAFETY: Prevented deletion of just-uploaded archive: ${file_to_delete}"
+            continue
+        fi
         if [ -n "${cloud_pinned_map[$file_to_delete]+x}" ]; then
             log_message "SAFETY: Skipped deletion of pinned cloud archive: ${file_to_delete}"
             continue
@@ -1523,6 +1679,82 @@ get_local_backup_path() {
 }
 
 #---
+#   FUNCTION:  run_local_rotation()
+#  DESCRIPTION:  Prunes old backups on local drive, keeping recent ones.
+#                Supports count-based retention (default) and GFS tiered retention.
+#---
+run_local_rotation() {
+    local expected_archive="${1:-${ENCRYPTED_TARBALL_NAME:-}}"
+    local expected_base=""
+    [ -n "$expected_archive" ] && expected_base="$(basename "$expected_archive")"
+
+    local local_backup_path
+    if ! local_backup_path=$(get_local_backup_path 2>/dev/null) || [ -z "$local_backup_path" ] || [ ! -d "$local_backup_path" ]; then
+        return 0
+    fi
+
+    # Confirm the just-backed-up archive exists on local drive before rotating anything
+    if [ -n "$expected_base" ]; then
+        if [ ! -f "${local_backup_path}/${expected_base}" ]; then
+            log_message "CRITICAL SAFETY: Just-backed-up archive '${expected_base}' was not found in ${local_backup_path}. Local rotation ABORTED to prevent data loss."
+            echo "ERROR: Local rotation aborted! Just-backed-up archive '${expected_base}' was not found on local drive (${local_backup_path})." >&2
+            return 1
+        fi
+        log_message "Verified just-backed-up archive '${expected_base}' exists in ${local_backup_path} before proceeding with rotation."
+    fi
+
+    local -a local_files_to_delete=()
+    local -a all_found_local=()
+    mapfile -t all_found_local < <(find "${local_backup_path}" -maxdepth 1 -type f \( -name "${TARBALL_BASENAME}_*.tar.zst.gpg" -o -name "${TARBALL_BASENAME}_*.tar.gz.gpg" -o -name "${TARBALL_BASENAME}_*.tar.xz.gpg" \) -printf "%f\n" 2>/dev/null | grep -E "$(get_archive_filename_regex)")
+
+    local -a candidate_local_files=()
+    for f in "${all_found_local[@]}"; do
+        [ -z "$f" ] && continue
+        if [ -f "${local_backup_path}/${f}.pinned" ]; then
+            log_message "Local archive '${f}' is pinned (retention hold); exempt from rotation."
+        else
+            candidate_local_files+=("$f")
+        fi
+    done
+
+    if [ "$RETENTION_MODE" = "tiered" ] || [ "$RETENTION_MODE" = "gfs" ]; then
+        echo "Running tiered local backup rotation (daily=${RETENTION_DAILY:-7}, weekly=${RETENTION_WEEKLY:-4}, monthly=${RETENTION_MONTHLY:-6}, yearly=${RETENTION_YEARLY:-1})..."
+        log_message "Running tiered local backup rotation (daily=${RETENTION_DAILY:-7}, weekly=${RETENTION_WEEKLY:-4}, monthly=${RETENTION_MONTHLY:-6}, yearly=${RETENTION_YEARLY:-1})."
+        mapfile -t local_files_to_delete < <(printf '%s\n' "${candidate_local_files[@]}" | calculate_tiered_retention_prune_list)
+    else
+        if [ "${LOCAL_KEEP_COUNT:-0}" -gt 0 ] 2>/dev/null; then
+            echo "Running local backup rotation (keeping ${LOCAL_KEEP_COUNT})..."
+            log_message "Running local backup rotation. Keeping the latest ${LOCAL_KEEP_COUNT} backups."
+            mapfile -t local_files_to_delete < <(printf '%s\n' "${candidate_local_files[@]}" | sort | head -n -"${LOCAL_KEEP_COUNT}")
+        else
+            log_message "WARNING: Local backup rotation skipped. LOCAL_KEEP_COUNT must be a positive integer (currently '${LOCAL_KEEP_COUNT}')."
+            echo "Local backup rotation skipped (invalid or zero keep count)."
+            return 0
+        fi
+    fi
+
+    for old_file in "${local_files_to_delete[@]}"; do
+        [ -z "$old_file" ] && continue
+        if [ -n "$expected_base" ] && [ "$old_file" = "$expected_base" ]; then
+            log_message "CRITICAL SAFETY: Prevented deletion of just-backed-up local archive: ${old_file}"
+            continue
+        fi
+        if [ -f "${local_backup_path}/${old_file}.pinned" ]; then
+            log_message "SAFETY: Skipped deletion of pinned local archive: ${old_file}"
+            continue
+        fi
+        log_message "Deleting old local backup: ${old_file}"
+        rm -f "${local_backup_path}/${old_file}"
+        rm -f "${local_backup_path}/${old_file}.sha256"
+        rm -f "${local_backup_path}/${old_file}.manifest.json"
+        rm -f "${local_backup_path}/${old_file}.files.gz"
+        rm -f "${local_backup_path}/${old_file}.pinned"
+    done
+    sync -f "${local_backup_path}" 2>/dev/null || sync
+    log_message "Local backup rotation complete."
+}
+
+#---
 #   FUNCTION:  get_preserved_archives()
 #  DESCRIPTION:  Finds preserved backup archives from previous failed uploads
 #                in SOURCE_DIR. Prints matching file paths, newest first.
@@ -1532,7 +1764,7 @@ get_preserved_archives() {
         -name "${TARBALL_BASENAME}_*.tar.zst.gpg" -o \
         -name "${TARBALL_BASENAME}_*.tar.gz.gpg" -o \
         -name "${TARBALL_BASENAME}_*.tar.xz.gpg" \
-    \) 2>/dev/null | sort -r
+    \) 2>/dev/null | grep -E "$(get_archive_path_regex)" | sort -r
 }
 
 #---
@@ -1558,7 +1790,7 @@ get_previous_backup_info() {
             -name "${TARBALL_BASENAME}_*.tar.zst.gpg" -o \
             -name "${TARBALL_BASENAME}_*.tar.gz.gpg" -o \
             -name "${TARBALL_BASENAME}_*.tar.xz.gpg" \
-        \) -printf "%s;%f\n" 2>/dev/null)
+        \) -printf "%s;%f\n" 2>/dev/null | grep -E "$(get_archive_lsf_sp_regex)")
     fi
 
     # 2. Check preserved archives in SOURCE_DIR
@@ -1568,13 +1800,13 @@ get_previous_backup_info() {
         -name "${TARBALL_BASENAME}_*.tar.zst.gpg" -o \
         -name "${TARBALL_BASENAME}_*.tar.gz.gpg" -o \
         -name "${TARBALL_BASENAME}_*.tar.xz.gpg" \
-    \) -printf "%s;%f\n" 2>/dev/null)
+    \) -printf "%s;%f\n" 2>/dev/null | grep -E "$(get_archive_lsf_sp_regex)")
 
     # 3. Fallback to cloud remote if no local candidates found and cloud is available
     if [ ${#candidates[@]} -eq 0 ] && [ "${cloud_available:-true}" = true ]; then
         while IFS= read -r line; do
             [ -n "$line" ] && candidates+=("$line")
-        done < <(rclone lsf --format "sp" --fast-list --contimeout 5s --timeout 15s "${BACKUP_DIR}" 2>/dev/null | grep -E "${TARBALL_BASENAME}_.*\.tar\.(zst|gz|xz)\.gpg$")
+        done < <(rclone lsf --format "sp" --fast-list --contimeout 5s --timeout 15s "${BACKUP_DIR}" 2>/dev/null | grep -E "$(get_archive_lsf_sp_regex)")
     fi
 
     [ ${#candidates[@]} -eq 0 ] && return 1
@@ -2093,6 +2325,7 @@ mirror_script_and_cheatsheet_to_cloud() {
 handle_local_backup() {
     local file_path="$1"
     local file_name="$2"
+    local defer_rotation="${3:-false}"
 
     if [ -z "$LOCAL_DRIVE_UUID" ]; then
         log_message "Local drive backup skipped (LOCAL_DRIVE_UUID not configured)."
@@ -2210,53 +2443,13 @@ handle_local_backup() {
                 fi
             fi
             
-            # Local Rotation
-            local -a local_files_to_delete=()
-            local -a all_found_local=()
-            mapfile -t all_found_local < <(find "${local_backup_path}" -maxdepth 1 -type f \( -name "${TARBALL_BASENAME}_*.tar.zst.gpg" -o -name "${TARBALL_BASENAME}_*.tar.gz.gpg" -o -name "${TARBALL_BASENAME}_*.tar.xz.gpg" \) -printf "%f\n" 2>/dev/null)
-
-            local -a candidate_local_files=()
-            for f in "${all_found_local[@]}"; do
-                [ -z "$f" ] && continue
-                if [ -f "${local_backup_path}/${f}.pinned" ]; then
-                    log_message "Local archive '${f}' is pinned (retention hold); exempt from rotation."
-                else
-                    candidate_local_files+=("$f")
-                fi
-            done
-
-            if [ "$RETENTION_MODE" = "tiered" ] || [ "$RETENTION_MODE" = "gfs" ]; then
-                echo "Running tiered local backup rotation (daily=${RETENTION_DAILY:-7}, weekly=${RETENTION_WEEKLY:-4}, monthly=${RETENTION_MONTHLY:-6}, yearly=${RETENTION_YEARLY:-1})..."
-                log_message "Running tiered local backup rotation (daily=${RETENTION_DAILY:-7}, weekly=${RETENTION_WEEKLY:-4}, monthly=${RETENTION_MONTHLY:-6}, yearly=${RETENTION_YEARLY:-1})."
-                mapfile -t local_files_to_delete < <(printf '%s\n' "${candidate_local_files[@]}" | calculate_tiered_retention_prune_list)
-            else
-                if [ "${LOCAL_KEEP_COUNT:-0}" -gt 0 ] 2>/dev/null; then
-                    echo "Running local backup rotation (keeping ${LOCAL_KEEP_COUNT})..."
-                    log_message "Running local backup rotation. Keeping the latest ${LOCAL_KEEP_COUNT} backups."
-                    mapfile -t local_files_to_delete < <(printf '%s\n' "${candidate_local_files[@]}" | sort | head -n -"${LOCAL_KEEP_COUNT}")
-                else
-                    log_message "WARNING: Local backup rotation skipped. LOCAL_KEEP_COUNT must be a positive integer (currently '${LOCAL_KEEP_COUNT}')."
-                    echo "Local backup rotation skipped (invalid or zero keep count)."
-                fi
-            fi
-
-            for old_file in "${local_files_to_delete[@]}"; do
-                [ -z "$old_file" ] && continue
-                if [ -f "${local_backup_path}/${old_file}.pinned" ]; then
-                    log_message "SAFETY: Skipped deletion of pinned local archive: ${old_file}"
-                    continue
-                fi
-                log_message "Deleting old local backup: ${old_file}"
-                rm -f "${local_backup_path}/${old_file}"
-                rm -f "${local_backup_path}/${old_file}.sha256"
-                rm -f "${local_backup_path}/${old_file}.manifest.json"
-                rm -f "${local_backup_path}/${old_file}.files.gz"
-                rm -f "${local_backup_path}/${old_file}.pinned"
-            done
-            sync -f "${local_backup_path}" 2>/dev/null || sync
-
             # Disaster Recovery: Mirror standalone script and cheatsheet to local backup drive
             mirror_script_and_cheatsheet "${local_backup_path}"
+
+            # If rotation is not deferred for post-backup verification, execute local rotation now
+            if [ "$defer_rotation" != "true" ]; then
+                run_local_rotation "${file_name}"
+            fi
 
             return 0
         else
@@ -2382,7 +2575,7 @@ upload_preserved_archive() {
         log_message "Preserved archive upload completed successfully: ${target_name} (${target_hr} in ${duration_str})"
         echo "Upload of ${target_name} succeeded in ${duration_str}!"
         rm -f "${target_file}" "${target_sha256}" "${target_manifest}" "${target_index}" "${target_pin}"
-        run_rotation
+        run_rotation "${target_name}"
         send_notification "normal" "Backup Upload Succeeded" "Preserved archive ${target_name} (${target_hr}) successfully uploaded in ${duration_str}." "drive-harddisk"
         return 0
     else
@@ -2697,12 +2890,13 @@ checkpoint_running_app_databases() {
 #  DESCRIPTION:  Detects active applications with open databases or write activity (e.g. browsers,
 #                email clients) prior to archiving. Depending on RUNNING_APPS_ACTION ('prompt',
 #                'close', 'sync', 'ignore') and UNATTENDED_APPS_ACTION (during non-interactive / timer runs),
-#                either prompts user interactively, terminates apps gracefully with SIGTERM (targeting
-#                root browser processes first to avoid crash recovery prompts), or flushes WAL/filesystem buffers.
+#                either prompts user interactively, terminates apps gently via a 3-stage sequence (Stage 1:
+#                Window Manager _NET_CLOSE_WINDOW via wmctrl, Stage 2: root-only SIGTERM, Stage 3: settle wait),
+#                or flushes SQLite WAL and filesystem buffers.
 #---
 handle_running_applications() {
     local action="${1:-${RUNNING_APPS_ACTION:-close}}"
-    local settle_timeout="${RUNNING_APPS_SETTLE_TIMEOUT:-10}"
+    local settle_timeout="${RUNNING_APPS_SETTLE_TIMEOUT:-25}"
     local synced=false
 
     # Check whether running in an interactive terminal or unattended (cron, timer, background)
@@ -2835,15 +3029,107 @@ handle_running_applications() {
         fi
 
         if [ "$action" = "close" ]; then
-            echo "Closing active application(s) gracefully..."
-            local any_closed=false
+            echo "Closing active application(s) gently (Stage 1: Window close, Stage 2: Root SIGTERM, Stage 3: Settle)..."
+            local any_attempted=false
+
+            # --- Stage 1: Window Manager Polite Close (_NET_CLOSE_WINDOW via wmctrl) ---
+            # If a graphical display is available and wmctrl is installed, politely request the window manager
+            # to close all windows belonging to the target application(s). This is equivalent to clicking "X"
+            # or pressing Alt+F4 / Ctrl+Q. It triggers the browser's normal UI teardown: saving open tabs,
+            # committing SQLite WAL checkpoints, setting 'exit_type: Normal' in Preferences, and letting the
+            # browser cleanly terminate its own child processes without crash flags or profile corruption.
+            if command -v wmctrl &>/dev/null && [ -n "${DISPLAY:-${WAYLAND_DISPLAY:-}}" ]; then
+                local -a wmctrl_lp_output=()
+                mapfile -t wmctrl_lp_output < <(wmctrl -lp 2>/dev/null)
+                local -a wmctrl_lx_output=()
+                mapfile -t wmctrl_lx_output < <(wmctrl -lx 2>/dev/null)
+
+                for app in "${running_detected[@]}"; do
+                    local app_pids=()
+                    mapfile -t app_pids < <(get_active_app_pids "$app")
+                    [ ${#app_pids[@]} -eq 0 ] && continue
+
+                    local -a win_ids=()
+                    # 1. Match windows by PID in active process tree
+                    for line in "${wmctrl_lp_output[@]}"; do
+                        local w_id w_pid
+                        w_id=$(awk '{print $1}' <<< "$line")
+                        w_pid=$(awk '{print $3}' <<< "$line")
+                        for ap in "${app_pids[@]}"; do
+                            if [ "$w_pid" = "$ap" ]; then
+                                win_ids+=("$w_id")
+                                break
+                            fi
+                        done
+                    done
+
+                    # 2. If no window matched by PID (e.g. PID not exported by window manager), match by WM_CLASS
+                    if [ ${#win_ids[@]} -eq 0 ]; then
+                        local wm_pattern=""
+                        case "$app" in
+                            vivaldi*|vivaldi-bin*) wm_pattern="[Vv]ivaldi" ;;
+                            chrome*|google-chrome*) wm_pattern="[Gg]oogle-chrome|[Cc]hrome" ;;
+                            chromium*) wm_pattern="[Cc]hromium" ;;
+                            firefox*|firefox-bin*|firefox-esr*) wm_pattern="[Ff]irefox" ;;
+                            thunderbird*|thunderbird-bin*) wm_pattern="[Tt]hunderbird" ;;
+                            brave*|brave-browser*) wm_pattern="[Bb]rave" ;;
+                            opera*) wm_pattern="[Oo]pera" ;;
+                            *) wm_pattern="$app" ;;
+                        esac
+                        for line in "${wmctrl_lx_output[@]}"; do
+                            local w_id w_class
+                            w_id=$(awk '{print $1}' <<< "$line")
+                            w_class=$(awk '{print $3}' <<< "$line")
+                            if [[ "$w_class" =~ $wm_pattern ]]; then
+                                win_ids+=("$w_id")
+                            fi
+                        done
+                    fi
+
+                    if [ ${#win_ids[@]} -gt 0 ]; then
+                        log_message "Stage 1: Requesting graceful window close via wmctrl for '$app' (${#win_ids[@]} window(s))..."
+                        echo "  Stage 1: Requesting graceful window close for $app (${#win_ids[@]} window(s))..."
+                        for wid in "${win_ids[@]}"; do
+                            wmctrl -ic "$wid" 2>/dev/null || true
+                        done
+                        any_attempted=true
+                        local already_tracked=false
+                        for ca in "${ACTUALLY_CLOSED_APPS[@]}"; do
+                            [ "$ca" = "$app" ] && already_tracked=true && break
+                        done
+                        [ "$already_tracked" = false ] && ACTUALLY_CLOSED_APPS+=("$app")
+                    fi
+                done
+
+                # If windows were closed, wait up to 8 seconds for application(s) to exit cleanly via UI
+                if [ "$any_attempted" = true ]; then
+                    echo "  Waiting up to 8s for window manager clean exit..."
+                    local wm_wait=0
+                    while [ "$wm_wait" -lt 8 ]; do
+                        local still_active=0
+                        for app in "${running_detected[@]}"; do
+                            if get_active_app_pids "$app" &>/dev/null; then
+                                still_active=1
+                                break
+                            fi
+                        done
+                        [ "$still_active" -eq 0 ] && break
+                        sleep 1
+                        ((wm_wait++))
+                    done
+                fi
+            fi
+
+            # --- Stage 2: Fallback SIGTERM strictly to Root / Parent process(es) ---
+            # For any applications still active (or running in headless / non-GUI environments),
+            # send SIGTERM ONLY to root/parent browser processes. Crucially: NEVER send SIGTERM directly
+            # to child worker/renderer/utility processes, as external termination of child processes causes
+            # Chromium's crash handler (Crashpad) to flag abnormal termination, record crash reports, write
+            # 'exit_type: Crashed' into Preferences, and leave SQLite/LevelDB databases half-flushed.
             for app in "${running_detected[@]}"; do
                 local app_pids=()
                 mapfile -t app_pids < <(get_active_app_pids "$app")
                 if [ ${#app_pids[@]} -gt 0 ]; then
-                    # Separate root/main parent processes from child workers/renderers.
-                    # Signaling the main browser process allows it to set clean shutdown flags and
-                    # terminate its own child processes cleanly, avoiding "Restore Session?" crash prompts.
                     local main_pids=()
                     for pid in "${app_pids[@]}"; do
                         local ppid
@@ -2859,9 +3145,10 @@ handle_running_applications() {
                     done
                     [ ${#main_pids[@]} -eq 0 ] && main_pids=("${app_pids[@]}")
 
-                    log_message "Sending SIGTERM to main process(es) of '$app' (PID(s): ${main_pids[*]})..."
+                    log_message "Stage 2: Sending SIGTERM to root process(es) of '$app' (PID(s): ${main_pids[*]})..."
+                    echo "  Stage 2: Sending SIGTERM to root process(es) of $app (PID(s): ${main_pids[*]})..."
                     if kill -TERM "${main_pids[@]}" 2>/dev/null; then
-                        any_closed=true
+                        any_attempted=true
                         local already_tracked=false
                         for ca in "${ACTUALLY_CLOSED_APPS[@]}"; do
                             [ "$ca" = "$app" ] && already_tracked=true && break
@@ -2871,8 +3158,11 @@ handle_running_applications() {
                 fi
             done
 
-            if [ "$any_closed" = true ]; then
-                echo "Waiting up to ${settle_timeout}s for applications to write state and exit..."
+            # --- Stage 3: Settle wait & Safe State Verification ---
+            # Allow generous settle timeout (default 25s) for applications to write state and flush databases.
+            # Child processes will exit naturally as their parent terminates; no aggressive child-killing is done.
+            if [ "$any_attempted" = true ]; then
+                echo "Waiting up to ${settle_timeout}s for applications to write state and exit cleanly..."
                 local waited=0
                 while [ "$waited" -lt "$settle_timeout" ]; do
                     local still_running=0
@@ -2883,23 +3173,11 @@ handle_running_applications() {
                         fi
                     done
                     [ "$still_running" -eq 0 ] && break
-
-                    # If after 4 seconds child processes still linger, send SIGTERM to remaining PIDs
-                    if [ "$waited" -ge 4 ]; then
-                        for app in "${running_detected[@]}"; do
-                            local rem_pids=()
-                            mapfile -t rem_pids < <(get_active_app_pids "$app")
-                            if [ ${#rem_pids[@]} -gt 0 ]; then
-                                kill -TERM "${rem_pids[@]}" 2>/dev/null || true
-                            fi
-                        done
-                    fi
-
                     sleep 1
                     ((waited++))
                 done
 
-                # Check if any stubborn processes remain
+                # Check if any applications stubbornly remain after the full settle timeout
                 local remaining=()
                 for app in "${running_detected[@]}"; do
                     if get_active_app_pids "$app" &>/dev/null; then
@@ -2907,8 +3185,21 @@ handle_running_applications() {
                     fi
                 done
                 if [ ${#remaining[@]} -gt 0 ]; then
-                    log_message "WARNING: Process(es) still running after ${settle_timeout}s: ${remaining[*]}."
-                    echo "WARNING: ${remaining[*]} still active after ${settle_timeout}s. Continuing..."
+                    log_message "WARNING: Process(es) still running after ${settle_timeout}s: ${remaining[*]}. Leaving active to prevent corruption."
+                    echo "WARNING: ${remaining[*]} still active after ${settle_timeout}s. Performing passive SQLite WAL checkpoint instead..."
+                    # Perform passive SQLite WAL checkpoints for remaining apps to preserve consistent state
+                    checkpoint_running_app_databases "${remaining[@]}"
+
+                    # Remove lingering apps from ACTUALLY_CLOSED_APPS so relaunch won't cause profile lock collisions (SingletonLock)
+                    local -a confirmed_closed=()
+                    for ca in "${ACTUALLY_CLOSED_APPS[@]}"; do
+                        local still_active=false
+                        for rem in "${remaining[@]}"; do
+                            [ "$ca" = "$rem" ] && still_active=true && break
+                        done
+                        [ "$still_active" = false ] && confirmed_closed+=("$ca")
+                    done
+                    ACTUALLY_CLOSED_APPS=("${confirmed_closed[@]}")
                 else
                     log_message "All target applications exited cleanly."
                     echo "Target application(s) closed cleanly."
@@ -2993,61 +3284,69 @@ relaunch_closed_applications() {
         local desktop_candidates=()
         case "$app" in
             vivaldi-bin|vivaldi|vivaldi-snapshot)
-                if [ -n "${SAVED_APP_REAL_EXES[$app]:-}" ] && command -v "${SAVED_APP_REAL_EXES[$app]}" &>/dev/null; then
-                    bin="${SAVED_APP_REAL_EXES[$app]}"
-                elif command -v vivaldi &>/dev/null; then
+                if command -v vivaldi &>/dev/null; then
                     bin="vivaldi"
                 elif command -v vivaldi-stable &>/dev/null; then
                     bin="vivaldi-stable"
                 elif command -v vivaldi-snapshot &>/dev/null; then
                     bin="vivaldi-snapshot"
+                elif [ -n "${SAVED_APP_REAL_EXES[$app]:-}" ] && command -v "${SAVED_APP_REAL_EXES[$app]}" &>/dev/null; then
+                    bin="${SAVED_APP_REAL_EXES[$app]}"
                 fi
                 desktop_candidates=("vivaldi-stable" "vivaldi" "vivaldi-snapshot")
                 ;;
             firefox-bin|firefox|firefox-esr)
-                if [ -n "${SAVED_APP_REAL_EXES[$app]:-}" ] && command -v "${SAVED_APP_REAL_EXES[$app]}" &>/dev/null; then
-                    bin="${SAVED_APP_REAL_EXES[$app]}"
-                elif command -v firefox &>/dev/null; then
+                if command -v firefox &>/dev/null; then
                     bin="firefox"
                 elif command -v firefox-esr &>/dev/null; then
                     bin="firefox-esr"
+                elif [ -n "${SAVED_APP_REAL_EXES[$app]:-}" ] && command -v "${SAVED_APP_REAL_EXES[$app]}" &>/dev/null; then
+                    bin="${SAVED_APP_REAL_EXES[$app]}"
                 fi
                 desktop_candidates=("firefox" "firefox-esr")
                 ;;
             chrome|google-chrome)
-                if [ -n "${SAVED_APP_REAL_EXES[$app]:-}" ] && command -v "${SAVED_APP_REAL_EXES[$app]}" &>/dev/null; then
-                    bin="${SAVED_APP_REAL_EXES[$app]}"
-                elif command -v google-chrome &>/dev/null; then
+                if command -v google-chrome &>/dev/null; then
                     bin="google-chrome"
+                elif command -v google-chrome-stable &>/dev/null; then
+                    bin="google-chrome-stable"
                 elif command -v chrome &>/dev/null; then
                     bin="chrome"
                 elif command -v chromium &>/dev/null; then
                     bin="chromium"
+                elif [ -n "${SAVED_APP_REAL_EXES[$app]:-}" ] && command -v "${SAVED_APP_REAL_EXES[$app]}" &>/dev/null; then
+                    bin="${SAVED_APP_REAL_EXES[$app]}"
                 fi
                 desktop_candidates=("google-chrome" "google-chrome-stable" "chrome" "chromium")
                 ;;
             brave|brave-browser)
-                if [ -n "${SAVED_APP_REAL_EXES[$app]:-}" ] && command -v "${SAVED_APP_REAL_EXES[$app]}" &>/dev/null; then
-                    bin="${SAVED_APP_REAL_EXES[$app]}"
-                elif command -v brave-browser &>/dev/null; then
+                if command -v brave-browser &>/dev/null; then
                     bin="brave-browser"
                 elif command -v brave &>/dev/null; then
                     bin="brave"
+                elif [ -n "${SAVED_APP_REAL_EXES[$app]:-}" ] && command -v "${SAVED_APP_REAL_EXES[$app]}" &>/dev/null; then
+                    bin="${SAVED_APP_REAL_EXES[$app]}"
                 fi
                 desktop_candidates=("brave-browser" "brave")
                 ;;
             chromium|chromium-browser)
-                if [ -n "${SAVED_APP_REAL_EXES[$app]:-}" ] && command -v "${SAVED_APP_REAL_EXES[$app]}" &>/dev/null; then
-                    bin="${SAVED_APP_REAL_EXES[$app]}"
-                elif command -v chromium &>/dev/null; then
+                if command -v chromium &>/dev/null; then
                     bin="chromium"
                 elif command -v chromium-browser &>/dev/null; then
                     bin="chromium-browser"
+                elif [ -n "${SAVED_APP_REAL_EXES[$app]:-}" ] && command -v "${SAVED_APP_REAL_EXES[$app]}" &>/dev/null; then
+                    bin="${SAVED_APP_REAL_EXES[$app]}"
                 fi
                 desktop_candidates=("chromium" "chromium-browser")
                 ;;
             opera|opera-beta|opera-developer)
-                if [ -n "${SAVED_APP_REAL_EXES[$app]:-}" ] && command -v "${SAVED_APP_REAL_EXES[$app]}" &>/dev/null; then
+                if command -v opera &>/dev/null; then
+                    bin="opera"
+                elif command -v opera-beta &>/dev/null; then
+                    bin="opera-beta"
+                elif command -v opera-developer &>/dev/null; then
+                    bin="opera-developer"
+                elif [ -n "${SAVED_APP_REAL_EXES[$app]:-}" ] && command -v "${SAVED_APP_REAL_EXES[$app]}" &>/dev/null; then
                     bin="${SAVED_APP_REAL_EXES[$app]}"
                 else
                     bin="$app"
@@ -3055,10 +3354,10 @@ relaunch_closed_applications() {
                 desktop_candidates=("$app" "opera")
                 ;;
             thunderbird|thunderbird-bin)
-                if [ -n "${SAVED_APP_REAL_EXES[$app]:-}" ] && command -v "${SAVED_APP_REAL_EXES[$app]}" &>/dev/null; then
-                    bin="${SAVED_APP_REAL_EXES[$app]}"
-                elif command -v thunderbird &>/dev/null; then
+                if command -v thunderbird &>/dev/null; then
                     bin="thunderbird"
+                elif [ -n "${SAVED_APP_REAL_EXES[$app]:-}" ] && command -v "${SAVED_APP_REAL_EXES[$app]}" &>/dev/null; then
+                    bin="${SAVED_APP_REAL_EXES[$app]}"
                 fi
                 desktop_candidates=("thunderbird")
                 ;;
@@ -3101,6 +3400,14 @@ relaunch_closed_applications() {
             [ "$done_app" = "$bin" ] && already_done=true && break
         done
         [ "$already_done" = true ] && continue
+
+        # Safety check: if an active instance is already running (e.g. started by user during backup),
+        # skip relaunching to prevent duplicate profile collisions (SingletonLock corruption)
+        if get_active_app_pids "$app" &>/dev/null || get_active_app_pids "$bin" &>/dev/null; then
+            log_message "Notice: Application '$app' ($bin) is already active; skipping relaunch."
+            echo "  Notice: $app is already active; skipping relaunch."
+            continue
+        fi
 
         if command -v "$bin" &>/dev/null; then
             local bin_safe
@@ -3609,7 +3916,7 @@ run_backup() {
     local space_source=""
     local local_backup_path
     if local_backup_path=$(get_local_backup_path 2>/dev/null) && [ -d "${local_backup_path}" ]; then
-        last_backup_bytes=$(find "${local_backup_path}" -maxdepth 1 -type f \( -name "${TARBALL_BASENAME}_*.tar.zst.gpg" -o -name "${TARBALL_BASENAME}_*.tar.gz.gpg" -o -name "${TARBALL_BASENAME}_*.tar.xz.gpg" \) -printf "%s\n" 2>/dev/null | sort -n | tail -n 1)
+        last_backup_bytes=$(find "${local_backup_path}" -maxdepth 1 -type f \( -name "${TARBALL_BASENAME}_*.tar.zst.gpg" -o -name "${TARBALL_BASENAME}_*.tar.gz.gpg" -o -name "${TARBALL_BASENAME}_*.tar.xz.gpg" \) -printf "%s;%f\n" 2>/dev/null | grep -E "$(get_archive_lsf_sp_regex)" | cut -d';' -f1 | sort -n | tail -n 1)
         if [ -n "$last_backup_bytes" ] && [ "$last_backup_bytes" -gt 0 ] 2>/dev/null; then
             space_source="local"
         fi
@@ -3619,7 +3926,7 @@ run_backup() {
     if [ -z "$last_backup_bytes" ] || [ "$last_backup_bytes" -le 0 ] 2>/dev/null; then
         if [ "$cloud_available" = true ]; then
             echo "Local drive unavailable for size estimation. Checking cloud backups..."
-            last_backup_bytes=$(rclone lsl --fast-list "${BACKUP_DIR}" 2>/dev/null | grep -E "${TARBALL_BASENAME}_.*\.tar\.(zst|gz|xz)\.gpg$" | sort -k4 | tail -n 1 | awk '{print $1}')
+            last_backup_bytes=$(rclone lsl --fast-list "${BACKUP_DIR}" 2>/dev/null | grep -E "$(get_archive_lsl_regex)" | sort -k4 | tail -n 1 | awk '{print $1}')
             if [ -n "$last_backup_bytes" ] && [ "$last_backup_bytes" -gt 0 ] 2>/dev/null; then
                 space_source="cloud"
             fi
@@ -4330,9 +4637,9 @@ run_backup() {
         log_message "Archive marked as pinned (retention hold): ${ENCRYPTED_PIN_NAME}"
     fi
 
-    # --- Step 3.5: Local Drive Backup ---
+    # --- Step 3.5: Local Drive Backup (rotation deferred until verification passes) ---
     local local_backup_status="Skipped (not mounted)"
-    handle_local_backup "${FULL_ENCRYPTED_PATH}" "${ENCRYPTED_TARBALL_NAME}"
+    handle_local_backup "${FULL_ENCRYPTED_PATH}" "${ENCRYPTED_TARBALL_NAME}" true
     local local_rc=$?
     if [ "$local_rc" -eq 0 ]; then
         local_backup_status="OK"
@@ -4479,7 +4786,7 @@ run_backup() {
         log_message "Upload completed successfully."
         echo "Upload completed successfully."
 
-        # --- Step 5: Clean up local encrypted tarball and rotate ---
+        # --- Step 5: Clean up scratch directory ---
         rm -f "${FULL_ENCRYPTED_PATH}" "${FULL_SHA256_PATH}" "${FULL_MANIFEST_PATH}" "${FULL_INDEX_PATH}" "${FULL_PIN_PATH}"
         CURRENT_ENCRYPTED_ARCHIVE=""
         CURRENT_SHA256_FILE=""
@@ -4488,7 +4795,6 @@ run_backup() {
         CURRENT_PIN_FILE=""
         rmdir "${SCRATCH_DIR}" 2>/dev/null || true
         SCRATCH_FILES_CREATED=0
-        run_rotation
     else
         cloud_backup_status="Skipped (unreachable)"
         echo "Skipping cloud upload (cloud remote was unreachable during pre-flight check)."
@@ -4582,6 +4888,21 @@ run_backup() {
             verify_exit_code=$?
             verify_status="FAILED"
             log_message "ERROR: Post-backup integrity verification failed for ${verify_target} (exit code ${verify_exit_code})."
+        fi
+    fi
+
+    # --- Step 7: Post-Verification Archive Retention & Rotation ---
+    # Defer cloud and local rotation until after verification passes.
+    # If verification was executed and failed, abort rotation to avoid pruning known good historical archives.
+    if [ "$verify_exit_code" -ne 0 ]; then
+        log_message "SAFETY: Post-backup verification failed (exit code ${verify_exit_code}). Archive rotation aborted to protect existing historical backups."
+        echo "WARNING: Post-backup verification failed. Skipping archive rotation to protect existing backups." >&2
+    else
+        if [ "$cloud_available" = true ] && [ "$cloud_backup_status" = "OK" ]; then
+            run_rotation "${ENCRYPTED_TARBALL_NAME}"
+        fi
+        if [ "$local_rc" -eq 0 ] && [ "$local_backup_status" = "OK" ]; then
+            run_local_rotation "${ENCRYPTED_TARBALL_NAME}"
         fi
     fi
     
@@ -6004,7 +6325,7 @@ run_restore_system() {
     local_backup_path=$(get_local_backup_path 2>/dev/null || echo "")
 
     if [ -n "$local_backup_path" ] && [ -d "${local_backup_path}" ]; then
-        mapfile -t local_backups < <(find "${local_backup_path}" -maxdepth 1 -type f \( -name "${TARBALL_BASENAME}_*.tar.zst.gpg" -o -name "${TARBALL_BASENAME}_*.tar.gz.gpg" -o -name "${TARBALL_BASENAME}_*.tar.xz.gpg" \) -printf "%f\n" 2>/dev/null | sort -r)
+        mapfile -t local_backups < <(find "${local_backup_path}" -maxdepth 1 -type f \( -name "${TARBALL_BASENAME}_*.tar.zst.gpg" -o -name "${TARBALL_BASENAME}_*.tar.gz.gpg" -o -name "${TARBALL_BASENAME}_*.tar.xz.gpg" \) -printf "%f\n" 2>/dev/null | grep -E "$(get_archive_filename_regex)" | sort -r)
         if [ ${#local_backups[@]} -gt 0 ]; then
             local_available=true
         fi
@@ -6027,7 +6348,7 @@ run_restore_system() {
                     restore_source="cloud"
                     local rclone_output
                     rclone_output=$(rclone lsf --fast-list "${BACKUP_DIR}" 2>&1) || true
-                    mapfile -t backups < <(grep -E "${TARBALL_BASENAME}_.*\.tar\.(zst|gz|xz)\.gpg$" <<< "$rclone_output" | sort -r)
+                    mapfile -t backups < <(grep -E "$(get_archive_filename_regex)" <<< "$rclone_output" | sort -r)
                     if [ ${#backups[@]} -eq 0 ]; then
                         echo "ERROR: No backups found on cloud storage." >&2
                         return 1
@@ -6090,7 +6411,7 @@ run_restore_system() {
                 restore_source="cloud"
                 local rclone_output
                 rclone_output=$(rclone lsf --fast-list "${BACKUP_DIR}" 2>&1) || true
-                mapfile -t backups < <(grep -E "${TARBALL_BASENAME}_.*\.tar\.(zst|gz|xz)\.gpg$" <<< "$rclone_output" | sort -r)
+                mapfile -t backups < <(grep -E "$(get_archive_filename_regex)" <<< "$rclone_output" | sort -r)
                 [ ${#backups[@]} -gt 0 ] && backup_choice="${backups[0]}"
             fi
         else
@@ -6125,7 +6446,7 @@ run_restore_system() {
                 echo "Querying cloud storage for backups..."
                 local rclone_output
                 rclone_output=$(rclone lsf --fast-list "${BACKUP_DIR}" 2>&1) || true
-                mapfile -t backups < <(grep -E "${TARBALL_BASENAME}_.*\.tar\.(zst|gz|xz)\.gpg$" <<< "$rclone_output" | sort -r)
+                mapfile -t backups < <(grep -E "$(get_archive_filename_regex)" <<< "$rclone_output" | sort -r)
             fi
 
             if [ ${#backups[@]} -eq 0 ]; then
@@ -6387,7 +6708,7 @@ run_restore() {
 
     # Check if local backup drive is mounted and has backups
     if [ "$local_rc" -eq 0 ] && [ -n "$local_backup_path" ] && [ -d "${local_backup_path}" ]; then
-        mapfile -t local_backups < <(find "${local_backup_path}" -maxdepth 1 -type f \( -name "${TARBALL_BASENAME}_*.tar.zst.gpg" -o -name "${TARBALL_BASENAME}_*.tar.gz.gpg" -o -name "${TARBALL_BASENAME}_*.tar.xz.gpg" \) -printf "%f\n" 2>/dev/null | sort -r)
+        mapfile -t local_backups < <(find "${local_backup_path}" -maxdepth 1 -type f \( -name "${TARBALL_BASENAME}_*.tar.zst.gpg" -o -name "${TARBALL_BASENAME}_*.tar.gz.gpg" -o -name "${TARBALL_BASENAME}_*.tar.xz.gpg" \) -printf "%f\n" 2>/dev/null | grep -E "$(get_archive_filename_regex)" | sort -r)
         if [ ${#local_backups[@]} -gt 0 ]; then
             local_available=true
         fi
@@ -6444,7 +6765,7 @@ run_restore() {
                     log_message "$ERROR_MSG"; echo "ERROR: Could not connect to cloud storage: ${rclone_output}" >&2
                     return 1
                 fi
-                mapfile -t backups < <(grep -E "${TARBALL_BASENAME}_.*\.tar\.(zst|gz|xz)\.gpg$" <<< "$rclone_output" | sort -r)
+                mapfile -t backups < <(grep -E "$(get_archive_filename_regex)" <<< "$rclone_output" | sort -r)
                 if [ ${#backups[@]} -eq 0 ]; then
                     local ERROR_MSG="ERROR: No cloud backups found for host (${HOSTNAME}) at ${BACKUP_DIR}."
                     log_message "$ERROR_MSG"; echo "$ERROR_MSG" >&2
@@ -6523,7 +6844,7 @@ run_restore() {
                 restore_source="cloud"
                 local rclone_output
                 rclone_output=$(rclone lsf --fast-list "${BACKUP_DIR}" 2>&1) || true
-                mapfile -t backups < <(grep -E "${TARBALL_BASENAME}_.*\.tar\.(zst|gz|xz)\.gpg$" <<< "$rclone_output" | sort -r)
+                mapfile -t backups < <(grep -E "$(get_archive_filename_regex)" <<< "$rclone_output" | sort -r)
                 if [ ${#backups[@]} -gt 0 ]; then
                     backup_choice="${backups[0]}"
                 fi
@@ -6588,7 +6909,7 @@ run_restore() {
                     return 1
                 fi
 
-                mapfile -t backups < <(grep -E "${TARBALL_BASENAME}_.*\.tar\.(zst|gz|xz)\.gpg$" <<< "$rclone_output" | sort -r)
+                mapfile -t backups < <(grep -E "$(get_archive_filename_regex)" <<< "$rclone_output" | sort -r)
             fi
 
             if [ ${#backups[@]} -eq 0 ]; then
@@ -7477,7 +7798,9 @@ display_manifest() {
             # Try local drive first
             if [ -n "$local_backup_path" ] && [ -d "$local_backup_path" ]; then
                 local latest_local_manifest=""
-                latest_local_manifest=$(find "${local_backup_path}" -maxdepth 1 -type f -name "${TARBALL_BASENAME}_*.manifest.json" 2>/dev/null | sort -r | head -n 1)
+                local lm_name
+                lm_name=$(find "${local_backup_path}" -maxdepth 1 -type f -name "${TARBALL_BASENAME}_*.manifest.json" -printf "%f\n" 2>/dev/null | grep -E "$(get_manifest_filename_regex)" | sort -r | head -n 1)
+                [ -n "$lm_name" ] && latest_local_manifest="${local_backup_path}/${lm_name}"
                 if [ -n "$latest_local_manifest" ] && [ -f "$latest_local_manifest" ]; then
                     manifest_content=$(<"$latest_local_manifest")
                     manifest_source="local drive (${latest_local_manifest})"
@@ -7487,7 +7810,9 @@ display_manifest() {
             # Try preserved archives in SOURCE_DIR
             if [ -z "$manifest_content" ]; then
                 local latest_pres_manifest=""
-                latest_pres_manifest=$(find "${SOURCE_DIR}" -maxdepth 1 -type f -name "${TARBALL_BASENAME}_*.manifest.json" 2>/dev/null | sort -r | head -n 1)
+                local pm_name
+                pm_name=$(find "${SOURCE_DIR}" -maxdepth 1 -type f -name "${TARBALL_BASENAME}_*.manifest.json" -printf "%f\n" 2>/dev/null | grep -E "$(get_manifest_filename_regex)" | sort -r | head -n 1)
+                [ -n "$pm_name" ] && latest_pres_manifest="${SOURCE_DIR}/${pm_name}"
                 if [ -n "$latest_pres_manifest" ] && [ -f "$latest_pres_manifest" ]; then
                     manifest_content=$(<"$latest_pres_manifest")
                     manifest_source="preserved archive (${latest_pres_manifest})"
@@ -7498,7 +7823,7 @@ display_manifest() {
             if [ -z "$manifest_content" ]; then
                 echo "Searching cloud storage for latest manifest (${BACKUP_DIR})..." >&2
                 local cloud_manifest_name=""
-                cloud_manifest_name=$(rclone lsf --fast-list "${BACKUP_DIR}" 2>/dev/null | grep -E "${TARBALL_BASENAME}_.*\.manifest\.json$" | sort -r | head -n 1)
+                cloud_manifest_name=$(rclone lsf --fast-list "${BACKUP_DIR}" 2>/dev/null | grep -E "$(get_manifest_filename_regex)" | sort -r | head -n 1)
                 if [ -n "$cloud_manifest_name" ]; then
                     manifest_content=$(rclone cat "${RCLONE_STREAM_OPTS[@]}" "${BACKUP_DIR}${cloud_manifest_name}" 2>/dev/null)
                     manifest_source="cloud storage (${BACKUP_DIR}${cloud_manifest_name})"
@@ -7788,14 +8113,14 @@ show_backup_stats() {
 
     # 1. Custom directory path source
     if [ "$source_mode" = "path" ] && [ -n "$custom_path" ]; then
-        mapfile -t manifest_files < <(find "${custom_path}" -maxdepth 2 -type f -name "${TARBALL_BASENAME}_*.manifest.json" 2>/dev/null | sort)
+        mapfile -t manifest_files < <(find "${custom_path}" -maxdepth 2 -type f -name "${TARBALL_BASENAME}_*.manifest.json" 2>/dev/null | grep -E "$(get_manifest_path_regex)" | sort)
     # 2. Local only
     elif [ "$source_mode" = "local" ]; then
         if [ -n "$local_backup_path" ] && [ -d "$local_backup_path" ]; then
-            mapfile -t manifest_files < <(find "${local_backup_path}" -maxdepth 1 -type f -name "${TARBALL_BASENAME}_*.manifest.json" 2>/dev/null | sort)
+            mapfile -t manifest_files < <(find "${local_backup_path}" -maxdepth 1 -type f -name "${TARBALL_BASENAME}_*.manifest.json" 2>/dev/null | grep -E "$(get_manifest_path_regex)" | sort)
         fi
         local -a pres_files=()
-        mapfile -t pres_files < <(find "${SOURCE_DIR}" -maxdepth 1 -type f -name "${TARBALL_BASENAME}_*.manifest.json" 2>/dev/null | sort)
+        mapfile -t pres_files < <(find "${SOURCE_DIR}" -maxdepth 1 -type f -name "${TARBALL_BASENAME}_*.manifest.json" 2>/dev/null | grep -E "$(get_manifest_path_regex)" | sort)
         manifest_files+=("${pres_files[@]}")
     # 3. Cloud only
     elif [ "$source_mode" = "cloud" ]; then
@@ -7805,15 +8130,15 @@ show_backup_stats() {
         CURRENT_STATS_TMP_DIRS+=("$stats_tmp_dir")
         echo "Fetching backup manifests from cloud storage (${BACKUP_DIR})..." >&2
         if rclone copy --include "${TARBALL_BASENAME}_*.manifest.json" "${BACKUP_DIR}" "$stats_tmp_dir" 2>/dev/null; then
-            mapfile -t manifest_files < <(find "$stats_tmp_dir" -maxdepth 1 -type f -name "${TARBALL_BASENAME}_*.manifest.json" 2>/dev/null | sort)
+            mapfile -t manifest_files < <(find "$stats_tmp_dir" -maxdepth 1 -type f -name "${TARBALL_BASENAME}_*.manifest.json" 2>/dev/null | grep -E "$(get_manifest_path_regex)" | sort)
         fi
     # 4. All (merge local + cloud)
     elif [ "$source_mode" = "all" ]; then
         if [ -n "$local_backup_path" ] && [ -d "$local_backup_path" ]; then
-            mapfile -t manifest_files < <(find "${local_backup_path}" -maxdepth 1 -type f -name "${TARBALL_BASENAME}_*.manifest.json" 2>/dev/null | sort)
+            mapfile -t manifest_files < <(find "${local_backup_path}" -maxdepth 1 -type f -name "${TARBALL_BASENAME}_*.manifest.json" 2>/dev/null | grep -E "$(get_manifest_path_regex)" | sort)
         fi
         local -a pres_files=()
-        mapfile -t pres_files < <(find "${SOURCE_DIR}" -maxdepth 1 -type f -name "${TARBALL_BASENAME}_*.manifest.json" 2>/dev/null | sort)
+        mapfile -t pres_files < <(find "${SOURCE_DIR}" -maxdepth 1 -type f -name "${TARBALL_BASENAME}_*.manifest.json" 2>/dev/null | grep -E "$(get_manifest_path_regex)" | sort)
         manifest_files+=("${pres_files[@]}")
 
         local stats_tmp_dir
@@ -7823,16 +8148,16 @@ show_backup_stats() {
         echo "Fetching backup manifests from cloud storage (${BACKUP_DIR})..." >&2
         if rclone copy --include "${TARBALL_BASENAME}_*.manifest.json" "${BACKUP_DIR}" "$stats_tmp_dir" 2>/dev/null; then
             local -a cloud_files=()
-            mapfile -t cloud_files < <(find "$stats_tmp_dir" -maxdepth 1 -type f -name "${TARBALL_BASENAME}_*.manifest.json" 2>/dev/null | sort)
+            mapfile -t cloud_files < <(find "$stats_tmp_dir" -maxdepth 1 -type f -name "${TARBALL_BASENAME}_*.manifest.json" 2>/dev/null | grep -E "$(get_manifest_path_regex)" | sort)
             manifest_files+=("${cloud_files[@]}")
         fi
     # 5. Auto mode (local drive first, preserved in home, fall back to cloud if none found)
     else
         if [ -n "$local_backup_path" ] && [ -d "$local_backup_path" ]; then
-            mapfile -t manifest_files < <(find "${local_backup_path}" -maxdepth 1 -type f -name "${TARBALL_BASENAME}_*.manifest.json" 2>/dev/null | sort)
+            mapfile -t manifest_files < <(find "${local_backup_path}" -maxdepth 1 -type f -name "${TARBALL_BASENAME}_*.manifest.json" 2>/dev/null | grep -E "$(get_manifest_path_regex)" | sort)
         fi
         local -a pres_files=()
-        mapfile -t pres_files < <(find "${SOURCE_DIR}" -maxdepth 1 -type f -name "${TARBALL_BASENAME}_*.manifest.json" 2>/dev/null | sort)
+        mapfile -t pres_files < <(find "${SOURCE_DIR}" -maxdepth 1 -type f -name "${TARBALL_BASENAME}_*.manifest.json" 2>/dev/null | grep -E "$(get_manifest_path_regex)" | sort)
         manifest_files+=("${pres_files[@]}")
 
         if [ ${#manifest_files[@]} -eq 0 ]; then
@@ -7842,7 +8167,7 @@ show_backup_stats() {
             CURRENT_STATS_TMP_DIRS+=("$stats_tmp_dir")
             echo "No local manifests found. Fetching from cloud storage (${BACKUP_DIR})..." >&2
             if rclone copy --include "${TARBALL_BASENAME}_*.manifest.json" "${BACKUP_DIR}" "$stats_tmp_dir" 2>/dev/null; then
-                mapfile -t manifest_files < <(find "$stats_tmp_dir" -maxdepth 1 -type f -name "${TARBALL_BASENAME}_*.manifest.json" 2>/dev/null | sort)
+                mapfile -t manifest_files < <(find "$stats_tmp_dir" -maxdepth 1 -type f -name "${TARBALL_BASENAME}_*.manifest.json" 2>/dev/null | grep -E "$(get_manifest_path_regex)" | sort)
             fi
         fi
     fi
@@ -8272,7 +8597,7 @@ pin_archive() {
                         available_archives+=("$f")
                     fi
                 fi
-            done < <(find "$local_backup_path" -maxdepth 1 -type f \( -name "${TARBALL_BASENAME}_*.tar.zst.gpg" -o -name "${TARBALL_BASENAME}_*.tar.gz.gpg" -o -name "${TARBALL_BASENAME}_*.tar.xz.gpg" \) -printf "%f\n" 2>/dev/null | sort -r)
+            done < <(find "$local_backup_path" -maxdepth 1 -type f \( -name "${TARBALL_BASENAME}_*.tar.zst.gpg" -o -name "${TARBALL_BASENAME}_*.tar.gz.gpg" -o -name "${TARBALL_BASENAME}_*.tar.xz.gpg" \) -printf "%f\n" 2>/dev/null | grep -E "$(get_archive_filename_regex)" | sort -r)
         fi
 
         # 2. Preserved
@@ -8295,7 +8620,7 @@ pin_archive() {
             while IFS= read -r pf; do
                 [ -z "$pf" ] && continue
                 cloud_pins["${pf%.pinned}"]=1
-            done < <(grep -E "${TARBALL_BASENAME}_.*\.tar\.(zst|gz|xz)\.gpg\.pinned$" <<< "$cloud_raw")
+            done < <(grep -E "$(get_pinned_filename_regex)" <<< "$cloud_raw")
 
             while IFS= read -r cf; do
                 [ -z "$cf" ] && continue
@@ -8307,7 +8632,7 @@ pin_archive() {
                         seen_archives["$cf"]="${seen_archives[$cf]}, cloud"
                     fi
                 fi
-            done < <(grep -E "${TARBALL_BASENAME}_.*\.tar\.(zst|gz|xz)\.gpg$" <<< "$cloud_raw" | sort -r)
+            done < <(grep -E "$(get_archive_filename_regex)" <<< "$cloud_raw" | sort -r)
         fi
 
         if [ ${#available_archives[@]} -eq 0 ]; then
@@ -8356,7 +8681,7 @@ pin_archive() {
         clean_target=""
         # Search local
         if [ -n "$local_backup_path" ] && [ -d "$local_backup_path" ]; then
-            clean_target=$(find "$local_backup_path" -maxdepth 1 -type f \( -name "${TARBALL_BASENAME}_*.tar.zst.gpg" -o -name "${TARBALL_BASENAME}_*.tar.gz.gpg" -o -name "${TARBALL_BASENAME}_*.tar.xz.gpg" \) -printf "%f\n" 2>/dev/null | sort -r | head -n 1)
+            clean_target=$(find "$local_backup_path" -maxdepth 1 -type f \( -name "${TARBALL_BASENAME}_*.tar.zst.gpg" -o -name "${TARBALL_BASENAME}_*.tar.gz.gpg" -o -name "${TARBALL_BASENAME}_*.tar.xz.gpg" \) -printf "%f\n" 2>/dev/null | grep -E "$(get_archive_filename_regex)" | sort -r | head -n 1)
         fi
         # Search preserved
         if [ -z "$clean_target" ]; then
@@ -8366,7 +8691,7 @@ pin_archive() {
         fi
         # Search cloud
         if [ -z "$clean_target" ]; then
-            clean_target=$(rclone lsf --fast-list "${BACKUP_DIR}" 2>/dev/null | grep -E "${TARBALL_BASENAME}_.*\.tar\.(zst|gz|xz)\.gpg$" | sort -r | head -n 1)
+            clean_target=$(rclone lsf --fast-list "${BACKUP_DIR}" 2>/dev/null | grep -E "$(get_archive_filename_regex)" | sort -r | head -n 1)
         fi
 
         if [ -z "$clean_target" ]; then
@@ -8535,7 +8860,7 @@ unpin_archive() {
                 rnote=$(grep -E "^Reason:" "${local_backup_path}/${pf}" 2>/dev/null | sed 's/^Reason:[[:space:]]*//')
                 pinned_list+=("$bname")
                 pinned_info["$bname"]="local | Reason: ${rnote:-Manual retention hold}"
-            done < <(find "$local_backup_path" -maxdepth 1 -type f -name "${TARBALL_BASENAME}_*.pinned" -printf "%f\n" 2>/dev/null | sort -r)
+            done < <(find "$local_backup_path" -maxdepth 1 -type f -name "${TARBALL_BASENAME}_*.pinned" -printf "%f\n" 2>/dev/null | grep -E "$(get_pinned_filename_regex)" | sort -r)
         fi
 
         # 2. Preserved
@@ -8552,11 +8877,11 @@ unpin_archive() {
             else
                 pinned_info["$bname"]="${pinned_info[$bname]}, preserved"
             fi
-        done < <(find "${SOURCE_DIR}" -maxdepth 1 -type f -name "${TARBALL_BASENAME}_*.pinned" 2>/dev/null | sort -r)
+        done < <(find "${SOURCE_DIR}" -maxdepth 1 -type f -name "${TARBALL_BASENAME}_*.pinned" 2>/dev/null | grep -E "$(get_pinned_path_regex)" | sort -r)
 
         # 3. Cloud
         local cloud_pins_raw
-        if cloud_pins_raw=$(rclone lsf --fast-list "${BACKUP_DIR}" 2>/dev/null | grep -E "${TARBALL_BASENAME}_.*\.pinned$"); then
+        if cloud_pins_raw=$(rclone lsf --fast-list "${BACKUP_DIR}" 2>/dev/null | grep -E "$(get_pinned_filename_regex)"); then
             while IFS= read -r pf; do
                 [ -z "$pf" ] && continue
                 local bname="${pf%.pinned}"
@@ -8610,12 +8935,12 @@ unpin_archive() {
         clean_target=""
         if [ -n "$local_backup_path" ] && [ -d "$local_backup_path" ]; then
             local lp
-            lp=$(find "$local_backup_path" -maxdepth 1 -type f -name "${TARBALL_BASENAME}_*.pinned" -printf "%f\n" 2>/dev/null | sort -r | head -n 1)
+            lp=$(find "$local_backup_path" -maxdepth 1 -type f -name "${TARBALL_BASENAME}_*.pinned" -printf "%f\n" 2>/dev/null | grep -E "$(get_pinned_filename_regex)" | sort -r | head -n 1)
             [ -n "$lp" ] && clean_target="${lp%.pinned}"
         fi
         if [ -z "$clean_target" ]; then
             local cp_file
-            cp_file=$(rclone lsf --fast-list "${BACKUP_DIR}" 2>/dev/null | grep -E "${TARBALL_BASENAME}_.*\.pinned$" | sort -r | head -n 1)
+            cp_file=$(rclone lsf --fast-list "${BACKUP_DIR}" 2>/dev/null | grep -E "$(get_pinned_filename_regex)" | sort -r | head -n 1)
             [ -n "$cp_file" ] && clean_target="${cp_file%.pinned}"
         fi
 
@@ -8637,7 +8962,7 @@ unpin_archive() {
     fi
     if [[ "$source_scope" == "all" || "$source_scope" == "both" || "$source_scope" == "cloud" || "$source_scope" == "auto" ]]; then
         if [[ "$BACKUP_DIR" == *:* ]] && command -v rclone &>/dev/null; then
-            if rclone lsf --files-only --max-depth 1 --contimeout 5s --timeout 10s --include "${clean_target}.pinned" "${BACKUP_DIR}" 2>/dev/null | grep -q "${clean_target}\.pinned"; then
+            if rclone lsf --files-only --max-depth 1 --contimeout 5s --timeout 10s --include "${clean_target}.pinned" "${BACKUP_DIR}" 2>/dev/null | grep -F -x -q "${clean_target}.pinned"; then
                 is_pinned_cloud=true
             fi
         fi
@@ -8731,16 +9056,16 @@ list_pinned_archives() {
 
     # 1. Local
     if [ -n "$local_backup_path" ] && [ -d "$local_backup_path" ]; then
-        mapfile -t local_pins < <(find "$local_backup_path" -maxdepth 1 -type f -name "${TARBALL_BASENAME}_*.pinned" -printf "%f\n" 2>/dev/null | sort -r)
+        mapfile -t local_pins < <(find "$local_backup_path" -maxdepth 1 -type f -name "${TARBALL_BASENAME}_*.pinned" -printf "%f\n" 2>/dev/null | grep -E "$(get_pinned_filename_regex)" | sort -r)
     fi
 
     # 2. Preserved
-    mapfile -t preserved_pins < <(find "${SOURCE_DIR}" -maxdepth 1 -type f -name "${TARBALL_BASENAME}_*.pinned" -printf "%f\n" 2>/dev/null | sort -r)
+    mapfile -t preserved_pins < <(find "${SOURCE_DIR}" -maxdepth 1 -type f -name "${TARBALL_BASENAME}_*.pinned" -printf "%f\n" 2>/dev/null | grep -E "$(get_pinned_filename_regex)" | sort -r)
 
     # 3. Cloud
     local cloud_raw
     if cloud_raw=$(rclone lsl --fast-list "${BACKUP_DIR}" 2>/dev/null); then
-        mapfile -t cloud_pins < <(grep -E "${TARBALL_BASENAME}_.*\.pinned$" <<< "$cloud_raw" | sort -k4 -r)
+        mapfile -t cloud_pins < <(grep -E "$(get_pinned_lsl_regex)" <<< "$cloud_raw" | sort -k4 -r)
     fi
 
     local total_count=$(( ${#local_pins[@]} + ${#preserved_pins[@]} + ${#cloud_pins[@]} ))
@@ -8758,11 +9083,16 @@ data = {
     "cloud": []
 }
 
+local_pins = [p for p in """$(printf '%s\n' "${local_pins[@]}")""".strip().splitlines() if p]
+preserved_pins = [p for p in """$(printf '%s\n' "${preserved_pins[@]}")""".strip().splitlines() if p]
+cloud_pins = [p for p in """$(printf '%s\n' "${cloud_pins[@]}")""".strip().splitlines() if p]
+
 local_path = "${local_backup_path}"
 if local_path and os.path.isdir(local_path):
-    for pf in sorted(glob.glob(os.path.join(local_path, "${TARBALL_BASENAME}_*.pinned")), reverse=True):
-        arch_name = os.path.basename(pf)[:-7]
+    for pf_name in local_pins:
+        arch_name = pf_name[:-7]
         arch_file = os.path.join(local_path, arch_name)
+        pf = os.path.join(local_path, pf_name)
         sz = os.path.getsize(arch_file) if os.path.isfile(arch_file) else 0
         reason = "Manual retention hold"
         pinned_at = ""
@@ -8777,9 +9107,10 @@ if local_path and os.path.isdir(local_path):
             pass
         data["local_drive"].append({"archive": arch_name, "size_bytes": sz, "reason": reason, "pinned_at": pinned_at})
 
-for pf in sorted(glob.glob(os.path.join("${SOURCE_DIR}", "${TARBALL_BASENAME}_*.pinned")), reverse=True):
-    arch_name = os.path.basename(pf)[:-7]
+for pf_name in preserved_pins:
+    arch_name = pf_name[:-7]
     arch_file = os.path.join("${SOURCE_DIR}", arch_name)
+    pf = os.path.join("${SOURCE_DIR}", pf_name)
     sz = os.path.getsize(arch_file) if os.path.isfile(arch_file) else 0
     reason = "Manual retention hold"
     pinned_at = ""
@@ -8794,8 +9125,7 @@ for pf in sorted(glob.glob(os.path.join("${SOURCE_DIR}", "${TARBALL_BASENAME}_*.
         pass
     data["preserved"].append({"archive": arch_name, "size_bytes": sz, "reason": reason, "pinned_at": pinned_at})
 
-cloud_pins_raw = """${cloud_raw}"""
-for line in cloud_pins_raw.strip().splitlines():
+for line in cloud_pins:
     parts = line.split(None, 3)
     if len(parts) >= 4 and parts[3].endswith(".pinned"):
         arch_name = parts[3][:-7]
@@ -8945,7 +9275,7 @@ list_backups() {
             fi
             printf "  %-9s %s  %s%s\n" "$hr_size" "$mtime" "$name" "$pin_tag"
             local_found=1
-        done < <(find "${local_backup_path}" -maxdepth 1 -type f \( -name "${TARBALL_BASENAME}_*.tar.zst.gpg" -o -name "${TARBALL_BASENAME}_*.tar.gz.gpg" -o -name "${TARBALL_BASENAME}_*.tar.xz.gpg" \) -printf "%s\t%TY-%Tm-%Td %TH:%TM:%.2TS\t%f\n" 2>/dev/null | sort -t$'\t' -k3 -r)
+        done < <(find "${local_backup_path}" -maxdepth 1 -type f \( -name "${TARBALL_BASENAME}_*.tar.zst.gpg" -o -name "${TARBALL_BASENAME}_*.tar.gz.gpg" -o -name "${TARBALL_BASENAME}_*.tar.xz.gpg" \) -printf "%s\t%TY-%Tm-%Td %TH:%TM:%.2TS\t%f\n" 2>/dev/null | grep -E "$(get_archive_lsl_regex)" | sort -t$'\t' -k3 -r)
 
         if [ "$local_found" -eq 0 ]; then
             echo "  (None)"
@@ -8964,7 +9294,7 @@ list_backups() {
         while read -r _ _ _ p_name; do
             [ -z "$p_name" ] && continue
             cloud_pins["${p_name%.pinned}"]=1
-        done < <(grep -E "${TARBALL_BASENAME}_.*\.pinned$" <<< "$rclone_lsl_output")
+        done < <(grep -E "$(get_pinned_lsl_regex)" <<< "$rclone_lsl_output")
 
         local cloud_found=0
         while read -r size date time name; do
@@ -8978,7 +9308,7 @@ list_backups() {
             fi
             printf "  %-9s %s %s  %s%s\n" "$hr_size" "$date" "$time_clean" "$name" "$pin_tag"
             cloud_found=1
-        done < <(grep -E "${TARBALL_BASENAME}_.*\.tar\.(zst|gz|xz)\.gpg$" <<< "$rclone_lsl_output" | sort -k4 -r)
+        done < <(grep -E "$(get_archive_lsl_regex)" <<< "$rclone_lsl_output" | sort -k4 -r)
 
         if [ "$cloud_found" -eq 0 ]; then
             echo "  (None)"
@@ -9078,7 +9408,7 @@ list_archive_contents() {
 
     # Check if local backup drive is mounted and has backups
     if [ -n "$local_backup_path" ] && [ -d "${local_backup_path}" ]; then
-        mapfile -t local_backups < <(find "${local_backup_path}" -maxdepth 1 -type f \( -name "${TARBALL_BASENAME}_*.tar.zst.gpg" -o -name "${TARBALL_BASENAME}_*.tar.gz.gpg" -o -name "${TARBALL_BASENAME}_*.tar.xz.gpg" \) -printf "%f\n" 2>/dev/null | sort -r)
+        mapfile -t local_backups < <(find "${local_backup_path}" -maxdepth 1 -type f \( -name "${TARBALL_BASENAME}_*.tar.zst.gpg" -o -name "${TARBALL_BASENAME}_*.tar.gz.gpg" -o -name "${TARBALL_BASENAME}_*.tar.xz.gpg" \) -printf "%f\n" 2>/dev/null | grep -E "$(get_archive_filename_regex)" | sort -r)
         if [ ${#local_backups[@]} -gt 0 ]; then
             local_available=true
         fi
@@ -9115,7 +9445,7 @@ list_archive_contents() {
                 echo "Querying cloud backups..."
                 local rclone_output
                 rclone_output=$(rclone lsf --fast-list "${BACKUP_DIR}" 2>&1) || true
-                mapfile -t backups < <(grep -E "${TARBALL_BASENAME}_.*\.tar\.(zst|gz|xz)\.gpg$" <<< "$rclone_output" | sort -r)
+                mapfile -t backups < <(grep -E "$(get_archive_filename_regex)" <<< "$rclone_output" | sort -r)
                 if [ ${#backups[@]} -eq 0 ]; then
                     echo "ERROR: No cloud backups found for host (${HOSTNAME}) at ${BACKUP_DIR}." >&2
                     return 1
@@ -9136,7 +9466,7 @@ list_archive_contents() {
                     echo "Querying cloud backups..."
                     local rclone_output
                     rclone_output=$(rclone lsf --fast-list "${BACKUP_DIR}" 2>&1) || true
-                    mapfile -t backups < <(grep -E "${TARBALL_BASENAME}_.*\.tar\.(zst|gz|xz)\.gpg$" <<< "$rclone_output" | sort -r)
+                    mapfile -t backups < <(grep -E "$(get_archive_filename_regex)" <<< "$rclone_output" | sort -r)
                     if [ ${#backups[@]} -eq 0 ]; then
                         echo "ERROR: No backups found for host (${HOSTNAME}) locally or on cloud." >&2
                         return 1
@@ -9237,7 +9567,7 @@ list_archive_contents() {
                 echo "ERROR: Could not connect to cloud storage: ${rclone_output}" >&2
                 return 1
             fi
-            mapfile -t backups < <(grep -E "${TARBALL_BASENAME}_.*\.tar\.(zst|gz|xz)\.gpg$" <<< "$rclone_output" | sort -r)
+            mapfile -t backups < <(grep -E "$(get_archive_filename_regex)" <<< "$rclone_output" | sort -r)
         fi
 
         if [ ${#backups[@]} -eq 0 ]; then
@@ -9671,11 +10001,12 @@ find_file() {
     # 1. Local drive backups
     if [[ "$source_filter" =~ ^(auto|local|all)$ ]] && [ -n "$local_backup_path" ] && [ -d "$local_backup_path" ]; then
         local local_idx_files=()
-        mapfile -t local_idx_files < <(find "${local_backup_path}" -maxdepth 1 -type f -name "${TARBALL_BASENAME}_*.files.gz" 2>/dev/null | sort -r)
-        for idx_file in "${local_idx_files[@]}"; do
-            [ -z "$idx_file" ] && continue
+        mapfile -t local_idx_files < <(find "${local_backup_path}" -maxdepth 1 -type f -name "${TARBALL_BASENAME}_*.files.gz" -printf "%f\n" 2>/dev/null | grep -E "$(get_file_index_regex)" | sort -r)
+        for idx_fname in "${local_idx_files[@]}"; do
+            [ -z "$idx_fname" ] && continue
+            local idx_file="${local_backup_path}/${idx_fname}"
             local arc_name
-            arc_name=$(basename "$idx_file" .files.gz)
+            arc_name="${idx_fname%.files.gz}"
             if [ -z "${archive_indices[$arc_name]+x}" ]; then
                 archive_indices["$arc_name"]="local|${idx_file}"
                 archive_order+=("$arc_name")
@@ -9686,11 +10017,12 @@ find_file() {
     # 2. Preserved archives in SOURCE_DIR
     if [[ "$source_filter" =~ ^(auto|local|all)$ ]]; then
         local pres_idx_files=()
-        mapfile -t pres_idx_files < <(find "${SOURCE_DIR}" -maxdepth 1 -type f -name "${TARBALL_BASENAME}_*.files.gz" 2>/dev/null | sort -r)
-        for idx_file in "${pres_idx_files[@]}"; do
-            [ -z "$idx_file" ] && continue
+        mapfile -t pres_idx_files < <(find "${SOURCE_DIR}" -maxdepth 1 -type f -name "${TARBALL_BASENAME}_*.files.gz" -printf "%f\n" 2>/dev/null | grep -E "$(get_file_index_regex)" | sort -r)
+        for idx_fname in "${pres_idx_files[@]}"; do
+            [ -z "$idx_fname" ] && continue
+            local idx_file="${SOURCE_DIR}/${idx_fname}"
             local arc_name
-            arc_name=$(basename "$idx_file" .files.gz)
+            arc_name="${idx_fname%.files.gz}"
             if [ -z "${archive_indices[$arc_name]+x}" ]; then
                 archive_indices["$arc_name"]="preserved|${idx_file}"
                 archive_order+=("$arc_name")
@@ -9703,7 +10035,7 @@ find_file() {
         if [ "$source_filter" != "auto" ] || [ ${#archive_order[@]} -eq 0 ]; then
             echo "Querying cloud file indices (${BACKUP_DIR})..." >&2
             local cloud_indices=()
-            mapfile -t cloud_indices < <(rclone lsf --fast-list "${BACKUP_DIR}" 2>/dev/null | grep -E "${TARBALL_BASENAME}_.*\.files\.gz$" | sort -r)
+            mapfile -t cloud_indices < <(rclone lsf --fast-list "${BACKUP_DIR}" 2>/dev/null | grep -E "$(get_file_index_regex)" | sort -r)
             for c_idx in "${cloud_indices[@]}"; do
                 [ -z "$c_idx" ] && continue
                 local arc_name="${c_idx%.files.gz}"
@@ -10147,11 +10479,12 @@ diff_backups() {
     # 1. Local drive backups
     if [[ "$source_filter" =~ ^(auto|local|all)$ ]] && [ -n "$local_backup_path" ] && [ -d "$local_backup_path" ]; then
         local local_idx_files=()
-        mapfile -t local_idx_files < <(find "${local_backup_path}" -maxdepth 1 -type f -name "${TARBALL_BASENAME}_*.files.gz" 2>/dev/null | sort -r)
-        for idx_file in "${local_idx_files[@]}"; do
-            [ -z "$idx_file" ] && continue
+        mapfile -t local_idx_files < <(find "${local_backup_path}" -maxdepth 1 -type f -name "${TARBALL_BASENAME}_*.files.gz" -printf "%f\n" 2>/dev/null | grep -E "$(get_file_index_regex)" | sort -r)
+        for idx_fname in "${local_idx_files[@]}"; do
+            [ -z "$idx_fname" ] && continue
+            local idx_file="${local_backup_path}/${idx_fname}"
             local arc_name
-            arc_name=$(basename "$idx_file" .files.gz)
+            arc_name="${idx_fname%.files.gz}"
             if [ -z "${archive_indices[$arc_name]+x}" ]; then
                 archive_indices["$arc_name"]="local|${idx_file}"
                 archive_order+=("$arc_name")
@@ -10162,11 +10495,12 @@ diff_backups() {
     # 2. Preserved archives in SOURCE_DIR
     if [[ "$source_filter" =~ ^(auto|local|all)$ ]]; then
         local pres_idx_files=()
-        mapfile -t pres_idx_files < <(find "${SOURCE_DIR}" -maxdepth 1 -type f -name "${TARBALL_BASENAME}_*.files.gz" 2>/dev/null | sort -r)
-        for idx_file in "${pres_idx_files[@]}"; do
-            [ -z "$idx_file" ] && continue
+        mapfile -t pres_idx_files < <(find "${SOURCE_DIR}" -maxdepth 1 -type f -name "${TARBALL_BASENAME}_*.files.gz" -printf "%f\n" 2>/dev/null | grep -E "$(get_file_index_regex)" | sort -r)
+        for idx_fname in "${pres_idx_files[@]}"; do
+            [ -z "$idx_fname" ] && continue
+            local idx_file="${SOURCE_DIR}/${idx_fname}"
             local arc_name
-            arc_name=$(basename "$idx_file" .files.gz)
+            arc_name="${idx_fname%.files.gz}"
             if [ -z "${archive_indices[$arc_name]+x}" ]; then
                 archive_indices["$arc_name"]="preserved|${idx_file}"
                 archive_order+=("$arc_name")
@@ -10179,7 +10513,7 @@ diff_backups() {
         if [ "$source_filter" != "auto" ] || [ ${#archive_order[@]} -lt 2 ]; then
             [ "$output_format" = "text" ] && echo "Querying cloud file indices (${BACKUP_DIR})..." >&2
             local cloud_indices=()
-            mapfile -t cloud_indices < <(rclone lsf --fast-list "${BACKUP_DIR}" 2>/dev/null | grep -E "${TARBALL_BASENAME}_.*\.files\.gz$" | sort -r)
+            mapfile -t cloud_indices < <(rclone lsf --fast-list "${BACKUP_DIR}" 2>/dev/null | grep -E "$(get_file_index_regex)" | sort -r)
             for c_idx in "${cloud_indices[@]}"; do
                 [ -z "$c_idx" ] && continue
                 local arc_name="${c_idx%.files.gz}"
@@ -10753,7 +11087,7 @@ run_verify() {
 
     # Check if local backup drive is mounted and has backups
     if [ -n "$local_backup_path" ] && [ -d "${local_backup_path}" ]; then
-        mapfile -t local_backups < <(find "${local_backup_path}" -maxdepth 1 -type f \( -name "${TARBALL_BASENAME}_*.tar.zst.gpg" -o -name "${TARBALL_BASENAME}_*.tar.gz.gpg" -o -name "${TARBALL_BASENAME}_*.tar.xz.gpg" \) -printf "%f\n" 2>/dev/null | sort -r)
+        mapfile -t local_backups < <(find "${local_backup_path}" -maxdepth 1 -type f \( -name "${TARBALL_BASENAME}_*.tar.zst.gpg" -o -name "${TARBALL_BASENAME}_*.tar.gz.gpg" -o -name "${TARBALL_BASENAME}_*.tar.xz.gpg" \) -printf "%f\n" 2>/dev/null | grep -E "$(get_archive_filename_regex)" | sort -r)
         if [ ${#local_backups[@]} -gt 0 ]; then
             local_available=true
         fi
@@ -10797,7 +11131,7 @@ run_verify() {
                     log_message "$ERROR_MSG"; echo "ERROR: Could not connect to cloud storage: ${rclone_output}" >&2
                     return 1
                 fi
-                mapfile -t backups < <(grep -E "${TARBALL_BASENAME}_.*\.tar\.(zst|gz|xz)\.gpg$" <<< "$rclone_output" | sort -r)
+                mapfile -t backups < <(grep -E "$(get_archive_filename_regex)" <<< "$rclone_output" | sort -r)
                 if [ ${#backups[@]} -eq 0 ]; then
                     local ERROR_MSG="ERROR: No cloud backups found for host (${HOSTNAME}) at ${BACKUP_DIR}."
                     log_message "$ERROR_MSG"; echo "$ERROR_MSG" >&2
@@ -10817,7 +11151,7 @@ run_verify() {
                         log_message "$ERROR_MSG"; echo "ERROR: Could not connect to cloud storage: ${rclone_output}" >&2
                         return 1
                     fi
-                    mapfile -t backups < <(grep -E "${TARBALL_BASENAME}_.*\.tar\.(zst|gz|xz)\.gpg$" <<< "$rclone_output" | sort -r)
+                    mapfile -t backups < <(grep -E "$(get_archive_filename_regex)" <<< "$rclone_output" | sort -r)
                     if [ ${#backups[@]} -eq 0 ]; then
                         local ERROR_MSG="ERROR: No cloud backups found for host (${HOSTNAME}) at ${BACKUP_DIR}."
                         log_message "$ERROR_MSG"; echo "$ERROR_MSG" >&2
@@ -10843,7 +11177,7 @@ run_verify() {
                         log_message "$ERROR_MSG"; echo "ERROR: Could not connect to cloud storage: ${rclone_output}" >&2
                         return 1
                     fi
-                    mapfile -t backups < <(grep -E "${TARBALL_BASENAME}_.*\.tar\.(zst|gz|xz)\.gpg$" <<< "$rclone_output" | sort -r)
+                    mapfile -t backups < <(grep -E "$(get_archive_filename_regex)" <<< "$rclone_output" | sort -r)
                     if [ ${#backups[@]} -eq 0 ]; then
                         local ERROR_MSG="ERROR: No cloud backups found for host (${HOSTNAME}) at ${BACKUP_DIR}."
                         log_message "$ERROR_MSG"; echo "$ERROR_MSG" >&2
@@ -10965,7 +11299,7 @@ run_verify() {
                 return 1
             fi
 
-            mapfile -t backups < <(grep -E "${TARBALL_BASENAME}_.*\.tar\.(zst|gz|xz)\.gpg$" <<< "$rclone_output" | sort -r)
+            mapfile -t backups < <(grep -E "$(get_archive_filename_regex)" <<< "$rclone_output" | sort -r)
         fi
 
         if [ ${#backups[@]} -eq 0 ]; then
@@ -12510,9 +12844,9 @@ init_config() {
 # Default: ("chrome" "chromium" "google-chrome" "firefox" "firefox-bin" "firefox-esr" "vivaldi" "vivaldi-bin" "vivaldi-snapshot" "brave" "brave-browser" "opera" "opera-beta" "opera-developer" "thunderbird" "thunderbird-bin" "betterbird" "librewolf" "floorp" "evolution" "microsoft-edge" "msedge" "edge")
 #TARGET_RUNNING_APPS=("chrome" "chromium" "google-chrome" "firefox" "firefox-bin" "firefox-esr" "vivaldi" "vivaldi-bin" "vivaldi-snapshot" "brave" "brave-browser" "opera" "opera-beta" "opera-developer" "thunderbird" "thunderbird-bin" "betterbird" "librewolf" "floorp" "evolution" "microsoft-edge" "msedge" "edge")
 
-# Seconds to wait for applications to exit and flush state after SIGTERM (when action is 'close').
-# Default: 10
-#RUNNING_APPS_SETTLE_TIMEOUT=10
+# Seconds to wait for applications to exit and flush state (when action is 'close').
+# Default: 25
+#RUNNING_APPS_SETTLE_TIMEOUT=25
 
 #------------------------------------------------------------------------------
 # 15. Email Alerts & Notifications
@@ -13477,13 +13811,13 @@ check_config() {
     local local_pinned_count=0 cloud_pinned_count=0 pres_pinned_count=0
     local local_dest_check
     if local_dest_check=$(get_local_backup_path 2>/dev/null) && [ -d "$local_dest_check" ]; then
-        local_pinned_count=$(find "$local_dest_check" -maxdepth 1 -type f -name "${TARBALL_BASENAME}_*.pinned" 2>/dev/null | wc -l)
+        local_pinned_count=$(find "$local_dest_check" -maxdepth 1 -type f -name "${TARBALL_BASENAME}_*.pinned" -printf "%f\n" 2>/dev/null | grep -E "$(get_pinned_filename_regex)" | wc -l)
     fi
     if [ -d "$SOURCE_DIR" ]; then
-        pres_pinned_count=$(find "$SOURCE_DIR" -maxdepth 1 -type f -name "${TARBALL_BASENAME}_*.pinned" 2>/dev/null | wc -l)
+        pres_pinned_count=$(find "$SOURCE_DIR" -maxdepth 1 -type f -name "${TARBALL_BASENAME}_*.pinned" -printf "%f\n" 2>/dev/null | grep -E "$(get_pinned_filename_regex)" | wc -l)
     fi
     if [[ "$BACKUP_DIR" == *:* ]] && command -v rclone &>/dev/null; then
-        cloud_pinned_count=$(rclone lsf --files-only --max-depth 1 --include "${TARBALL_BASENAME}_*.pinned" "$BACKUP_DIR" 2>/dev/null | grep -E "${TARBALL_BASENAME}_.*\.pinned$" | wc -l)
+        cloud_pinned_count=$(rclone lsf --files-only --max-depth 1 --include "${TARBALL_BASENAME}_*.pinned" "$BACKUP_DIR" 2>/dev/null | grep -E "$(get_pinned_filename_regex)" | wc -l)
     fi
     local total_pinned=$((local_pinned_count + pres_pinned_count + cloud_pinned_count))
     if [ "$total_pinned" -gt 0 ]; then
@@ -13581,7 +13915,7 @@ check_config() {
             report_ok "Apps Consistency (Interactive)" "Interactive prompt mode (prompts user when run in terminal)"
             ;;
         close|kill|terminate)
-            report_ok "Apps Consistency (Interactive)" "Auto-close mode (SIGTERM graceful termination with ${RUNNING_APPS_SETTLE_TIMEOUT:-10}s timeout)"
+            report_ok "Apps Consistency (Interactive)" "Auto-close mode (3-stage graceful termination with ${RUNNING_APPS_SETTLE_TIMEOUT:-25}s timeout)"
             ;;
         sync|warn|flush)
             report_ok "Apps Consistency (Interactive)" "Filesystem sync mode (apps remain running; disk buffers flushed)"
@@ -13964,9 +14298,15 @@ show_main_menu() {
 #  Main Script
 #------------------------------------------------------------------------------
 
-# Handle help and diagnostic options early before dependency checking or signal traps
+# Handle help, version, and diagnostic options early before dependency checking or signal traps
 case "${1:-}" in
+    version|--version|-V)
+        echo "backup_script.sh version ${SCRIPT_VERSION}"
+        exit 0
+        ;;
     help|-h|--help)
+        echo "backup_script.sh version ${SCRIPT_VERSION}"
+        echo
         echo "Usage: $0 [command] [options]"
         echo
         echo "Commands:"
@@ -14109,6 +14449,7 @@ case "${1:-}" in
         echo "  init-config [path] [--force]  Generate a template configuration file with all configurable settings"
         echo "  export-rclone-config [target] Export rclone configuration file for disaster recovery escrow (chmod 600)"
         echo "  export-gpg-keys [target_dir]  Export ASCII-armored GPG public and secret keys for disaster recovery (chmod 600)"
+        echo "  version, --version, -V        Display script version"
         echo "  help, -h, --help              Display this help message"
         echo
         echo "Run without arguments to launch the interactive menu."
