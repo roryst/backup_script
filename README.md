@@ -17,6 +17,7 @@ A robust, enterprise-grade Bash backup, verification, and disaster-recovery solu
 - [Command Reference & Examples](#command-reference--examples)
   - [Environment & Health Check (`check-config`)](#environment--health-check-check-config)
   - [Creating Backups (`backup`)](#creating-backups-backup)
+  - [Standalone Disaster Recovery Bundler (`bundle`)](#standalone-disaster-recovery-bundler-bundle)
   - [Listing Available Backups (`list`)](#listing-available-backups-list)
   - [Archive Pinning & Retention Holds (`pin`, `unpin`, `pinned`)](#archive-pinning--retention-holds-pin-unpin-pinned)
   - [Viewing Archive Files (`list-files`)](#viewing-archive-files-list-files)
@@ -27,8 +28,9 @@ A robust, enterprise-grade Bash backup, verification, and disaster-recovery solu
   - [Integrity Verification (`verify`)](#integrity-verification-verify)
   - [Restoring Data (`restore`)](#restoring-data-restore)
   - [System Packages & State Restore (`restore-system`)](#system-packages--state-restore-restore-system)
+  - [Preserved Archive Recovery (`manage-preserved`, `clean-preserved`)](#preserved-archive-recovery-manage-preserved-clean-preserved)
   - [Automated Scheduling (`systemd` Timer)](#automated-scheduling-systemd-timer)
-  - [Testing Email Notifications (`test-email`)](#testing-email-notifications-test-email)
+  - [Testing Notifications & Email (`test-email`, `test-notification`)](#testing-notifications--email-test-email-test-notification)
   - [Disaster Recovery Escrow Exports (`export-rclone-config`, `export-gpg-keys`)](#disaster-recovery-escrow-exports-export-rclone-config-export-gpg-keys)
 - [Retention Policies, GFS Pruning & Retention Holds](#retention-policies-gfs-pruning--retention-holds)
 - [Exclusion Rules](#exclusion-rules)
@@ -46,49 +48,86 @@ A robust, enterprise-grade Bash backup, verification, and disaster-recovery solu
 ## Features
 
 ### 🛡️ Security & Encryption
-- **Multi-Mode Encryption**: Supports symmetric AES-256 (`gpg`), asymmetric public-key encryption (ideal for headless servers with zero secret keys on disk), or hybrid encryption.
-- **Strict Permission Enforcement**: Automatically ensures configuration files and passphrase secrets are locked to `chmod 700` and `600`.
+- **Multi-Mode & Multi-Recipient Encryption**: Supports symmetric AES-256 (`gpg`), asymmetric public-key encryption across one or multiple GPG recipients (`GPG_RECIPIENT` / `GPG_RECIPIENTS`, ideal for headless servers with zero secret keys on disk), or hybrid encryption (unlockable with either a secret key or passphrase).
+- **Hardware-Accelerated AEAD Encryption**: Automatically enables modern AEAD authenticated encryption (`OCB` or `EAX` mode via `GPG_AEAD_ALGO="auto"`) when supported by GnuPG for faster throughput and tamper detection, with seamless fallback to standard CFB+MDC packets.
+- **Strict Permission Enforcement**: Automatically ensures configuration directories, config files, and passphrase secrets are locked to `chmod 700` and `600` (with `check-config --fix` auto-remediation).
 - **Disaster Recovery Escrow Exports**: Built-in CLI commands to export OAuth cloud configurations (`export-rclone-config`) and ASCII-armored GPG public and secret keys (`export-gpg-keys`) with automated strict `chmod 600` permission enforcement for offline paper/USB vaults.
-- **Zero Temporary Secret Leakage**: Passphrases and encryption pipes are handled in memory and secure file descriptors.
+- **Zero Temporary Secret Leakage**: Passphrases and encryption pipes are handled in memory and secure file descriptors (`--passphrase-fd 3`), and explicitly scrubbed from memory on exit.
 
 ### ⚡ Compression & Performance
-- **Modern Zstandard (`zstd`)**: Tuned compression (default level 6) with **Long Distance Matching (`--long=27`)** to dramatically compress repetitive text, code repositories, and container structures.
+- **Modern Zstandard (`zstd`)**: Tuned multi-threaded compression (default level 6) with **Long Distance Matching (`--long=27`)** to dramatically compress repetitive text, code repositories, and container structures.
 - **Live Terminal Throughput (`pv`)**: Automatically pipes archive streaming operations through Pipe Viewer (`pv`) in interactive terminals to display real-time throughput rates and transferred data counters without disrupting `tar`/`gpg` exit status codes.
 - **Non-Disruptive Process Priority (`nice` & `ionice`)**: Automatically lowers execution priority to background levels (`nice -n 19`, `ionice -c 2 -n 7`), preventing workstation UI freezes or I/O stalls during intensive backups and restores.
-- **Adaptive Cloud Streaming**: Restore directly from cloud storage via `rclone cat` without downloading full multi-gigabyte archives to local disk, falling back to local staging when disk permits.
-- **Resilient Network Streaming**: All `rclone cat` streaming operations (restores, verifications, index queries) incorporate multi-level retries (`--retries 3 --low-level-retries 10`), socket timeouts, and optional bandwidth throttling to resist transient socket drops.
-- **Parallel Companion Uploads**: Companion sidecars (`.sha256`, `.manifest.json`, `.files.gz`, `.pinned`) and disaster recovery bootstrap files upload concurrently in parallel background threads, cutting round-trip API latency.
-- **Resource Aware**: Dynamically caps decompression memory and enforces scratch space checks before archiving to prevent disk exhaustion.
+- **Adaptive Cloud Streaming**: Restore directly from cloud storage via `rclone cat` without downloading full multi-gigabyte archives to local disk, or stage to scratch space automatically when disk space permits.
+- **Resilient Network Transfers**: Multi-threaded cloud uploads (`--multi-thread-streams 4`) and resilient `rclone cat` streaming operations incorporate multi-level retries (`--retries 3 --low-level-retries 10`), socket timeouts, and optional bandwidth throttling (`RCLONE_BWLIMIT`) to resist transient socket drops.
+- **Batched Companion Uploads**: Companion sidecars (`.sha256`, `.manifest.json`, `.files.gz`, `.pinned`) are transferred in a single batched `rclone copy --files-from-raw` pass to minimize cloud API round-trips.
+- **Resource Aware**: Dynamically scales decompression memory (`ZSTD_DECOMPRESS_MEMORY`) to match LDM window sizes and enforces pre-flight scratch space checks (`MIN_FREE_SPACE_GB`) before archiving.
 
 ### 🔄 Dual-Destination Synchronization & Retention
 - **Hybrid Storage**: Concurrently synchronizes to local external partitions (auto-discovered via filesystem UUID) and cloud remotes via `rclone` (Google Drive, Backblaze B2, AWS S3, etc.).
 - **Archive Pinning & Retention Holds**: Explicitly pin significant archives (e.g. prior to major system updates, migrations, or project milestones) locally and/or in the cloud with human-readable reason notes (`backup --pin "Pre-distro upgrade"` or `./backup_script.sh pin latest`). Pinned archives are completely immune from automated count-based pruning and GFS rotation, and do not consume regular retention quota slots.
 - **Flexible Retention (Count-Based or GFS Tiered)**:
   - **Count-based** (default): Retains the `N` newest archives on local drive and cloud remote (default: 10).
-  - **Grandfather-Father-Son (GFS) Tiered Retention**: Automatically maintains a timeline of daily, weekly, monthly, and yearly archives (default: 7 daily, 4 weekly, 6 monthly, 1 yearly) for months or years of recovery coverage without extra storage bloat.
-- **Preserved Archive Management**: If network or remote connectivity fails, encrypted archives can be preserved locally to avoid data loss and re-uploaded later using `manage-preserved`.
+  - **Grandfather-Father-Son (GFS) Tiered Retention**: Automatically maintains a timeline of hourly, daily, weekly, monthly, and yearly archives (default: 0 hourly, 7 daily, 4 weekly, 6 monthly, 1 yearly) plus same-day intra-day snapshot protection (`RETENTION_KEEP_INTRADAY="true"`).
+- **Preserved Archive Management**: If network or remote connectivity fails, encrypted archives and their companion sidecars are preserved locally in `~` to prevent data loss and can be re-uploaded later using `manage-preserved` or purged with `clean-preserved`.
 
 ### 🔍 Verification & Integrity
-- **SHA-256 Sidecar Checksums**: Companion `.sha256` files accompany every archive, allowing sub-10-second bit-rot validation without needing to decrypt multi-gigabyte archives.
-- **Inline Single-Pass Verification**: Verifies checksums on-the-fly during cloud streaming via named pipes and `tee`.
-- **Full Tar Stream Validation**: Thoroughly validates encryption integrity and tar archive block structure without writing files to disk.
+- **Pre-Upload Local Integrity Verification**: Automatically verifies the newly created archive locally (on the external backup drive if mounted, or directly in the staging scratch directory) **before** uploading to cloud storage—catching any corruption or encryption errors immediately without wasting bandwidth uploading a bad archive.
+- **Deferred Retention Rotation**: Both local and cloud archive pruning are deferred until integrity verification succeeds, guaranteeing that known-good historical backups are never rotated out if a new archive fails verification.
+- **SHA-256 Sidecar Checksums**: Companion `.sha256` files accompany every archive, allowing sub-10-second bit-rot validation (`--checksum-only`) without needing to decrypt multi-gigabyte archives.
+- **Inline Single-Pass Cloud Verification**: Verifies SHA-256 checksums on-the-fly during cloud streaming restores and cloud verifications (`--verify-cloud`) via named pipes and `tee`.
+- **Full Tar Stream Validation**: Thoroughly validates GPG decryption and `tar`/`zstd` archive block structure without writing files to disk.
 
 ### 📦 System State Snapshots, Manifests & File Indexing
-- **OS Environment Capture**: Exports lists of installed system packages (APT or DNF), package hold selections, Flatpaks, Pipx packages, enabled systemd user units, desktop `dconf` configurations, crontabs, and repository/GPG keyrings into the backup.
+- **OS Environment Capture**: Exports lists of installed system packages (APT manual packages, foreign `dpkg` architectures, and `debconf` selections on Debian/Ubuntu/Mint; DNF user-installed packages on Fedora/RHEL), Flatpaks, Pipx packages, enabled systemd user units, desktop `dconf` configurations, crontabs, and repository/GPG keyrings into the backup.
 - **Modular System State Restore (`restore-system`)**: Dedicated subcommand that re-applies packages, repositories, desktop settings, systemd user units, and crontabs directly from unpacked directories or extracts manifests from an archive in a single pass without downloading or unpacking the entire home directory.
 - **Interactive Archive File Browser**: Search and browse files inside archives using companion `.files.gz` indexes, multi-select items with number ranges (`1, 3-5`), and restore selectively without full downloads.
-- **Companion JSON Manifests (`.manifest.json`)**: Instantly inspect archive metadata, compression ratios, package counts, and checksums without downloading or decrypting the archive.
+- **Companion JSON Manifests (`.manifest.json`)**: Instantly inspect archive metadata, compression ratios, package counts, destination sync statuses, and checksums without downloading or decrypting the archive.
 - **Zero-Bandwidth Companion File Indexes (`.files.gz`)**: Captures full file tables during archive creation (`tar -vv --index-file`) with zero extra disk passes, enabling instant file search (`find-file`) and zero-download archive exploration (`list-files`) across all local and remote snapshots.
 - **Zero-Decryption Backup Drift Comparison (`diff-backups`)**: Instantly diff any two backups (local or cloud) using companion index sidecars in seconds without decrypting or decompressing multi-gigabyte archives. Categorizes added, removed, and modified files with exact size deltas, net storage drift analytics, interactive filtering, and structured JSON/CSV exports.
 
 ### ⚙️ Reliability & Safety
-- **Multi-Run Historical Log Retention**: Retains timestamped per-run logs in `~/.config/backup_script/logs` (`backup_rory_YYYY-MM-DD_HHMMSS.log`) with configurable pruning retention (`LOG_RETENTION_COUNT=14`) while maintaining backwards-compatible active `$LOG_FILE` pointer.
-- **Application Consistency Guard & Cgroup-Decoupled Relaunch**: Detects running database-heavy applications (Vivaldi, Chrome, Firefox, Thunderbird) and gracefully terminates them with `SIGTERM` and filesystem `sync` before archiving. When `RESTART_CLOSED_APPS=true` (or `--restart-apps`), the script automatically relaunches closed applications. Under systemd services, relaunches are prioritized into independent `app.slice` scopes via `systemd-run` alongside `KillMode=mixed`, preventing cgroup teardown crashes when the backup unit terminates.
+- **Dry-Run Simulation (`--dry-run` / `-n`)**: Simulate the entire backup workflow—including pre-flight checks, exclusion rules, and count/GFS retention pruning calculations—without creating or deleting any files.
+- **Application Consistency Guard, SQLite WAL Checkpointing & Cgroup-Decoupled Relaunch**: Detects running database-heavy applications (Vivaldi, Chrome, Firefox, Thunderbird, Brave, etc.) and either gracefully terminates them (`SIGTERM` with configurable `25s` settle timeout) or performs safe, passive SQLite WAL checkpointing (`PRAGMA wal_checkpoint(PASSIVE)`) on open browser/email databases before flushing OS buffers (`sync`). When `RESTART_CLOSED_APPS=true` (or `--restart-apps`), closed applications are automatically relaunched in independent `app.slice` scopes as soon as local archiving finishes (before cloud upload).
+- **Pre & Post Backup Lifecycle Hooks**: Execute custom scripts (`~/.config/backup_script/pre-backup.sh`, `post-backup.sh`) or inline commands (`PRE_BACKUP_COMMAND`, `POST_BACKUP_COMMAND`) before and after backup runs with rich status arguments.
+- **Multi-Run Historical Log Retention**: Retains timestamped per-run logs in `~/.config/backup_script/logs` (`backup_<user>_YYYY-MM-DD_HHMMSS.log`) with configurable pruning retention (`LOG_RETENTION_COUNT=14`) while maintaining a backwards-compatible active `$LOG_FILE` pointer.
 - **Passphrase Memory Isolation**: Explicitly wipes plaintext passphrases from shell environment memory (`unset`) upon exit or signal interruption.
 - **Pre-Restore Safety Backups**: Automatically generates a timestamped safety backup of the active user crontab (`~/.crontab.pre-restore.<timestamp>.bak`) prior to applying crontab restorations.
 - **Concurrency Locking & Sleep Inhibition**: Uses kernel `flock` and `systemd-inhibit` to prevent overlapping runs and ensure systems do not suspend during backup or restoration.
-- **Graceful Cleanup**: Traps `SIGINT`, `SIGTERM`, and script exit to clean up scratch paths, temporary statistics staging directories, and named pipes safely, and reliably relaunches any closed apps.
 - **Standards-Compliant Failure, Success & Size Alerts**: Dispatches automated email alerts on backup failure, successful completion, or when an archive's size changes significantly (>= 15% increase or decrease by default) compared to the previous backup using local MTAs (`msmtp`, `mailx`), complete with `Message-ID` and MIME headers for optimal inbox deliverability.
+
+---
+
+## Architecture & Workflow
+
+### Modular Library Architecture & Standalone Bundler
+The suite uses a clean modular architecture for maintainability while providing a single-file standalone bundle for bare-metal disaster recovery:
+
+- **Entry Wrapper (`~/.local/bin/backup_script.sh`)**: Lightweight dispatcher that resolves paths and sources the modular libraries in dependency order.
+- **Modular Libraries (`~/.local/lib/backup_script/`)**:
+  - `config.sh` — Configuration parsing, defaults, environment discovery, and security permission checks
+  - `core.sh` — Logging, desktop notifications, MTA email delivery, locking, and signal cleanup traps
+  - `cloud.sh` — `rclone` remote connectivity, caching, local UUID drive resolution, and DR mirroring
+  - `crypto.sh` — Symmetric/asymmetric/hybrid GPG encryption, AEAD detection, and key/config escrow exports
+  - `consistency.sh` — Running application detection, graceful termination, SQLite WAL checkpointing, and cgroup-decoupled relaunch
+  - `system_state.sh` — APT/DNF/Flatpak/Pipx/dconf/systemd/crontab export and `restore-system` replay
+  - `retention.sh` — Count-based and GFS tiered pruning, archive pinning, and retention holds
+  - `backup.sh` — Archive creation pipeline, sidecar generation, pre-upload verification, and standalone bundler
+  - `restore.sh` — Full/selective/interactive restoration and archive integrity verification (`verify`)
+  - `analytics.sh` — Manifest inspection (`manifest`), historical trends (`stats`), file search (`find-file`), and drift analysis (`diff-backups`)
+  - `ui.sh` — Interactive menus, `check-config` diagnostics, `systemd` timer management, and preserved archive tools
+  - `main_dispatcher.sh` — CLI argument normalization and subcommand routing
+- **Standalone Disaster Recovery Bundle (`./backup_script.sh bundle`)**: Combines all modules into a single zero-dependency executable script (`backup_script_standalone.sh`) that is automatically mirrored alongside `RESTORE_README.txt` to your external drive and cloud remote.
+
+### Backup Execution Pipeline
+Each `backup` run follows a fail-safe 7-stage pipeline:
+1. **Step 1 — System State Snapshot**: Exports package lists, repositories, signing keys, Flatpaks, Pipx specs, systemd user units, `dconf` settings, and user crontab.
+2. **Step 2 — Application Consistency**: Closes target running apps (or checkpoints open SQLite WAL databases) and flushes filesystem buffers.
+3. **Step 3 — Archive, Compress, Encrypt & Sidecars**: Streams `tar` $\rightarrow$ `zstd` $\rightarrow$ `gpg` into `~/.backup_scratch`, generating `.files.gz`, `.sha256`, `.manifest.json`, and optional `.pinned` sidecars, then immediately relaunches any closed desktop applications.
+4. **Step 3.5 — Local External Drive Copy**: Copies the encrypted archive and sidecars to the UUID-mounted external drive (if connected).
+5. **Step 3.75 — Pre-Upload Local Integrity Verification**: Verifies the local copy (or staged scratch archive if the external drive is unplugged) **before** cloud upload. If verification fails, the cloud upload and archive rotation are aborted immediately.
+6. **Step 4 & 5 — Cloud Upload & Scratch Cleanup**: Uploads the verified archive, companion sidecars, and standalone recovery bundle to cloud storage via `rclone`, then cleans up `~/.backup_scratch`. (If `--verify-cloud` was explicitly requested, Step 6 streams and verifies the remote copy post-upload.)
+7. **Step 7 — Post-Verification Retention & Rotation**: Prunes expired unpinned archives on local and cloud destinations according to your `count` or `tiered` (GFS) policy.
 
 ---
 
@@ -103,47 +142,40 @@ Ensure the following tools are installed on your Linux system:
 | `bash` | Shell execution engine | 4.3+ |
 | `tar` | Archive bundling | GNU tar (with `--exclude-tag-all` support) |
 | `zstd` | Ultra-fast compression | 1.4+ |
-| `gpg` | Asymmetric & symmetric AES-256 encryption | GnuPG 2.x |
+| `gpg` | Asymmetric, hybrid & symmetric AES-256 encryption | GnuPG 2.x |
 | `rclone` | Cloud storage transfer & streaming | Recent stable release |
 | `sha256sum` | Cryptographic checksum generation & validation | GNU coreutils |
 | `gzip` | Fast compression for companion `.files.gz` index sidecars | Any modern version |
 | `flock` | Script execution locking | `util-linux` |
 | `lsblk` / `blkid` | Local external drive UUID discovery | `util-linux` |
+| `python3` | Manifest parsing, historical trend analytics, JSON output formatting | 3.6+ |
 
 ### Optional Helper Integrations
 
 | Utility | Used For |
 | :--- | :--- |
-| `apt-mark` | Capturing manually installed APT packages on Debian/Ubuntu/Mint |
+| `apt-mark` / `dpkg` | Capturing manually installed APT packages and foreign architectures on Debian/Ubuntu/Mint |
+| `debconf-get-selections` | Capturing pre-seeded package configuration answers on Debian/Ubuntu/Mint (`debconf-utils`) |
 | `dnf` | Capturing user-installed RPM packages on Fedora/RHEL/CentOS/Rocky/Alma |
-| `msmtp` / `mailx` | Email notification alerts on backup failure |
+| `sqlite3` | Passive SQLite WAL checkpointing (`PRAGMA wal_checkpoint(PASSIVE)`) for open browser/mail DBs |
+| `msmtp` / `mailx` | Email notification alerts on backup failure, success, or size changes |
 | `flatpak` | Capturing installed Flatpak apps and remotes |
 | `pipx` | Capturing installed standalone Python CLI tools |
 | `dconf` | Exporting GNOME/desktop settings snapshot |
 | `crontab` | Exporting user scheduled jobs |
-| `systemd` | Managing automated `--user` timers and services |
+| `systemd` | Managing automated `--user` timers, sleep inhibition, and cgroup-decoupled app relaunch |
 | `pv` | Live terminal progress and throughput rate display |
 | `ionice` | Background I/O scheduling class and priority control |
 
 To install common dependencies on Debian/Ubuntu/Mint:
 ```bash
 sudo apt update
-sudo apt install -y bash tar zstd gnupg rclone coreutils util-linux gzip msmtp pv
+sudo apt install -y bash tar zstd gnupg rclone coreutils util-linux gzip python3 sqlite3 msmtp pv
 ```
 
 To install common dependencies on Fedora/RHEL/CentOS Stream/Rocky/AlmaLinux:
 ```bash
-sudo dnf install -y bash tar zstd gnupg2 rclone coreutils util-linux gzip msmtp pv
-```
-
-To install common dependencies on Arch Linux:
-```bash
-sudo pacman -S --needed bash tar zstd gnupg rclone coreutils util-linux gzip msmtp pv
-```
-
-To install common dependencies on openSUSE (Leap / Tumbleweed):
-```bash
-sudo zypper install -y bash tar zstd gpg2 rclone coreutils util-linux gzip msmtp pv
+sudo dnf install -y bash tar zstd gnupg2 rclone coreutils util-linux gzip python3 sqlite3 msmtp pv
 ```
 
 ---
@@ -172,12 +204,14 @@ echo "YOUR_STRONG_PASSPHRASE" > ~/.config/backup_script/passphrase
 chmod 600 ~/.config/backup_script/passphrase
 ```
 
-#### Asymmetric / Public-Key Encryption (Optional)
-If running on a server or automated host where you do not want secrets stored, configure GPG public-key encryption:
+#### Asymmetric / Public-Key or Hybrid Encryption (Optional)
+If running on a server or automated host where you do not want secrets stored, configure GPG public-key encryption (supports single or multiple recipients) or `hybrid` mode (decryptable with either your GPG secret key or symmetric passphrase):
 ```bash
 # In ~/.config/backup_script/config:
-ENCRYPTION_MODE="asymmetric"
+ENCRYPTION_MODE="asymmetric"   # or "hybrid"
 GPG_RECIPIENT="your_email@domain.com"
+# Or specify multiple recipients:
+# GPG_RECIPIENTS=("primary@domain.com" "escrow@domain.com")
 ```
 
 ### 3. Configure Storage Destinations
@@ -203,9 +237,10 @@ BACKUP_DIR="googledrive:backup/"
 
 ### 4. Verify Environment
 
-Run the pre-flight check to validate your configuration, dependencies, and credentials:
+Run the pre-flight check to validate your configuration, dependencies, and credentials (use `--fix` to automatically tighten file/directory permissions):
 ```bash
 ./backup_script.sh check-config
+./backup_script.sh check-config --fix
 ```
 
 ---
@@ -214,7 +249,7 @@ Run the pre-flight check to validate your configuration, dependencies, and crede
 
 ### Environment & Health Check (`check-config`)
 
-Validates file permissions, storage availability, cloud remotes, and external tools:
+Validates file permissions, storage availability, cloud remotes, and external tools (supports `--fix` / `-f` to auto-remediate permissions and `--quiet` / `-q` to report only warnings/errors):
 
 ```bash
 $ ./backup_script.sh check-config
@@ -256,7 +291,7 @@ Cloud Remote Destination (rclone):
  [  OK  ]  Rclone Chunk Size            256M (upload cutoff: 256M)
 
 Compression & Applications:
- [  OK  ]  Apps Consistency             Auto-close mode (SIGTERM graceful termination with 10s timeout)
+ [  OK  ]  Apps Consistency             Auto-close mode (SIGTERM graceful termination with 25s timeout)
  [  OK  ]  Apps Relaunch                Enabled (closed applications will be automatically relaunched after archive creation)
  [ INFO ]  Active Applications          Currently running: vivaldi-bin
  [  OK  ]  Failure Email Alert          Configured: rorymobley5@gmail.com
@@ -287,22 +322,43 @@ Execute a manual backup immediately:
 ```
 
 #### Common Options:
+- `--dry-run`, `-n`: Simulate backup creation and count/GFS rotation without creating or deleting any files.
 - `--pin [reason]`: Pin archive (retention hold) during backup creation, exempting it permanently from rotation.
 - `--pin-reason, -pr <text>`: Specify custom explanation or tag when pinning an archive during backup (e.g. `--pin "Pre-distro upgrade"`).
 - `--close-apps`: Gracefully terminate running target applications (default).
 - `--prompt-apps`: Interactively prompt whether to close running applications.
-- `--no-close-apps`: Skip closing open applications; flushes filesystem buffers via `sync`.
+- `--no-close-apps`: Skip closing open applications; performs passive SQLite WAL checkpointing and flushes filesystem buffers via `sync`.
+- `--unattended-apps-action, -uaa <mode>`: Action for unattended/timer runs (`close`, `sync`, or `ignore`).
 - `--restart-apps`, `-ra`: Automatically relaunch closed applications as soon as archive creation and checksum calculation complete (before cloud upload).
 - `--no-restart-apps`, `-nra`: Do not relaunch closed applications after backup completes.
-- `--verify-checksum`, `-vc`: Run fast SHA-256 bit-rot validation immediately after creation.
-- `--no-verify`: Skip post-backup verification for faster completion.
-- `--asymmetric [key]`: Encrypt with GPG public key.
-- `--alert-email <email>`: Override failure and size alert notification address.
-- `--alert-on-size-change`: Send email alert if backup size changes by >= threshold% compared to previous backup (default: on).
-- `--no-alert-on-size-change`: Disable email alerts for backup size changes.
+- `--sqlite-checkpoint` / `--no-sqlite-checkpoint`: Enable or disable passive SQLite WAL checkpointing (`PRAGMA wal_checkpoint(PASSIVE)`) on open browser/email databases.
+- `--verify, -v [source]`: Run full decryption and `tar` stream verification (`local` runs pre-upload; `cloud` streams post-upload).
+- `--verify-checksum, -vc [source]`: Run fast SHA-256 sidecar bit-rot validation (`local` runs pre-upload by default via `AUTO_VERIFY_BACKUP="checksum-local"`).
+- `--no-verify`: Skip integrity verification for faster completion.
+- `--asymmetric [key]` / `--hybrid [key]` / `--symmetric`: Select encryption mode per run.
+- `--recipient, -r <key>`: Add GPG recipient key ID, fingerprint, or email (can be specified multiple times).
+- `--aead-algo <OCB|EAX|none>` / `--no-aead`: Configure or disable GPG AEAD authenticated encryption.
+- `--retention-hourly <N>`: Retain `N` hourly snapshots when using `tiered` (GFS) retention.
+- `--keep-intraday` / `--no-keep-intraday`: Keep all intra-day snapshots created on the active backup date (default: enabled).
+- `--alert-email, -ae <email>`: Override failure and size alert notification address.
+- `--alert-on-size-change` / `--no-alert-on-size-change`: Enable or disable email alerts if backup size changes by $\ge$ threshold% compared to previous backup (default: on).
 - `--size-change-threshold <pct>`: Percentage threshold for size change alerts (default: 15).
-- `--email-on-success`: Send email notification upon successful backup completion.
-- `--success-email <email>`: Specify recipient address for success notifications (enables success email).
+- `--email-on-success` / `--no-email-on-success`: Enable or disable email notification upon successful backup completion.
+- `--success-email, -se <email>`: Specify recipient address for success notifications (enables success email).
+
+---
+
+### Standalone Disaster Recovery Bundler (`bundle`)
+
+Compile all modular libraries (`~/.local/lib/backup_script/*.sh`) into a single self-contained, zero-dependency executable script for offline disaster recovery or portable deployment:
+
+```bash
+# Generate default standalone bundle (~/.local/bin/backup_script_standalone.sh)
+./backup_script.sh bundle
+
+# Generate standalone bundle at a custom destination path (e.g. external drive or USB)
+./backup_script.sh bundle /media/rory/SECURE_USB/backup_script.sh
+```
 
 ---
 
@@ -520,7 +576,7 @@ $ ./backup_script.sh manifest latest
   Created (UTC)    : 2026-09-21T05:53:37Z
   Host / User      : hp / rory
   Source Directory : /home/rory
-  Script Version   : 9.35.0
+  Script Version   : 11.7.2
   Duration         : 1m 46s (106s)
 -------------------------------------------------------------------------------
   Archive Details
@@ -839,6 +895,26 @@ You can selectively restore specific layers of the system:
 
 ---
 
+### Preserved Archive Recovery (`manage-preserved`, `clean-preserved`)
+
+If a backup run completes while cloud storage is unreachable (or if an upload fails), the encrypted archive and its companion sidecars are preserved locally in `~` so no data is lost:
+
+```bash
+# Launch interactive menu to inspect, retry uploading, or delete preserved archives
+./backup_script.sh manage-preserved
+
+# List all preserved archives waiting for upload
+./backup_script.sh manage-preserved --list
+
+# Non-interactively retry uploading all preserved archives to cloud storage
+./backup_script.sh manage-preserved --retry
+
+# Delete all preserved archives and their companion sidecar files
+./backup_script.sh clean-preserved
+```
+
+---
+
 ### Automated Scheduling (`systemd` Timer)
 
 The script includes built-in systemd user service and timer integration.
@@ -881,19 +957,22 @@ Service Status (Last Run):
 
 ---
 
-### Testing Email Notifications (`test-email`)
+### Testing Notifications & Email (`test-email`, `test-notification`)
 
-Verify mail delivery, sender reputation headers (`Message-ID`, `MIME-Version`), and recipient reachability directly from the command line or interactive menu:
+Verify MTA email delivery, sender reputation headers (`Message-ID`, `MIME-Version`), and desktop notification delivery (`notify-send`) directly from the command line or interactive menu:
 
 ```bash
-# Send test notification to configured ALERT_EMAIL using auto-detected sender
+# Send test email notification to configured ALERT_EMAIL using auto-detected sender
 $ ./backup_script.sh test-email
 
-# Send test notification to an explicit recipient address
+# Send test email notification to an explicit recipient address
 $ ./backup_script.sh test-email user@example.com
 
-# Send test notification with custom recipient and sender addresses
+# Send test email notification with custom recipient and sender addresses
 $ ./backup_script.sh test-email user@example.com alerts@custom-domain.org
+
+# Send a test desktop notification (optional urgency, title, and message)
+$ ./backup_script.sh test-notification normal "Backup Test" "Desktop notifications are working!"
 ```
 
 ---
@@ -943,11 +1022,13 @@ LOCAL_KEEP_COUNT=10
 ```
 
 ### 2. Grandfather-Father-Son (GFS) Tiered Retention
-Provides structured historical protection across days, weeks, months, and years without consuming massive storage:
-- **Daily**: Retains the newest backup for each of the last `N` days (default: 7).
-- **Weekly**: Retains the newest backup for each of the last `N` calendar weeks (default: 4).
-- **Monthly**: Retains the newest backup for each of the last `N` months (default: 6).
-- **Yearly**: Retains the newest backup for each of the last `N` years (default: 1).
+Provides structured historical protection across hours, days, weeks, months, and years without consuming massive storage:
+- **Hourly (`RETENTION_HOURLY`)**: Retains the newest backup for each of the last `N` distinct hours (default: 0 / disabled).
+- **Daily (`RETENTION_DAILY`)**: Retains the newest backup for each of the last `N` days (default: 7).
+- **Weekly (`RETENTION_WEEKLY`)**: Retains the newest backup for each of the last `N` calendar weeks (default: 4).
+- **Monthly (`RETENTION_MONTHLY`)**: Retains the newest backup for each of the last `N` months (default: 6).
+- **Yearly (`RETENTION_YEARLY`)**: Retains the newest backup for each of the last `N` years (default: 1).
+- **Intra-Day Active Day Protection (`RETENTION_KEEP_INTRADAY`)**: Keeps all intra-day snapshots created on the current/active backup date before consolidating previous days to 1 per day (default: `true`).
 - **Minimum Keep Floor (`RETENTION_MIN_KEEP`)**: Ensures the `N` most recent backups are never pruned, even if multiple backups were taken on the same day.
 
 To activate GFS Tiered Retention, configure in `~/.config/backup_script/config`:
@@ -956,10 +1037,12 @@ To activate GFS Tiered Retention, configure in `~/.config/backup_script/config`:
 RETENTION_MODE="tiered"       # or "gfs"
 
 # Number of historical buckets to preserve
+RETENTION_HOURLY=0            # Last N hours (0 = disabled)
 RETENTION_DAILY=7             # Last 7 days
 RETENTION_WEEKLY=4            # Last 4 weeks
 RETENTION_MONTHLY=6           # Last 6 months
 RETENTION_YEARLY=1            # Last 1 year
+RETENTION_KEEP_INTRADAY=true  # Keep all snapshots from the active backup date
 
 # Optional safety floor (default: 0)
 RETENTION_MIN_KEEP=0
@@ -1022,16 +1105,6 @@ Before beginning bare-metal restoration, install the foundational utilities for 
 - **Fedora / RHEL / CentOS Stream / Rocky / AlmaLinux**:
   ```bash
   sudo dnf install -y bash tar zstd gnupg2 rclone coreutils util-linux gzip msmtp pv
-  ```
-
-- **Arch Linux / Manjaro / EndeavourOS**:
-  ```bash
-  sudo pacman -S --needed bash tar zstd gnupg rclone coreutils util-linux gzip msmtp pv
-  ```
-
-- **openSUSE (Leap / Tumbleweed)**:
-  ```bash
-  sudo zypper install -y bash tar zstd gpg2 rclone coreutils util-linux gzip msmtp pv
   ```
 
 ### 2. Bootstrapping Cloud Storage Access (`rclone`)
@@ -1121,6 +1194,8 @@ If performing manual bare-metal recovery without `backup_script.sh`, the exporte
   ```bash
   sudo tar -xzvf apt_repos_keys.tar.gz -C /
   # Note: For legacy archives created with paths relative to /etc/apt, extract to -C /etc/apt/
+  # Pre-seed configuration answers (if debconf_selections.txt is present):
+  [ -f debconf_selections.txt ] && sudo debconf-set-selections < debconf_selections.txt
   sudo apt update
   xargs -a apt_packages_manual.txt sudo apt install -y
   ```
@@ -1159,6 +1234,12 @@ When running in an interactive terminal, the suite automatically pipes archive d
 - Labeled progress headers (`Writing Archive`, `Extracting Archive`) keep terminal users informed.
 - If `pv` is not installed or when running in unattended/cron/systemd timers, the pipeline seamlessly falls back to direct standard pipes without disruption or warnings.
 
+### Pre & Post Backup Lifecycle Hooks
+Automate custom tasks before or after backups (e.g., dumping container databases, waking NAS storage, or pinging healthcheck endpoints):
+- **Executable Hook Scripts**: Place executable scripts at `~/.config/backup_script/pre-backup.sh` and/or `~/.config/backup_script/post-backup.sh` (configurable via `HOOKS_DIR`).
+- **Inline Hook Commands**: Set `PRE_BACKUP_COMMAND` and/or `POST_BACKUP_COMMAND` in `~/.config/backup_script/config`.
+- **Rich Context Arguments**: Post-backup hooks receive outcome status (`success`, `warning`, or `failure`), archive filename, archive size, duration, verification status, cloud status, and local drive status.
+
 ---
 
 ## Configuration Reference
@@ -1169,25 +1250,45 @@ Key variables configurable in `~/.config/backup_script/config`:
 | :--- | :--- | :--- |
 | `BACKUP_DIR` | `googledrive:backup/` | `rclone` remote path for cloud backups |
 | `RCLONE_DRIVE_CHUNK_SIZE` | `256M` | Chunk size and upload cutoff for cloud transfers (e.g. `64M`, `128M`, `256M`) |
+| `RCLONE_MULTI_THREAD_STREAMS` | `4` | Number of parallel streams for multi-threaded `rclone` transfers |
+| `RCLONE_MULTI_THREAD_CUTOFF` | `64M` | File size cutoff for enabling multi-threaded `rclone` transfers |
 | `RCLONE_BWLIMIT` | `""` | Optional bandwidth cap for cloud transfers (e.g. `10M`, `5M`, `500k`; empty = unlimited) |
+| `RCLONE_DRIVE_USE_TRASH` | `false` | Move rotated cloud archives to Google Drive trash instead of permanent deletion (`true`/`false`) |
 | `RCLONE_STREAM_OPTS` | `(--retries 3 ...)` | Resilient transfer options for cloud streaming (`--retries 3 --low-level-retries 10 --contimeout 60s --timeout 30m`) |
 | `LOCAL_DRIVE_UUID` | *(none)* | Filesystem UUID of external backup drive partition (leave empty for cloud-only mode) |
 | `LOCAL_BACKUP_SUBDIR` | `Backups` | Subdirectory on external partition for archives |
+| `MIRROR_SCRIPT_TO_LOCAL` | `true` | Mirror standalone `backup_script.sh` and `RESTORE_README.txt` to local external drive |
+| `MIRROR_SCRIPT_TO_CLOUD` | `true` | Mirror standalone `backup_script.sh` and `RESTORE_README.txt` to cloud remote |
 | `ENCRYPTION_MODE` | `symmetric` | Encryption method: `symmetric`, `asymmetric`, or `hybrid` |
 | `PASSWORD_FILE` | `~/.config/backup_script/passphrase` | Path to symmetric encryption passphrase file |
-| `GPG_RECIPIENT` | `""` | Recipient email or fingerprint for asymmetric GPG |
+| `GPG_RECIPIENT` | `""` | Recipient email or fingerprint for asymmetric/hybrid GPG (supports comma/space-separated list) |
+| `GPG_RECIPIENTS` | `()` | Array of GPG recipient key IDs, fingerprints, or emails for multi-recipient encryption |
+| `GPG_AEAD_ALGO` | `auto` | AEAD authenticated encryption algorithm (`auto`, `OCB`, `EAX`, or `none`) |
+| `AUTO_VERIFY_BACKUP` | `checksum-local` | Automatic backup verification mode (`checksum-local`, `local`, `cloud`, `checksum-cloud`, `true`, `false`) |
 | `CLOUD_KEEP_COUNT` | `10` | Number of recent archives to keep on cloud remote (in `count` mode) |
 | `LOCAL_KEEP_COUNT` | `10` | Number of recent archives to keep on local drive (in `count` mode) |
 | `RETENTION_MODE` | `count` | Retention mode: `count` (fixed count) or `tiered` / `gfs` (Grandfather-Father-Son) |
+| `RETENTION_HOURLY` | `0` | Number of hourly archives to retain in `tiered` mode (`0` = disabled) |
 | `RETENTION_DAILY` | `7` | Number of daily archives to retain in `tiered` mode |
 | `RETENTION_WEEKLY` | `4` | Number of weekly archives to retain in `tiered` mode |
 | `RETENTION_MONTHLY` | `6` | Number of monthly archives to retain in `tiered` mode |
 | `RETENTION_YEARLY` | `1` | Number of yearly archives to retain in `tiered` mode |
+| `RETENTION_KEEP_INTRADAY` | `true` | Keep all intra-day snapshots created on the active backup date in `tiered` mode |
 | `RETENTION_MIN_KEEP` | `0` | Minimum newest archives to always preserve regardless of buckets |
 | `ZSTD_LEVEL` | `6` | Zstd compression level (1-19, or up to 22 with ultra) |
 | `ZSTD_LONG` | `27` | Long-distance matching window log (128MB window) |
+| `ZSTD_DECOMPRESS_MEMORY` | `512MB` | Memory limit for `zstd` decompression (auto-scales for large LDM windows) |
+| `TAR_ONE_FILE_SYSTEM` | `true` | Confine backup archiving to a single filesystem (`tar --one-file-system`) |
+| `TAR_IGNORE_FAILED_READ` | `true` | Continue archiving without fatal abort if unreadable files are encountered |
+| `MIN_FREE_SPACE_GB` | `15` | Minimum free space (in GB) required in `SCRATCH_DIR` before archiving |
 | `RUNNING_APPS_ACTION` | `close` | Policy for running apps (`close`, `prompt`, `sync`, `ignore`) |
+| `UNATTENDED_APPS_ACTION` | *(auto)* | App policy for unattended/timer runs (`close` if `RESTART_CLOSED_APPS=true`, else `sync`) |
+| `RUNNING_APPS_SETTLE_TIMEOUT` | `25` | Timeout (in seconds) to wait for applications to gracefully exit |
 | `RESTART_CLOSED_APPS` | `false` | Automatically relaunch closed applications after archive creation completes (`true`/`false`) |
+| `SQLITE_WAL_CHECKPOINT` | `true` | Perform passive SQLite WAL checkpointing on open browser/mail DBs in `sync` mode |
+| `HOOKS_DIR` | `~/.config/backup_script` | Directory containing optional `pre-backup.sh` and `post-backup.sh` hook scripts |
+| `PRE_BACKUP_COMMAND` | `""` | Optional inline shell command executed prior to backup creation |
+| `POST_BACKUP_COMMAND` | `""` | Optional inline shell command executed after backup completion |
 | `STREAM_CLOUD_RESTORE`| `auto` | Cloud restore streaming policy (`auto`, `true`, `false`) |
 | `RESTORE_VERIFY_CHECKSUM`| `true` | Verify SHA-256 sidecar checksum before restoring |
 | `RESTORE_FAST_OCCURRENCE`| `auto` | Fast single-file extraction via `tar --occurrence=1` (`auto`, `true`, `false`) |
@@ -1203,8 +1304,11 @@ Key variables configurable in `~/.config/backup_script/config`:
 | `SIZE_CHANGE_THRESHOLD` | `15` | Percentage threshold for triggering size change alerts (default: `15` for ±15%) |
 | `ALERT_ON_SUCCESS` | `false` | Send email notification on successful backup completion (`true`/`false`) |
 | `SUCCESS_EMAIL` | `""` | Optional dedicated recipient email address for success notifications |
+| `ALERT_FROM` | *(auto)* | Sender email address for alert notifications (auto-detected from `msmtp` if unset) |
 | `APT_PACKAGES_FILE` | `apt_packages_manual.txt` | Filename for exported manual APT packages |
 | `APT_REPOS_FILE` | `apt_repos_keys.tar.gz` | Archive for APT repository sources and keyrings |
+| `DEBCONF_SELECTIONS_FILE` | `debconf_selections.txt` | Filename for exported Debconf package configuration answers |
+| `DPKG_ARCHITECTURES_FILE` | `dpkg_foreign_architectures.txt` | Filename for exported foreign `dpkg` architectures (e.g. `i386`) |
 | `DNF_PACKAGES_FILE` | `dnf_packages_userinstalled.txt` | Filename for exported user-installed DNF packages |
 | `DNF_REPOS_FILE` | `dnf_repos_keys.tar.gz` | Archive for DNF repository configurations and RPM GPG keys |
 
