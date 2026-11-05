@@ -1254,7 +1254,7 @@ Key variables configurable in `~/.config/backup_script/config`:
 | `RCLONE_MULTI_THREAD_CUTOFF` | `64M` | File size cutoff for enabling multi-threaded `rclone` transfers |
 | `RCLONE_BWLIMIT` | `""` | Optional bandwidth cap for cloud transfers (e.g. `10M`, `5M`, `500k`; empty = unlimited) |
 | `RCLONE_DRIVE_USE_TRASH` | `false` | Move rotated cloud archives to Google Drive trash instead of permanent deletion (`true`/`false`) |
-| `RCLONE_STREAM_OPTS` | `(--retries 3 ...)` | Resilient transfer options for cloud streaming (`--retries 3 --low-level-retries 10 --contimeout 60s --timeout 30m`) |
+| `RCLONE_STREAM_OPTS` | `(--retries 3 ...)` | Resilient transfer options for cloud streaming (`--retries 3 --low-level-retries 10 --contimeout 90s --timeout 30m30s`) |
 | `LOCAL_DRIVE_UUID` | *(none)* | Filesystem UUID of external backup drive partition (leave empty for cloud-only mode) |
 | `LOCAL_BACKUP_SUBDIR` | `Backups` | Subdirectory on external partition for archives |
 | `MIRROR_SCRIPT_TO_LOCAL` | `true` | Mirror standalone `backup_script.sh` and `RESTORE_README.txt` to local external drive |
