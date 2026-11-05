@@ -5,7 +5,7 @@
 #
 #   DESCRIPTION:  Self-contained single-file bundle generated from modular libraries.
 #                 Version: 11.7.2
-#                 Generated on: 2026-11-04 12:44:24
+#                 Generated on: 2026-11-05 02:18:04
 #
 #==============================================================================
 SCRIPT_IS_STANDALONE=true
@@ -20,7 +20,8 @@ fi
 if [ -z "$SCRIPT_PATH" ]; then
     SCRIPT_PATH="${HOME}/.local/bin/backup_script.sh"
 fi
-export SCRIPT_PATH
+SCRIPT_DIR="$(dirname -- "$SCRIPT_PATH")"
+export SCRIPT_PATH SCRIPT_DIR
 unset _raw_source
 
 if [ -n "${BASH_SOURCE[0]}" ] && [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
@@ -325,14 +326,14 @@ RCLONE_BWLIMIT="${RCLONE_BWLIMIT:-}"
 # Resilient transfer options for rclone cloud streaming (rclone cat)
 # Includes connection and idle timeouts, multi-level retries, and optional bandwidth throttling.
 if [ -z "${RCLONE_STREAM_OPTS+x}" ]; then
-    RCLONE_STREAM_OPTS=(--retries 3 --low-level-retries 10 --contimeout 60s --timeout 30m)
+    RCLONE_STREAM_OPTS=(--retries 3 --low-level-retries 10 --contimeout 90s --timeout 30m30s)
     [ -n "$RCLONE_BWLIMIT" ] && RCLONE_STREAM_OPTS+=(--bwlimit "$RCLONE_BWLIMIT")
 fi
 
 # Query and metadata options for fast, resilient cloud discovery (rclone lsf / lsl)
 # Uses short connection timeouts to prevent hanging indefinitely when network or remote is unreachable
 if [ -z "${RCLONE_QUERY_OPTS+x}" ]; then
-    RCLONE_QUERY_OPTS=(--contimeout 10s --timeout 30s --retries 2 --low-level-retries 2)
+    RCLONE_QUERY_OPTS=(--contimeout 40s --timeout 60s --retries 2 --low-level-retries 2)
 fi
 
 # Rclone multi-thread transfer options for large files (speeds up multi-GB archive transfers)
@@ -343,7 +344,7 @@ RCLONE_MULTI_THREAD_CUTOFF="${RCLONE_MULTI_THREAD_CUTOFF:-64M}"
 # Set RCLONE_DRIVE_USE_TRASH="true" in config to move deleted cloud files to Google Drive trash instead.
 RCLONE_DRIVE_USE_TRASH="${RCLONE_DRIVE_USE_TRASH:-false}"
 if [ -z "${RCLONE_DELETE_OPTS+x}" ]; then
-    RCLONE_DELETE_OPTS=()
+    RCLONE_DELETE_OPTS=(--contimeout 90s --timeout 5m30s)
     if [ "$RCLONE_DRIVE_USE_TRASH" = "false" ] || [ "$RCLONE_DRIVE_USE_TRASH" = "0" ]; then
         RCLONE_DELETE_OPTS+=(--drive-use-trash=false)
     fi
@@ -3788,7 +3789,9 @@ apply_system_state() {
                 log_message "Restoring Debconf selections from ${debconf_f}"
                 if command -v debconf-set-selections &> /dev/null; then
                     local debconf_can_sudo=false
-                    if command -v sudo &> /dev/null; then
+                    if [ "$(id -u)" -eq 0 ]; then
+                        debconf_can_sudo=true
+                    elif command -v sudo &> /dev/null; then
                         if [ "$cli_yes" = true ] || [ ! -t 0 ]; then
                             if sudo -n -v 2>/dev/null; then
                                 debconf_can_sudo=true
@@ -4222,7 +4225,9 @@ apply_system_state() {
                                 local dnf_success=0 dnf_failed=0
                                 for pkg in "${dnf_packages_to_install[@]}"; do
                                     [ -z "$pkg" ] && continue
-                                    if ! rpm -q "$pkg" &>/dev/null; then
+                                    if rpm -q "$pkg" &>/dev/null; then
+                                        ((dnf_success++))
+                                    else
                                         if [ "$(id -u)" -ne 0 ] && ! sudo -n -v 2>/dev/null; then
                                             if [ -t 0 ] && [ "$cli_yes" != true ]; then
                                                 echo "Sudo session expired. Please authenticate to continue package installation:"
@@ -5906,7 +5911,7 @@ pin_archive() {
     done
     if [[ "$source_scope" == "all" || "$source_scope" == "both" || "$source_scope" == "cloud" || "$source_scope" == "auto" ]]; then
         if [[ "$BACKUP_DIR" == *:* ]] && command -v rclone &>/dev/null; then
-            if rclone lsf --files-only --max-depth 1 "${RCLONE_QUERY_OPTS[@]}" --include "${clean_target}" "${BACKUP_DIR}" 2>/dev/null | grep -q "${clean_target}"; then
+            if rclone lsf --files-only --max-depth 1 "${RCLONE_QUERY_OPTS[@]}" --include "${clean_target}" "${BACKUP_DIR}" 2>/dev/null | grep -F -x -q "${clean_target}"; then
                 on_cloud=true
             fi
         fi
@@ -5918,6 +5923,20 @@ pin_archive() {
     fi
 
     [ -z "$reason" ] && reason="Manual retention hold"
+
+    if [ "${DRY_RUN:-false}" = "true" ]; then
+        local -a dry_dests=()
+        if [[ "$source_scope" == "all" || "$source_scope" == "both" || "$source_scope" == "local" || "$source_scope" == "auto" ]]; then
+            [ "$on_local" = true ] && dry_dests+=("Local drive (${local_backup_path})")
+            [ "$on_preserved" = true ] && [ -n "$preserved_archive_path" ] && dry_dests+=("Preserved directory ($(dirname "$preserved_archive_path"))")
+        fi
+        if [[ "$source_scope" == "all" || "$source_scope" == "both" || "$source_scope" == "cloud" || "$source_scope" == "auto" ]]; then
+            [ "$on_cloud" = true ] && dry_dests+=("Cloud storage (${BACKUP_DIR})")
+        fi
+        echo "[DRY-RUN] Would pin archive '${clean_target}' (Reason: '${reason}') on: ${dry_dests[*]}"
+        log_message "[DRY-RUN] Would pin archive '${clean_target}' (Reason: '${reason}') on: ${dry_dests[*]}"
+        return 0
+    fi
 
     # Prepare pin metadata
     local pin_tmp
@@ -5955,7 +5974,7 @@ pin_archive() {
     # 2. Apply to Cloud remote
     if [[ "$source_scope" == "all" || "$source_scope" == "both" || "$source_scope" == "cloud" || "$source_scope" == "auto" ]]; then
         if [ "$on_cloud" = true ]; then
-            if rclone copyto --retries 3 --low-level-retries 5 --timeout 2m "$pin_tmp" "${BACKUP_DIR}${clean_target}.pinned" >> "$LOG_FILE" 2>&1; then
+            if rclone copyto --retries 3 --low-level-retries 5 --contimeout 90s --timeout 2m30s "$pin_tmp" "${BACKUP_DIR}${clean_target}.pinned" >> "$LOG_FILE" 2>&1; then
                 invalidate_cloud_lsf_cache
                 pinned_destinations+=("Cloud storage (${BACKUP_DIR})")
                 log_message "Cloud archive pinned: ${clean_target} (${reason})"
@@ -6222,7 +6241,7 @@ unpin_archive() {
     fi
     if [[ "$source_scope" == "all" || "$source_scope" == "both" || "$source_scope" == "cloud" || "$source_scope" == "auto" ]]; then
         if [[ "$BACKUP_DIR" == *:* ]] && command -v rclone &>/dev/null; then
-            if rclone lsf --files-only --max-depth 1 "${RCLONE_QUERY_OPTS[@]}" --include "${clean_target}.pinned" --include "${base_target}.pinned" "${BACKUP_DIR}" 2>/dev/null | grep -E -q "^(${clean_target}|${base_target})\.pinned$"; then
+            if rclone lsf --files-only --max-depth 1 "${RCLONE_QUERY_OPTS[@]}" --include "${clean_target}.pinned" --include "${base_target}.pinned" "${BACKUP_DIR}" 2>/dev/null | grep -F -x -q -e "${clean_target}.pinned" -e "${base_target}.pinned"; then
                 is_pinned_cloud=true
             fi
         fi
@@ -6230,6 +6249,20 @@ unpin_archive() {
 
     if [ "$is_pinned_local" = false ] && [ "$is_pinned_preserved" = false ] && [ "$is_pinned_cloud" = false ]; then
         echo "Archive '${clean_target}' is not currently pinned."
+        return 0
+    fi
+
+    if [ "${DRY_RUN:-false}" = "true" ]; then
+        local -a dry_unpin_dests=()
+        if [[ "$source_scope" == "all" || "$source_scope" == "both" || "$source_scope" == "local" || "$source_scope" == "auto" ]]; then
+            [ "$is_pinned_local" = true ] && dry_unpin_dests+=("Local drive")
+            [ "$is_pinned_preserved" = true ] && dry_unpin_dests+=("Preserved directory")
+        fi
+        if [[ "$source_scope" == "all" || "$source_scope" == "both" || "$source_scope" == "cloud" || "$source_scope" == "auto" ]]; then
+            [ "$is_pinned_cloud" = true ] && dry_unpin_dests+=("Cloud storage")
+        fi
+        echo "[DRY-RUN] Would remove retention hold (unpin) for '${clean_target}' on: ${dry_unpin_dests[*]}"
+        log_message "[DRY-RUN] Would remove retention hold (unpin) for '${clean_target}' on: ${dry_unpin_dests[*]}"
         return 0
     fi
 
@@ -6659,11 +6692,15 @@ upload_preserved_archive() {
     log_message "Uploading preserved archive: ${target_name} (${target_hr})"
 
     # Also stage to local backup drive if mounted and not yet present
+    local target_manifest="${target_file}.manifest.json"
     local local_backup_path
     if local_backup_path=$(get_local_backup_path 2>/dev/null) && [ -d "${local_backup_path}" ]; then
         if [ ! -f "${local_backup_path}/${target_name}" ]; then
             echo "Staging copy of preserved archive to local backup drive..."
-            handle_local_backup "${target_file}" "${target_name}"
+            if handle_local_backup "${target_file}" "${target_name}"; then
+                [ -f "$target_manifest" ] && update_manifest_destination_status "$target_manifest" "local_backup" "OK"
+                [ -f "${local_backup_path}/${target_name}.manifest.json" ] && update_manifest_destination_status "${local_backup_path}/${target_name}.manifest.json" "local_backup" "OK"
+            fi
         fi
     fi
 
@@ -6675,8 +6712,8 @@ upload_preserved_archive() {
         --drive-upload-cutoff "${RCLONE_DRIVE_CHUNK_SIZE}"
         --multi-thread-streams "${RCLONE_MULTI_THREAD_STREAMS:-4}"
         --multi-thread-cutoff "${RCLONE_MULTI_THREAD_CUTOFF:-64M}"
-        --timeout 30m
-        --contimeout 60s
+        --timeout 30m30s
+        --contimeout 90s
     )
     [ -n "$RCLONE_BWLIMIT" ] && rclone_common_opts+=(--bwlimit "$RCLONE_BWLIMIT")
     local rclone_progress_opts=()
@@ -6687,6 +6724,12 @@ upload_preserved_archive() {
     fi
 
     if rclone copy "${rclone_common_opts[@]}" "${rclone_progress_opts[@]}" --log-file "$rclone_log" "${target_file}" "${BACKUP_DIR}"; then
+        # Update manifest cloud_backup destination status before uploading sidecar
+        [ -f "$target_manifest" ] && update_manifest_destination_status "$target_manifest" "cloud_backup" "OK"
+        if [ -n "${local_backup_path:-}" ] && [ -d "${local_backup_path}" ] && [ -f "${local_backup_path}/${target_name}.manifest.json" ]; then
+            update_manifest_destination_status "${local_backup_path}/${target_name}.manifest.json" "cloud_backup" "OK"
+        fi
+
         # Parallelize companion sidecar uploads
         local -a pres_sidecar_pids=()
         local -a pres_sidecar_descs=()
@@ -6699,15 +6742,14 @@ upload_preserved_archive() {
 
         if [ -f "$target_sha256" ]; then
             local slog="${ptmp}/sha256.log"
-            rclone copy --retries 3 --low-level-retries 5 --timeout 5m "$target_sha256" "${BACKUP_DIR}" > "$slog" 2>&1 &
+            rclone copy --retries 3 --low-level-retries 5 --contimeout 90s --timeout 5m30s "$target_sha256" "${BACKUP_DIR}" > "$slog" 2>&1 &
             pres_sidecar_pids+=($!)
             pres_sidecar_descs+=("SHA-256 sidecar")
             pres_sidecar_logs+=("$slog")
         fi
-        local target_manifest="${target_file}.manifest.json"
         if [ -f "$target_manifest" ]; then
             local mlog="${ptmp}/manifest.log"
-            rclone copy --retries 3 --low-level-retries 5 --timeout 5m "$target_manifest" "${BACKUP_DIR}" > "$mlog" 2>&1 &
+            rclone copy --retries 3 --low-level-retries 5 --contimeout 90s --timeout 5m30s "$target_manifest" "${BACKUP_DIR}" > "$mlog" 2>&1 &
             pres_sidecar_pids+=($!)
             pres_sidecar_descs+=("backup manifest")
             pres_sidecar_logs+=("$mlog")
@@ -6715,7 +6757,7 @@ upload_preserved_archive() {
         local target_index="${target_file}.files.gz"
         if [ -f "$target_index" ]; then
             local ilog="${ptmp}/index.log"
-            rclone copy --retries 3 --low-level-retries 5 --timeout 5m "$target_index" "${BACKUP_DIR}" > "$ilog" 2>&1 &
+            rclone copy --retries 3 --low-level-retries 5 --contimeout 90s --timeout 5m30s "$target_index" "${BACKUP_DIR}" > "$ilog" 2>&1 &
             pres_sidecar_pids+=($!)
             pres_sidecar_descs+=("file list index")
             pres_sidecar_logs+=("$ilog")
@@ -6724,7 +6766,7 @@ upload_preserved_archive() {
         [ ! -f "$target_pin" ] && [ -f "${target_file%%.tar.*}.pinned" ] && target_pin="${target_file%%.tar.*}.pinned"
         if [ -f "$target_pin" ]; then
             local plog="${ptmp}/pin.log"
-            rclone copy --retries 3 --low-level-retries 5 --timeout 5m "$target_pin" "${BACKUP_DIR}" > "$plog" 2>&1 &
+            rclone copy --retries 3 --low-level-retries 5 --contimeout 90s --timeout 5m30s "$target_pin" "${BACKUP_DIR}" > "$plog" 2>&1 &
             pres_sidecar_pids+=($!)
             pres_sidecar_descs+=("archive pin marker")
             pres_sidecar_logs+=("$plog")
@@ -7070,7 +7112,8 @@ fi
 if [ -z "$SCRIPT_PATH" ]; then
     SCRIPT_PATH="${HOME}/.local/bin/backup_script.sh"
 fi
-export SCRIPT_PATH
+SCRIPT_DIR="$(dirname -- "$SCRIPT_PATH")"
+export SCRIPT_PATH SCRIPT_DIR
 unset _raw_source
 
 if [ -n "${BASH_SOURCE[0]}" ] && [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
@@ -7622,7 +7665,7 @@ mirror_script_and_cheatsheet_to_cloud() {
     if [ "$has_readme" = true ] && [ -f "$temp_readme" ]; then
         echo "Uploading disaster recovery cheatsheet to ${cloud_dest}..."
         local rlog="${m_tmp}/readme.log"
-        rclone copy --retries 3 --low-level-retries 5 --timeout 5m "${temp_readme}" "${cloud_dest}" > "$rlog" 2>&1 &
+        rclone copy --retries 3 --low-level-retries 5 --contimeout 90s --timeout 5m30s "${temp_readme}" "${cloud_dest}" > "$rlog" 2>&1 &
         mirror_pids+=($!)
         mirror_descs+=("Disaster recovery cheatsheet")
         mirror_logs+=("$rlog")
@@ -7632,7 +7675,7 @@ mirror_script_and_cheatsheet_to_cloud() {
         echo "Mirroring standalone backup script to ${cloud_dest}..."
         local slog="${m_tmp}/script.log"
         if [ "${SCRIPT_IS_STANDALONE:-false}" = "true" ]; then
-            rclone copy --retries 3 --low-level-retries 5 --timeout 5m "${SCRIPT_PATH}" "${cloud_dest}" > "$slog" 2>&1 &
+            rclone copy --retries 3 --low-level-retries 5 --contimeout 90s --timeout 5m30s "${SCRIPT_PATH}" "${cloud_dest}" > "$slog" 2>&1 &
             mirror_pids+=($!)
             mirror_descs+=("Standalone backup script")
             mirror_logs+=("$slog")
@@ -7643,7 +7686,7 @@ mirror_script_and_cheatsheet_to_cloud() {
                 if [ -f "$local_standalone" ]; then
                     cp -p "${m_tmp}/backup_script.sh" "$local_standalone" 2>/dev/null || true
                 fi
-                rclone copy --retries 3 --low-level-retries 5 --timeout 5m "${m_tmp}/backup_script.sh" "${cloud_dest}" > "$slog" 2>&1 &
+                rclone copy --retries 3 --low-level-retries 5 --contimeout 90s --timeout 5m30s "${m_tmp}/backup_script.sh" "${cloud_dest}" > "$slog" 2>&1 &
                 mirror_pids+=($!)
                 mirror_descs+=("Standalone backup script")
                 mirror_logs+=("$slog")
@@ -7879,6 +7922,7 @@ run_backup() {
     local cli_apps_action=""
     local pin_backup=false
     local pin_reason=""
+    local cli_recipients_set=false
     ACTUALLY_CLOSED_APPS=()
 
     while [ $# -gt 0 ]; do
@@ -8139,13 +8183,19 @@ run_backup() {
                 ;;
             --asymmetric=*|--pubkey=*)
                 ENCRYPTION_MODE="asymmetric"
-                GPG_RECIPIENTS+=("${1#*=}")
+                [ "$cli_recipients_set" = false ] && { GPG_RECIPIENTS=(); cli_recipients_set=true; }
+                local -a _cli_recips=()
+                parse_gpg_recipients _cli_recips "${1#*=}"
+                GPG_RECIPIENTS+=("${_cli_recips[@]}")
                 shift
                 ;;
             --asymmetric|--pubkey)
                 ENCRYPTION_MODE="asymmetric"
                 if [ -n "${2:-}" ] && [[ "${2:-}" != -* ]]; then
-                    GPG_RECIPIENTS+=("$2")
+                    [ "$cli_recipients_set" = false ] && { GPG_RECIPIENTS=(); cli_recipients_set=true; }
+                    local -a _cli_recips=()
+                    parse_gpg_recipients _cli_recips "$2"
+                    GPG_RECIPIENTS+=("${_cli_recips[@]}")
                     shift
                 fi
                 shift
@@ -8156,24 +8206,36 @@ run_backup() {
                 ;;
             --hybrid=*)
                 ENCRYPTION_MODE="hybrid"
-                GPG_RECIPIENTS+=("${1#*=}")
+                [ "$cli_recipients_set" = false ] && { GPG_RECIPIENTS=(); cli_recipients_set=true; }
+                local -a _cli_recips=()
+                parse_gpg_recipients _cli_recips "${1#*=}"
+                GPG_RECIPIENTS+=("${_cli_recips[@]}")
                 shift
                 ;;
             --hybrid)
                 ENCRYPTION_MODE="hybrid"
                 if [ -n "${2:-}" ] && [[ "${2:-}" != -* ]]; then
-                    GPG_RECIPIENTS+=("$2")
+                    [ "$cli_recipients_set" = false ] && { GPG_RECIPIENTS=(); cli_recipients_set=true; }
+                    local -a _cli_recips=()
+                    parse_gpg_recipients _cli_recips "$2"
+                    GPG_RECIPIENTS+=("${_cli_recips[@]}")
                     shift
                 fi
                 shift
                 ;;
             --recipient=*|-r=*)
-                GPG_RECIPIENTS+=("${1#*=}")
+                [ "$cli_recipients_set" = false ] && { GPG_RECIPIENTS=(); cli_recipients_set=true; }
+                local -a _cli_recips=()
+                parse_gpg_recipients _cli_recips "${1#*=}"
+                GPG_RECIPIENTS+=("${_cli_recips[@]}")
                 shift
                 ;;
             --recipient|-r)
                 if [ -n "${2:-}" ]; then
-                    GPG_RECIPIENTS+=("$2")
+                    [ "$cli_recipients_set" = false ] && { GPG_RECIPIENTS=(); cli_recipients_set=true; }
+                    local -a _cli_recips=()
+                    parse_gpg_recipients _cli_recips "$2"
+                    GPG_RECIPIENTS+=("${_cli_recips[@]}")
                     shift 2
                 else
                     echo "ERROR: Missing recipient for --recipient / -r." >&2
@@ -9370,7 +9432,7 @@ run_backup() {
                     dir = (diff >= 0) ? "increased" : "decreased";
                     abs_pct = (pct < 0) ? -pct : pct;
                     exceeded = (abs_pct >= thresh) ? "true" : "false";
-                    printf "%d %.1f %s %.1f %s\n", diff, pct, dir, abs_pct, exceeded;
+                    printf "%.0f %.1f %s %.1f %s\n", diff, pct, dir, abs_pct, exceeded;
                 }' 2>/dev/null || echo "0 0.0 same 0.0 false")
 
                 local diff_sign="+"
@@ -9565,8 +9627,8 @@ run_backup() {
             --drive-upload-cutoff "${RCLONE_DRIVE_CHUNK_SIZE}"
             --multi-thread-streams "${RCLONE_MULTI_THREAD_STREAMS:-4}"
             --multi-thread-cutoff "${RCLONE_MULTI_THREAD_CUTOFF:-64M}"
-            --timeout 30m
-            --contimeout 60s
+            --timeout 30m30s
+            --contimeout 90s
         )
         [ -n "$RCLONE_BWLIMIT" ] && rclone_common_opts+=(--bwlimit "$RCLONE_BWLIMIT")
 
@@ -9615,8 +9677,11 @@ run_backup() {
                 echo "$rclone_errors" >&2
                 echo "----------------------------------------" >&2
             fi
+            duration_secs=$(( SECONDS - start_time ))
+            local duration_str
+            duration_str=$(format_duration "$duration_secs")
             send_notification "critical" "Backup Failed" "Upload failed. Archive preserved at ${PRESERVED_PATH}."
-            execute_lifecycle_hook "post" "failure" "${ENCRYPTED_TARBALL_NAME}" "cloud_upload_failed"
+            execute_lifecycle_hook "post" "failure" "${ENCRYPTED_TARBALL_NAME}" "${archive_size_hr}" "${duration_str}" "Skipped (upload failed)" "${cloud_backup_status}" "${local_backup_status}"
             return 1
         fi
 
@@ -9638,7 +9703,7 @@ run_backup() {
             echo "Uploading companion sidecars (${#sidecar_files[@]} files) to ${BACKUP_DIR} in a single batch transfer..."
             log_message "Uploading companion sidecars (${sidecar_files[*]}) to ${BACKUP_DIR} via batch transfer"
             local sidecar_log="${SCRATCH_DIR}/sidecars_transfer.log"
-            if printf '%s\n' "${sidecar_files[@]}" | rclone copy --files-from-raw - "${rclone_common_opts[@]}" --timeout 5m "${SCRATCH_DIR}" "${BACKUP_DIR}" > "$sidecar_log" 2>&1; then
+            if printf '%s\n' "${sidecar_files[@]}" | rclone copy --files-from-raw - "${rclone_common_opts[@]}" --timeout 5m30s "${SCRATCH_DIR}" "${BACKUP_DIR}" > "$sidecar_log" 2>&1; then
                 log_message "Companion sidecars uploaded successfully."
             else
                 log_message "WARNING: Failed to upload one or more companion sidecars to cloud storage."
@@ -9845,8 +9910,6 @@ run_backup() {
     if [ "$size_threshold_exceeded" = "true" ]; then
         notif_msg="${notif_msg}"$'\n'"⚠️ Size Alert: ${size_direction} by ${size_pct_abs}% (threshold ±${SIZE_CHANGE_THRESHOLD:-15}%)"
     fi
-    send_notification "$notif_urgency" "$notif_title" "$notif_msg" "$notif_icon"
-
     # Determine overall backup status for lifecycle hooks
     local backup_overall_status="success"
     if [ "$verify_exit_code" -ne 0 ] || [ "$cloud_backup_status" = "Failed" ] || [ "$local_backup_status" = "Failed" ]; then
@@ -9872,6 +9935,8 @@ run_backup() {
             send_success_email "${ENCRYPTED_TARBALL_NAME}" "${archive_size_hr}" "${duration_str}" "${verify_status}" "${cloud_backup_status}" "${local_backup_status}" "${compression_ratio:-}" "${uncompressed_size_hr:-}"
         fi
     fi
+
+    send_notification "$notif_urgency" "$notif_title" "$notif_msg" "$notif_icon"
 
     if [ "$verify_exit_code" -ne 0 ]; then
         echo "ERROR: Backup archive was created, but post-backup verification failed." >&2
@@ -9958,12 +10023,30 @@ normalize_restore_pattern() {
     elif [[ "$pat" == */* ]]; then
         # Path contains directory separators (e.g. dir/file.txt)
         echo "./${pat}"
-    else
-        # Base filename or pattern without slashes (e.g. report.pdf, *.txt)
+    elif [[ "$pat" =~ (^|[^\\])[*?\[] ]]; then
+        # Slashless wildcard pattern (e.g. *.txt, report*.pdf)
         # Preserve without leading ./ so tar --wildcards --no-anchored matches it anywhere
         echo "$pat"
+    else
+        # Root-level file or directory name without wildcards (e.g. .bashrc, Documents, report.pdf)
+        echo "./${pat}"
     fi
     return 0
+}
+
+
+#---
+#   FUNCTION:  escape_tar_wildcard_literal()
+#  DESCRIPTION:  Escapes glob metacharacters (*, ?, [, ]) in a literal archive path
+#                selected from an index so GNU tar --wildcards treats them literally.
+#---
+escape_tar_wildcard_literal() {
+    local s="${1:-}"
+    s="${s//\[/\\[}"
+    s="${s//\]/\\]}"
+    s="${s//\*/\\*}"
+    s="${s//\?/\\?}"
+    printf '%s\n' "$s"
 }
 
 
@@ -10351,8 +10434,9 @@ interactive_browse_archive_files() {
 
                 local added_count=0
                 for item in "${picks_to_add[@]}"; do
-                    local norm_item
-                    if norm_item=$(normalize_restore_pattern "$item"); then
+                    local norm_item esc_item
+                    esc_item=$(escape_tar_wildcard_literal "$item")
+                    if norm_item=$(normalize_restore_pattern "$esc_item"); then
                         local already_has=false
                         for existing in "${selected_items[@]}"; do
                             [ "$existing" = "$norm_item" ] && already_has=true && break
@@ -11153,7 +11237,18 @@ run_restore() {
 
     local tar_wildcard_opts=()
     if [ "$is_selective" = true ]; then
-        tar_wildcard_opts=("--wildcards" "--wildcards-match-slash" "--no-anchored")
+        tar_wildcard_opts=("--wildcards" "--wildcards-match-slash")
+        local _pat_needs_unanchored=false
+        local _p
+        for _p in "${restore_patterns[@]}"; do
+            if [[ "$_p" != ./* ]]; then
+                _pat_needs_unanchored=true
+                break
+            fi
+        done
+        if [ "$_pat_needs_unanchored" = true ]; then
+            tar_wildcard_opts+=("--no-anchored")
+        fi
     fi
 
     # Determine whether to use tar --occurrence=1 for fast single/non-wildcard file extraction.
@@ -11198,8 +11293,8 @@ run_restore() {
             fi
 
             for p in "${restore_patterns[@]}"; do
-                # 1. Reject if pattern contains wildcards
-                if [[ "$p" == *"*"* || "$p" == *"?"* || "$p" == *"["* ]]; then
+                # 1. Reject if pattern is unanchored or contains unescaped wildcards
+                if [[ "$p" != ./* ]] || [[ "$p" =~ (^|[^\\])[*?\[] ]]; then
                     patterns_safe_for_occurrence=false
                     break
                 fi
@@ -11208,15 +11303,19 @@ run_restore() {
                     patterns_safe_for_occurrence=false
                     break
                 fi
+                local unesc_p="${p//\\\[/[}"
+                unesc_p="${unesc_p//\\\]/]}"
+                unesc_p="${unesc_p//\\\*/*}"
+                unesc_p="${unesc_p//\\\?/?}"
                 # 3. Reject if pattern matches an existing local directory in SOURCE_DIR or restore_target
-                local rel_path="${p#./}"
+                local rel_path="${unesc_p#./}"
                 if [ -d "${SOURCE_DIR}/${rel_path}" ] || [ -d "${restore_target}/${rel_path}" ]; then
                     patterns_safe_for_occurrence=false
                     break
                 fi
                 # 4. If companion index is available, check whether pattern is a directory or has child files
                 if [ -n "$occ_index_file" ] && [ -f "$occ_index_file" ]; then
-                    local clean_p="${p#./}"
+                    local clean_p="${unesc_p#./}"
                     local esc_p
                     esc_p=$(escape_regex_literal "$clean_p")
                     if gzip -dc "$occ_index_file" 2>/dev/null | grep -q -m 1 -E "(^d.*[[:space:]](\./)?${esc_p}(/|$)|[[:space:]](\./)?${esc_p}/)"; then
@@ -11225,7 +11324,7 @@ run_restore() {
                     fi
                 else
                     # 5. Without an index file, if the basename lacks a file extension, treat as potential directory
-                    local base_p="${p##*/}"
+                    local base_p="${unesc_p##*/}"
                     if [[ "$base_p" != *.* ]]; then
                         patterns_safe_for_occurrence=false
                         break
@@ -11466,8 +11565,8 @@ run_restore() {
             --drive-upload-cutoff "${RCLONE_DRIVE_CHUNK_SIZE}"
             --multi-thread-streams "${RCLONE_MULTI_THREAD_STREAMS:-4}"
             --multi-thread-cutoff "${RCLONE_MULTI_THREAD_CUTOFF:-64M}"
-            --timeout 30m
-            --contimeout 60s
+            --timeout 30m30s
+            --contimeout 90s
         )
         [ -n "$RCLONE_BWLIMIT" ] && rclone_common_opts+=(--bwlimit "$RCLONE_BWLIMIT")
 
@@ -14642,11 +14741,13 @@ find_file() {
 
     echo
     echo "Restoring '${chosen_path}' from ${chosen_archive} to ${target_dest}..."
+    local esc_chosen_path
+    esc_chosen_path=$(escape_tar_wildcard_literal "$chosen_path")
     local restore_cmd_args=(
         "--archive" "$restore_archive_arg"
         "--source" "$restore_source_arg"
         "--dest" "$target_dest"
-        "--path" "$chosen_path"
+        "--path" "$esc_chosen_path"
     )
     [ "$cli_yes" = true ] && restore_cmd_args+=("--yes")
 
@@ -15164,11 +15265,11 @@ diff_backups() {
             rclone cat "${RCLONE_STREAM_OPTS[@]}" "${BACKUP_DIR}${src_location}" 2>/dev/null | gzip -dc > "$dest_file" 2>/dev/null
         elif [[ "$src_location" == *.files.gz ]] || ( [ -f "$src_location" ] && gzip -t "$src_location" 2>/dev/null ); then
             gzip -dc "$src_location" > "$dest_file" 2>/dev/null
-        elif [ -f "$src_location" ] && grep -q -m 1 -E '^[-dlcbps][-rwxst]{9}' "$src_location" 2>/dev/null; then
+        elif [ -f "$src_location" ] && grep -q -m 1 -E '^[-dlcbps][-rwxstST]{9}' "$src_location" 2>/dev/null; then
             cat "$src_location" > "$dest_file"
         elif [ -f "$src_location" ]; then
             [ "$output_format" = "text" ] && echo "Generating file index for ${label} from archive contents..." >&2
-            list_archive_contents "$src_location" "" --long --no-pager 2>/dev/null | grep -E '^[-dlcbps][-rwxst]{9}' > "$dest_file" || true
+            list_archive_contents "$src_location" "" --long --no-pager 2>/dev/null | grep -E '^[-dlcbps][-rwxstST]{9}' > "$dest_file" || true
         fi
         [ -s "$dest_file" ]
     }
@@ -15245,7 +15346,7 @@ diff_backups() {
         return (index(path, filter_pat) > 0)
     }
     NR==FNR {
-        if ($1 !~ /^[-dlcbps][-rwxst]{9}/) next
+        if ($1 !~ /^[-dlcbps][-rwxstST]{9}/) next
         p = clean_path($0)
         if (p == "./" || p == ".") next
         f1_size[p] = $3 + 0
@@ -15257,7 +15358,7 @@ diff_backups() {
         next
     }
     {
-        if ($1 !~ /^[-dlcbps][-rwxst]{9}/) next
+        if ($1 !~ /^[-dlcbps][-rwxstST]{9}/) next
         p = clean_path($0)
         if (p == "./" || p == ".") next
         sz2 = $3 + 0
@@ -15309,8 +15410,8 @@ diff_backups() {
                 }
             }
         }
-        printf "SUMMARY\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\n",
-            f1_count, f1_bytes, f2_count, f2_bytes, added_count, added_bytes, del_count, del_bytes, mod_count, mod_delta, unchanged_count, unchanged_bytes
+        printf "SUMMARY\t%.0f\t%.0f\t%.0f\t%.0f\t%.0f\t%.0f\t%.0f\t%.0f\t%.0f\t%.0f\t%.0f\t%.0f\n",
+            f1_count + 0, f1_bytes + 0, f2_count + 0, f2_bytes + 0, added_count + 0, added_bytes + 0, del_count + 0, del_bytes + 0, mod_count + 0, mod_delta + 0, unchanged_count + 0, unchanged_bytes + 0
     }
     ' "$base_idx_file" "$tgt_idx_file" \
     | {
@@ -15408,17 +15509,17 @@ diff_backups() {
         END {
             if (fmt == "json") {
                 printf "{\n"
-                printf "  \"baseline\": {\"archive\": \"%s\", \"source\": \"%s\", \"files\": %d, \"bytes\": %d, \"human\": \"%s\"},\n",
-                    base_name, base_src, f1_count, f1_bytes, hr_size(f1_bytes)
-                printf "  \"target\": {\"archive\": \"%s\", \"source\": \"%s\", \"files\": %d, \"bytes\": %d, \"human\": \"%s\"},\n",
-                    tgt_name, tgt_src, f2_count, f2_bytes, hr_size(f2_bytes)
-                printf "  \"summary\": {\"added_files\": %d, \"added_bytes\": %d, \"removed_files\": %d, \"removed_bytes\": %d, \"modified_files\": %d, \"modified_delta_bytes\": %d, \"unchanged_files\": %d, \"net_files\": %d, \"net_bytes_drift\": %d},\n",
-                    add_count, add_bytes, del_count, del_bytes, mod_count, mod_delta, unch_count, net_files, net_drift
+                printf "  \"baseline\": {\"archive\": \"%s\", \"source\": \"%s\", \"files\": %.0f, \"bytes\": %.0f, \"human\": \"%s\"},\n",
+                    base_name, base_src, f1_count + 0, f1_bytes + 0, hr_size(f1_bytes + 0)
+                printf "  \"target\": {\"archive\": \"%s\", \"source\": \"%s\", \"files\": %.0f, \"bytes\": %.0f, \"human\": \"%s\"},\n",
+                    tgt_name, tgt_src, f2_count + 0, f2_bytes + 0, hr_size(f2_bytes + 0)
+                printf "  \"summary\": {\"added_files\": %.0f, \"added_bytes\": %.0f, \"removed_files\": %.0f, \"removed_bytes\": %.0f, \"modified_files\": %.0f, \"modified_delta_bytes\": %.0f, \"unchanged_files\": %.0f, \"net_files\": %.0f, \"net_bytes_drift\": %.0f},\n",
+                    add_count + 0, add_bytes + 0, del_count + 0, del_bytes + 0, mod_count + 0, mod_delta + 0, unch_count + 0, net_files + 0, net_drift + 0
                 printf "  \"changes\": [\n"
                 for (i = 1; i <= lines_total; i++) {
                     st = (status[i] == "A" ? "added" : (status[i] == "D" ? "removed" : "modified"))
-                    printf "    {\"status\": \"%s\", \"path\": \"%s\", \"baseline_bytes\": %d, \"target_bytes\": %d, \"delta_bytes\": %d}%s\n",
-                        st, json_escape(path[i]), sz1[i], sz2[i], delta[i], (i == lines_total ? "" : ",")
+                    printf "    {\"status\": \"%s\", \"path\": \"%s\", \"baseline_bytes\": %.0f, \"target_bytes\": %.0f, \"delta_bytes\": %.0f}%s\n",
+                        st, json_escape(path[i]), sz1[i] + 0, sz2[i] + 0, delta[i] + 0, (i == lines_total ? "" : ",")
                 }
                 printf "  ]\n}\n"
             } else if (fmt == "csv") {
@@ -15953,8 +16054,8 @@ init_config() {
 
 # Optional transfer options for rclone cloud streaming operations ('rclone cat').
 # Provides network resiliency against transient socket drops during restores and verification.
-# Default: (--retries 3 --low-level-retries 10 --contimeout 60s --timeout 30m)
-#RCLONE_STREAM_OPTS=(--retries 3 --low-level-retries 10 --contimeout 60s --timeout 30m)
+# Default: (--retries 3 --low-level-retries 10 --contimeout 90s --timeout 30m30s)
+#RCLONE_STREAM_OPTS=(--retries 3 --low-level-retries 10 --contimeout 90s --timeout 30m30s)
 
 # Deletion behavior for Google Drive cloud storage.
 # When false (default), files deleted by backup rotation or unpinning are permanently removed
@@ -17091,7 +17192,7 @@ check_config() {
     else
         report_info "Rclone Bandwidth Limit" "Unlimited (RCLONE_BWLIMIT not set)"
     fi
-    report_ok "Rclone Stream Resilience" "Active (retries: 3, low-level-retries: 10, timeout: 30m, contimeout: 60s)"
+    report_ok "Rclone Stream Resilience" "Active (retries: 3, low-level-retries: 10, timeout: 30m30s, contimeout: 90s)"
     if [ "$RCLONE_DRIVE_USE_TRASH" = "false" ] || [ "$RCLONE_DRIVE_USE_TRASH" = "0" ]; then
         report_ok "Rclone Drive Trash" "Disabled (--drive-use-trash=false, permanent deletion)"
     else
@@ -17654,9 +17755,9 @@ show_main_menu() {
             5) list_backups ;;
             6) display_manifest ;;
             7) show_backup_stats ;;
-            8) list_archive_contents ;;
-            9) find_file ;;
-            10) diff_backups ;;
+            8) execute_with_inhibit contents ;;
+            9) execute_with_inhibit find-file ;;
+            10) execute_with_inhibit diff ;;
             11) execute_with_inhibit manage-preserved ;;
             12) execute_with_inhibit manage-pinned ;;
             13) manage_systemd_timer ;;
