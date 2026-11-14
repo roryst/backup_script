@@ -5,7 +5,7 @@
 #
 #   DESCRIPTION:  Self-contained single-file bundle generated from modular libraries.
 #                 Version: 11.7.2
-#                 Generated on: 2026-11-05 02:18:04
+#                 Generated on: 2026-11-14 14:02:17
 #
 #==============================================================================
 SCRIPT_IS_STANDALONE=true
@@ -736,7 +736,11 @@ fi
 
 
 # Dry run simulation mode flag
-DRY_RUN="${DRY_RUN:-false}"
+if [[ "${DRY_RUN:-false}" =~ ^([Tt][Rr][Uu][Ee]|1|[Yy][Ee][Ss])$ ]]; then
+    DRY_RUN="true"
+else
+    DRY_RUN="false"
+fi
 
 # Security: prevent password leakage into child process environments
 export -n ENCRYPTION_PASSWORD BACKUP_ENCRYPTION_PASSWORD 2>/dev/null || true
@@ -1594,7 +1598,7 @@ cleanup() {
     # Clean up any temporary statistics cloud directories
     if [ ${#CURRENT_STATS_TMP_DIRS[@]} -gt 0 ]; then
         for d in "${CURRENT_STATS_TMP_DIRS[@]}"; do
-            [ -n "$d" ] && [ -d "$d" ] && rm -rf "$d" 2>/dev/null
+            [ -n "$d" ] && [ -d "$d" ] && rm -rf -- "$d" 2>/dev/null
         done
         CURRENT_STATS_TMP_DIRS=()
     fi
@@ -1602,7 +1606,7 @@ cleanup() {
     # Clean up any temporary backup drift diff directories
     if [ ${#CURRENT_DIFF_TMP_DIRS[@]} -gt 0 ]; then
         for d in "${CURRENT_DIFF_TMP_DIRS[@]}"; do
-            [ -n "$d" ] && [ -d "$d" ] && rm -rf "$d" 2>/dev/null
+            [ -n "$d" ] && [ -d "$d" ] && rm -rf -- "$d" 2>/dev/null
         done
         CURRENT_DIFF_TMP_DIRS=()
     fi
@@ -1610,7 +1614,7 @@ cleanup() {
     # Clean up any tracked generic temporary files and directories
     if [ ${#CURRENT_GENERIC_TMP_FILES[@]} -gt 0 ]; then
         for f in "${CURRENT_GENERIC_TMP_FILES[@]}"; do
-            [ -n "$f" ] && [ -e "$f" ] && rm -rf "$f" 2>/dev/null
+            [ -n "$f" ] && [ -e "$f" ] && rm -rf -- "$f" 2>/dev/null
         done
         CURRENT_GENERIC_TMP_FILES=()
     fi
@@ -1675,7 +1679,7 @@ execute_with_inhibit() {
         restore) why_msg="Restoring home directory" ;;
         restore-system|restore_system|system-restore|system_restore) why_msg="Restoring system configuration and packages" ;;
         verify)  why_msg="Verifying backup archive integrity" ;;
-        list-files|list_files|view-archive|view_archive|list-contents|list_contents) why_msg="Listing backup archive contents" ;;
+        list-files|list_files|view-archive|view_archive|list-contents|list_contents|contents) why_msg="Listing backup archive contents" ;;
         find-file|find_file|search-file|search_file) why_msg="Searching files across backup archives" ;;
         diff-backups|diff_backups|backup-diff|backup_diff|drift|diff) why_msg="Comparing backup archive contents" ;;
         manage-preserved|clean-preserved) why_msg="Managing preserved backup archives" ;;
@@ -1694,7 +1698,7 @@ execute_with_inhibit() {
                     restore) run_restore "$@" ;;
                     restore-system|restore_system|system-restore|system_restore) run_restore_system "$@" ;;
                     verify) run_verify "$@" ;;
-                    list-files|list_files|view-archive|view_archive|list-contents|list_contents) list_archive_contents "$@" ;;
+                    list-files|list_files|view-archive|view_archive|list-contents|list_contents|contents) list_archive_contents "$@" ;;
                     find-file|find_file|search-file|search_file) find_file "$@" ;;
                     diff-backups|diff_backups|backup-diff|backup_diff|drift|diff) diff_backups "$@" ;;
                     manage-preserved|clean-preserved) manage_preserved_archives "$@" ;;
@@ -1733,7 +1737,7 @@ execute_with_inhibit() {
                 backup) display_title="Backup" ;;
                 restore|restore-system|restore_system|system-restore|system_restore) display_title="Restore" ;;
                 verify) display_title="Verification" ;;
-                list-files|list_files|view-archive|view_archive|list-contents|list_contents) display_title="Archive File Listing" ;;
+                list-files|list_files|view-archive|view_archive|list-contents|list_contents|contents) display_title="Archive File Listing" ;;
                 find-file|find_file|search-file|search_file) display_title="Archive File Search" ;;
                 diff-backups|diff_backups|backup-diff|backup_diff|drift|diff) display_title="Archive Diff" ;;
                 manage-preserved|clean-preserved) display_title="Archive Management" ;;
@@ -1791,7 +1795,7 @@ execute_with_inhibit() {
         restore) run_restore "$@" || ret=$? ;;
         restore-system|restore_system|system-restore|system_restore) run_restore_system "$@" || ret=$? ;;
         verify)  run_verify "$@" || ret=$? ;;
-        list-files|list_files|view-archive|view_archive|list-contents|list_contents) list_archive_contents "$@" || ret=$? ;;
+        list-files|list_files|view-archive|view_archive|list-contents|list_contents|contents) list_archive_contents "$@" || ret=$? ;;
         find-file|find_file|search-file|search_file) find_file "$@" || ret=$? ;;
         diff-backups|diff_backups|backup-diff|backup_diff|drift|diff) diff_backups "$@" || ret=$? ;;
         manage-preserved) manage_preserved_archives "$@" || ret=$? ;;
@@ -1896,8 +1900,8 @@ update_manifest_destination_status() {
     [ -f "$manifest_file" ] || return 0
 
     local escaped_status
-    escaped_status=$(printf '%s\n' "$status" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/[\/&]/\\&/g')
-    sed -i -E "s/\"${dest_key}\":[[:space:]]*\"[^\"]*\"/\"${dest_key}\": \"${escaped_status}\"/" "$manifest_file" 2>/dev/null || true
+    escaped_status=$(printf '%s\n' "$status" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/[\/&\\]/\\&/g')
+    sed -i -E "s/\"${dest_key}\":[[:space:]]*\"(\\\\.|[^\"\\])*\"/\"${dest_key}\": \"${escaped_status}\"/" "$manifest_file" 2>/dev/null || true
 }
 
 
@@ -2427,6 +2431,14 @@ export_rclone_config() {
                 echo "  --help, -h        Show this help message"
                 return 0
                 ;;
+            --dry-run|-n)
+                DRY_RUN=true
+                shift
+                ;;
+            -*)
+                echo "ERROR: Unknown option '$1'. Run '$0 export-rclone-config --help' for usage." >&2
+                return 1
+                ;;
             *)
                 if [ -z "$target_file" ]; then
                     target_file="$1"
@@ -2477,6 +2489,11 @@ export_rclone_config() {
     target_file="${target_file:-${CONFIG_DIR}/rclone.conf.escrow}"
     target_file="${target_file/#\~/$HOME}"
 
+    if [ "${DRY_RUN:-false}" = "true" ]; then
+        echo "[DRY-RUN] Would export rclone configuration (${src_conf}) to '${target_file}' (chmod 600)."
+        return 0
+    fi
+
     if [ -f "$target_file" ] && [ "$opt_force" = false ]; then
         if [ -t 0 ]; then
             local overwrite_confirm
@@ -2496,15 +2513,16 @@ export_rclone_config() {
     [ -d "$parent_dir" ] || mkdir -p "$parent_dir" 2>/dev/null || true
     chmod 700 "$parent_dir" 2>/dev/null || true
 
-    # Pre-create escrow target file with restrictive 600 permissions
-    install -m 600 /dev/null "$target_file" 2>/dev/null || { touch "$target_file" && chmod 600 "$target_file"; }
+    # Stage export into temporary file with restrictive 600 permissions before replacing target
+    local tmp_target="${target_file}.tmp.$$"
+    install -m 600 /dev/null "$tmp_target" 2>/dev/null || { touch "$tmp_target" && chmod 600 "$tmp_target"; }
 
     local export_mode="active remote [${remote_name}]"
     local export_success=false
 
     # By default, export only the active backup remote to minimize credential leakage
     if [ "$opt_full" = false ] && [ -n "$remote_name" ] && rclone config show "$remote_name" &>/dev/null; then
-        if rclone config show "$remote_name" > "$target_file" 2>/dev/null; then
+        if rclone config show "$remote_name" > "$tmp_target" 2>/dev/null && [ -s "$tmp_target" ]; then
             export_success=true
         fi
     fi
@@ -2516,12 +2534,12 @@ export_rclone_config() {
         else
             export_mode="full configuration fallback"
         fi
-        if cp -p "$src_conf" "$target_file" 2>/dev/null; then
+        if cp -p "$src_conf" "$tmp_target" 2>/dev/null && [ -s "$tmp_target" ]; then
             export_success=true
         fi
     fi
 
-    if [ "$export_success" = true ]; then
+    if [ "$export_success" = true ] && mv -f "$tmp_target" "$target_file" 2>/dev/null; then
         chmod 600 "$target_file" 2>/dev/null || true
         echo "==============================================================================="
         echo "  Rclone Disaster Recovery Escrow Export"
@@ -2541,7 +2559,7 @@ export_rclone_config() {
         return 0
     else
         echo "ERROR: Failed to export rclone configuration to '${target_file}'." >&2
-        rm -f "$target_file" 2>/dev/null || true
+        rm -f "$tmp_target" 2>/dev/null || true
         return 1
     fi
 }
@@ -2561,6 +2579,10 @@ export_gpg_keys() {
         case "$1" in
             --force|-f|-y|--yes)
                 opt_force=true
+                shift
+                ;;
+            --dry-run|-n)
+                DRY_RUN=true
                 shift
                 ;;
             --recipient=*|-r=*)
@@ -2587,6 +2609,10 @@ export_gpg_keys() {
                 echo "  --force, -f       Overwrite existing key files in destination directory"
                 echo "  --help, -h        Show this help message"
                 return 0
+                ;;
+            -*)
+                echo "ERROR: Unknown option '$1'. Run '$0 export-gpg-keys --help' for usage." >&2
+                return 1
                 ;;
             *)
                 if [ -z "$target_dir" ]; then
@@ -2648,6 +2674,12 @@ export_gpg_keys() {
 
     target_dir="${target_dir:-${CONFIG_DIR}/gpg_escrow}"
     target_dir="${target_dir/#\~/$HOME}"
+
+    if [ "${DRY_RUN:-false}" = "true" ]; then
+        echo "[DRY-RUN] Would export GPG key '${key_id}' to '${target_dir}' (chmod 600)."
+        return 0
+    fi
+
     mkdir -p "$target_dir" 2>/dev/null || true
     chmod 700 "$target_dir" 2>/dev/null || true
 
@@ -2668,30 +2700,34 @@ export_gpg_keys() {
         fi
     fi
 
-    # Pre-create escrow key files with strict 600 permissions before export
-    install -m 600 /dev/null "$pub_file" 2>/dev/null || { touch "$pub_file" && chmod 600 "$pub_file"; }
+    # Stage public key export into a temporary file with strict 600 permissions before replacing pub_file
+    local tmp_pub="${pub_file}.tmp.$$"
+    install -m 600 /dev/null "$tmp_pub" 2>/dev/null || { touch "$tmp_pub" && chmod 600 "$tmp_pub"; }
     echo "Exporting public key for '${key_id}'..."
-    if ! gpg --batch --yes --armor --export "$key_id" > "$pub_file" 2>/dev/null || [ ! -s "$pub_file" ]; then
+    if ! gpg --batch --yes --armor --export "$key_id" > "$tmp_pub" 2>/dev/null || [ ! -s "$tmp_pub" ]; then
         echo "ERROR: Failed to export public key for '${key_id}' (key not found or export empty)." >&2
-        rm -f "$pub_file" 2>/dev/null || true
+        rm -f "$tmp_pub" 2>/dev/null || true
         return 1
     fi
+    mv -f "$tmp_pub" "$pub_file"
     chmod 600 "$pub_file" 2>/dev/null || true
 
     local has_secret=false
     if gpg --batch --list-secret-keys "$key_id" &>/dev/null; then
         echo "Exporting secret key for '${key_id}'..."
-        install -m 600 /dev/null "$sec_file" 2>/dev/null || { touch "$sec_file" && chmod 600 "$sec_file"; }
+        local tmp_sec="${sec_file}.tmp.$$"
+        install -m 600 /dev/null "$tmp_sec" 2>/dev/null || { touch "$tmp_sec" && chmod 600 "$tmp_sec"; }
         local gpg_sec_err=""
         local gpg_batch_opts=()
         [ ! -t 0 ] && gpg_batch_opts=(--batch)
-        if gpg_sec_err=$(gpg "${gpg_batch_opts[@]}" --yes --armor --export-secret-keys "$key_id" 2>&1 > "$sec_file") && [ -s "$sec_file" ]; then
+        if gpg_sec_err=$(gpg "${gpg_batch_opts[@]}" --yes --armor --export-secret-keys "$key_id" 2>&1 > "$tmp_sec") && [ -s "$tmp_sec" ]; then
+            mv -f "$tmp_sec" "$sec_file"
             chmod 600 "$sec_file" 2>/dev/null || true
             has_secret=true
         else
             echo "WARNING: Could not export secret key for '${key_id}' (pinentry or gpg-agent rejected export)." >&2
             [ -n "$gpg_sec_err" ] && echo "  Diagnostic: ${gpg_sec_err}" >&2
-            rm -f "$sec_file" 2>/dev/null || true
+            rm -f "$tmp_sec" 2>/dev/null || true
         fi
     else
         echo "Notice: Secret key for '${key_id}' is not in local keyring (encryption-only host)."
@@ -3119,7 +3155,7 @@ handle_running_applications() {
                     local main_pids=()
                     for pid in "${app_pids[@]}"; do
                         local ppid
-                        ppid=$(awk '{print $4}' "/proc/$pid/stat" 2>/dev/null)
+                        ppid=$(awk '/^PPid:/ {print $2; exit}' "/proc/$pid/status" 2>/dev/null)
                         local is_child=false
                         for other_pid in "${app_pids[@]}"; do
                             if [ "$ppid" = "$other_pid" ]; then
@@ -3997,7 +4033,7 @@ apply_system_state() {
                             else
                                 log_message "WARNING: APT packages batch installation completed with error status (${apt_rc}); attempting individual package installs."
                                 echo "Batch APT install encountered issues; attempting individual package installs..."
-                                local apt_success=0 apt_failed=0
+                                local apt_success=0 apt_failed=0 apt_aborted=false
                                 for pkg in "${apt_packages_to_install[@]}"; do
                                     [ -z "$pkg" ] && continue
                                     if dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q "install ok installed"; then
@@ -4021,6 +4057,7 @@ apply_system_state() {
                                             if ! sudo -n -v 2>/dev/null; then
                                                 log_message "ERROR: Sudo credentials expired and cannot be renewed in non-interactive mode. Aborting remaining individual APT package installations."
                                                 echo "ERROR: Sudo authentication expired. Skipping remaining APT packages." >&2
+                                                apt_aborted=true
                                                 break
                                             fi
                                         fi
@@ -4043,7 +4080,7 @@ apply_system_state() {
                                     fi
                                 done
                                 log_message "Individual APT package installation completed (${apt_success} installed, ${apt_failed} failed)."
-                                if [ "$apt_failed" -eq 0 ] || [ "$apt_success" -gt 0 ]; then
+                                if [ "$apt_failed" -eq 0 ] && [ "$apt_aborted" = false ]; then
                                     apt_pkgs_applied=true
                                 fi
                             fi
@@ -4222,7 +4259,7 @@ apply_system_state() {
                             else
                                 log_message "Batch DNF install encountered issues; attempting individual package installs."
                                 echo "Batch install encountered issues; attempting individual package installs..."
-                                local dnf_success=0 dnf_failed=0
+                                local dnf_success=0 dnf_failed=0 dnf_aborted=false
                                 for pkg in "${dnf_packages_to_install[@]}"; do
                                     [ -z "$pkg" ] && continue
                                     if rpm -q "$pkg" &>/dev/null; then
@@ -4238,6 +4275,7 @@ apply_system_state() {
                                             if ! sudo -n -v 2>/dev/null; then
                                                 log_message "ERROR: Sudo credentials expired and cannot be renewed in non-interactive mode. Aborting remaining individual DNF package installations."
                                                 echo "ERROR: Sudo authentication expired. Skipping remaining DNF packages." >&2
+                                                dnf_aborted=true
                                                 break
                                             fi
                                         fi
@@ -4258,7 +4296,7 @@ apply_system_state() {
                                     fi
                                 done
                                 log_message "Individual DNF package installation completed (${dnf_success} installed, ${dnf_failed} failed)."
-                                if [ "$dnf_failed" -eq 0 ] || [ "$dnf_success" -gt 0 ]; then
+                                if [ "$dnf_failed" -eq 0 ] && [ "$dnf_aborted" = false ]; then
                                     dnf_pkgs_applied=true
                                 fi
                             fi
@@ -4328,7 +4366,8 @@ apply_system_state() {
 
     # --- Step 6: Restore Flatpak remotes and packages ---
     if [ "$opt_flatpaks" = true ] && { { [ -n "$flatpak_remotes_f" ] && [ -f "$flatpak_remotes_f" ]; } || { [ -n "$flatpak_pkgs_f" ] && [ -f "$flatpak_pkgs_f" ]; }; }; then
-        local flatpaks_applied=false
+        local flatpak_remotes_applied=false
+        local flatpak_pkgs_applied=false
         local restore_flatpak_confirm=""
         if [ "$cli_yes" = true ]; then
             restore_flatpak_confirm="y"
@@ -4342,6 +4381,7 @@ apply_system_state() {
                 if [ -n "$flatpak_remotes_f" ] && [ -f "$flatpak_remotes_f" ]; then
                     log_message "Restoring flatpak remotes from ${flatpak_remotes_f}"
                     local remote_can_sudo=""
+                    local fp_remote_failed=0
                     while IFS=$'\t' read -r remote_name remote_url remote_options; do
                         { [ -z "$remote_name" ] || [ -z "$remote_url" ]; } && continue
                         local scope_flag="--system"
@@ -4378,18 +4418,24 @@ apply_system_state() {
                                     sudo -n -v 2>/dev/null || true
                                     # shellcheck disable=SC2024
                                     if ! sudo -n flatpak remote-add --if-not-exists "$scope_flag" "${remote_name}" "${remote_url}" >> "$LOG_FILE" 2>&1; then
+                                        ((fp_remote_failed++))
                                         log_message "WARNING: Failed to configure system flatpak remote ${remote_name} with sudo."
                                         echo "WARNING: Failed to configure system flatpak remote: ${remote_name}" >&2
                                     fi
                                 else
+                                    ((fp_remote_failed++))
                                     log_message "WARNING: Failed to configure system flatpak remote ${remote_name} (root privileges unavailable)."
                                 fi
                             else
+                                ((fp_remote_failed++))
                                 log_message "WARNING: Failed to configure flatpak remote ${remote_name} (${scope_flag})."
                                 echo "WARNING: Failed to configure flatpak remote: ${remote_name}" >&2
                             fi
                         fi
                     done < "$flatpak_remotes_f"
+                    if [ "$fp_remote_failed" -eq 0 ]; then
+                        flatpak_remotes_applied=true
+                    fi
                 fi
 
                 # Restore packages
@@ -4397,6 +4443,7 @@ apply_system_state() {
                     log_message "Restoring flatpak packages from ${flatpak_pkgs_f}"
                     local user_apps=()
                     local system_apps=()
+                    local fp_sys_failed=0 fp_usr_failed=0
 
                     while IFS=$'\t' read -r col1 _ col3 col4; do
                         [ -z "$col1" ] && continue
@@ -4469,7 +4516,7 @@ apply_system_state() {
                         else
                             log_message "WARNING: System flatpak batch installation completed with error status (${fp_sys_rc}); attempting individual app installs."
                             echo "Batch system flatpak install encountered issues; attempting individual app installs..."
-                            local fp_sys_success=0 fp_sys_failed=0
+                            local fp_sys_success=0
                             for app in "${system_apps[@]}"; do
                                 [ -z "$app" ] && continue
                                 echo "Installing system flatpak: $app..."
@@ -4505,7 +4552,7 @@ apply_system_state() {
                         else
                             log_message "WARNING: User flatpak batch installation completed with error status (${fp_user_rc}); attempting individual app installs."
                             echo "Batch user flatpak install encountered issues; attempting individual app installs..."
-                            local fp_usr_success=0 fp_usr_failed=0
+                            local fp_usr_success=0
                             for app in "${user_apps[@]}"; do
                                 [ -z "$app" ] && continue
                                 echo "Installing user flatpak: $app..."
@@ -4523,7 +4570,9 @@ apply_system_state() {
                     fi
 
                     log_message "Flatpak restore completed."
-                    flatpaks_applied=true
+                    if [ "$fp_sys_failed" -eq 0 ] && [ "$fp_usr_failed" -eq 0 ]; then
+                        flatpak_pkgs_applied=true
+                    fi
                 fi
             else
                 log_message "WARNING: flatpak command not found. Skipping flatpak restore."
@@ -4532,8 +4581,8 @@ apply_system_state() {
             echo "Skipping flatpak restore."
             log_message "Flatpak restore skipped by user."
         fi
-        [ -n "$flatpak_remotes_f" ] && preserve_or_clean_manifest "$flatpak_remotes_f" "$flatpaks_applied"
-        [ -n "$flatpak_pkgs_f" ] && preserve_or_clean_manifest "$flatpak_pkgs_f" "$flatpaks_applied"
+        [ -n "$flatpak_remotes_f" ] && preserve_or_clean_manifest "$flatpak_remotes_f" "$flatpak_remotes_applied"
+        [ -n "$flatpak_pkgs_f" ] && preserve_or_clean_manifest "$flatpak_pkgs_f" "$flatpak_pkgs_applied"
     fi
 
     # --- Step 7: Restore Pipx packages ---
@@ -4580,15 +4629,19 @@ apply_system_state() {
                 log_message "Re-enabling systemd user units from ${systemd_f}"
                 if command -v systemctl &> /dev/null; then
                     systemctl --user daemon-reload 2>/dev/null || true
-                    local unit_file _
+                    local unit_file _ systemd_failed=0
                     while read -r unit_file _; do
                         [ -z "$unit_file" ] && continue
                         echo "Enabling systemd user unit: ${unit_file}..."
-                        systemctl --user enable "$unit_file" >> "$LOG_FILE" 2>&1 || \
+                        if ! systemctl --user enable "$unit_file" >> "$LOG_FILE" 2>&1; then
+                            ((systemd_failed++))
                             log_message "WARNING: Failed to enable systemd user unit ${unit_file}"
+                        fi
                     done < "$systemd_f"
-                    log_message "Systemd user units re-enabled."
-                    systemd_applied=true
+                    log_message "Systemd user units re-enabled (${systemd_failed} failed)."
+                    if [ "$systemd_failed" -eq 0 ]; then
+                        systemd_applied=true
+                    fi
                 else
                     log_message "WARNING: systemctl command not found. Skipping systemd user units restore."
                 fi
@@ -4703,8 +4756,11 @@ run_restore_system() {
                         local|cloud|all|auto)
                             cli_source="$2"
                             ;;
+                        "local file"|preserved|scratch)
+                            cli_source="preserved"
+                            ;;
                         *)
-                            echo "ERROR: Invalid source '$2'. Use 'local' or 'cloud'." >&2
+                            echo "ERROR: Invalid source '$2'. Use 'local', 'preserved', or 'cloud'." >&2
                             return 1
                             ;;
                     esac
@@ -4718,8 +4774,11 @@ run_restore_system() {
                     local|cloud|all|auto)
                         cli_source="${1#*=}"
                         ;;
+                    "local file"|preserved|scratch)
+                        cli_source="preserved"
+                        ;;
                     *)
-                        echo "ERROR: Invalid source '${1#*=}'. Use 'local' or 'cloud'." >&2
+                        echo "ERROR: Invalid source '${1#*=}'. Use 'local', 'preserved', or 'cloud'." >&2
                         return 1
                         ;;
                 esac
@@ -4831,14 +4890,14 @@ run_restore_system() {
     if [ -n "$cli_archive" ]; then
         case "$cli_archive" in
             latest|auto)
-                if [ "$local_available" = true ] && [ "$cli_source" != "cloud" ]; then
+                if [ "$local_available" = true ] && [ "$cli_source" != "cloud" ] && [ "$cli_source" != "preserved" ]; then
                     restore_source="local"
                     backup_choice="${local_backups[0]}"
                 elif [ ${#preserved_archives[@]} -gt 0 ] && [ "$cli_source" != "cloud" ]; then
                     restore_source="local file"
                     direct_archive_file="${preserved_archives[0]}"
                     backup_choice="$(basename "$direct_archive_file")"
-                elif [ "$cli_source" = "local" ]; then
+                elif [ "$cli_source" = "local" ] || [ "$cli_source" = "preserved" ]; then
                     echo "ERROR: Local backup drive is not available and no preserved archives found in ${SCRATCH_DIR:-${SOURCE_DIR}}." >&2
                     return 1
                 else
@@ -4880,7 +4939,7 @@ run_restore_system() {
                     backup_choice="$(basename "$direct_archive_file")"
                 else
                     local found_local=false
-                    if [ "$cli_source" != "cloud" ]; then
+                    if [ "$cli_source" != "cloud" ] && [ "$cli_source" != "preserved" ]; then
                         for b in "${local_backups[@]}"; do
                             if [ "$b" = "$requested_file" ]; then
                                 found_local=true
@@ -4891,7 +4950,7 @@ run_restore_system() {
                     if [ "$found_local" = true ]; then
                         restore_source="local"
                         backup_choice="$requested_file"
-                    elif [ "$cli_source" = "local" ]; then
+                    elif [ "$cli_source" = "local" ] || [ "$cli_source" = "preserved" ]; then
                         echo "ERROR: Specified archive '${cli_archive}' not found on local drive, in SCRATCH_DIR, SOURCE_DIR, or as local file." >&2
                         return 1
                     else
@@ -4916,14 +4975,14 @@ run_restore_system() {
     else
         # Select archive interactively or auto-pick in batch mode
         if [ "$cli_yes" = true ] || [ ! -t 0 ]; then
-            if [ "$local_available" = true ] && [ "$cli_source" != "cloud" ]; then
+            if [ "$local_available" = true ] && [ "$cli_source" != "cloud" ] && [ "$cli_source" != "preserved" ]; then
                 restore_source="local"
                 backup_choice="${local_backups[0]}"
             elif [ ${#preserved_archives[@]} -gt 0 ] && [ "$cli_source" != "cloud" ]; then
                 restore_source="local file"
                 direct_archive_file="${preserved_archives[0]}"
                 backup_choice="$(basename "$direct_archive_file")"
-            elif [ "$cli_source" = "local" ]; then
+            elif [ "$cli_source" = "local" ] || [ "$cli_source" = "preserved" ]; then
                 echo "ERROR: Local backup drive is not available and no preserved archives found in ${SCRATCH_DIR:-${SOURCE_DIR}}." >&2
                 return 1
             else
@@ -4940,9 +4999,9 @@ run_restore_system() {
             fi
         else
             local source_options=()
-            [ "$local_available" = true ] && [ "$cli_source" != "cloud" ] && source_options+=("Local Drive (${local_backup_path}) [Fastest]")
-            [ ${#preserved_archives[@]} -gt 0 ] && [ "$cli_source" != "cloud" ] && source_options+=("Preserved Local Archives (${SCRATCH_DIR:-${SOURCE_DIR}}) [${#preserved_archives[@]} archive(s)]")
-            [ "$cli_source" != "local" ] && source_options+=("Cloud Storage (${BACKUP_DIR})")
+            [ "$local_available" = true ] && [ "$cli_source" != "cloud" ] && [ "$cli_source" != "preserved" ] && source_options+=("Local Drive (${local_backup_path}) [Fastest]")
+            [ ${#preserved_archives[@]} -gt 0 ] && [ "$cli_source" != "cloud" ] && [ "$cli_source" != "local" ] && source_options+=("Preserved Local Archives (${SCRATCH_DIR:-${SOURCE_DIR}}) [${#preserved_archives[@]} archive(s)]")
+            [ "$cli_source" != "local" ] && [ "$cli_source" != "preserved" ] && source_options+=("Cloud Storage (${BACKUP_DIR})")
             source_options+=("Cancel")
 
             if [ ${#source_options[@]} -gt 2 ]; then
@@ -4956,13 +5015,13 @@ run_restore_system() {
                         "Cancel"|"") echo "Cancelled."; return 0 ;;
                     esac
                 done
-            elif [ "$local_available" = true ] && [ "$cli_source" != "cloud" ]; then
+            elif [ "$local_available" = true ] && [ "$cli_source" != "cloud" ] && [ "$cli_source" != "preserved" ]; then
                 restore_source="local"
                 backups=("${local_backups[@]}")
             elif [ ${#preserved_archives[@]} -gt 0 ] && [ "$cli_source" != "cloud" ]; then
                 restore_source="local file"
                 backups=("${preserved_archives[@]}")
-            elif [ "$cli_source" = "local" ]; then
+            elif [ "$cli_source" = "local" ] || [ "$cli_source" = "preserved" ]; then
                 echo "ERROR: Local backup drive is not available and no preserved archives found in ${SCRATCH_DIR:-${SOURCE_DIR}}." >&2
                 return 1
             else
@@ -5148,9 +5207,31 @@ run_restore_system() {
     fi
 
     if [ -n "$companion_index_file" ] && [ -s "$companion_index_file" ]; then
+        local _mf_re_parts=(
+            "apt_repos_keys\\.tar\\.gz" "apt_repos.*\\.txt" "apt_packages.*\\.txt"
+            "dpkg_.*architectures\\.txt" "debconf_selections\\.txt"
+            "dnf_repos_keys\\.tar\\.gz" "dnf_repos.*\\.txt" "dnf_packages.*\\.txt"
+            "dconf_settings\\.(ini|dconf)" "flatpak_.*\\.txt" "pipx-spec\\.json"
+            "systemd_user.*_units\\.txt" "crontab_backup\\.txt"
+        )
+        local _custom_mf _esc_mf
+        for _custom_mf in \
+            "${APT_REPOS_FILE}" "${APT_PACKAGES_FILE}" "${DPKG_ARCHITECTURES_FILE}" "${DEBCONF_SELECTIONS_FILE}" \
+            "${DNF_REPOS_FILE}" "${DNF_PACKAGES_FILE}" "${DCONF_SETTINGS_FILE}" \
+            "${FLATPAK_REMOTES_FILE}" "${FLATPAK_PACKAGES_FILE}" "${PIPX_SPEC_FILE}" \
+            "${SYSTEMD_USER_UNITS_FILE}" "${CRONTAB_BACKUP_FILE}"; do
+            [ -z "$_custom_mf" ] && continue
+            # shellcheck disable=SC2016
+            _esc_mf=$(printf '%s' "$_custom_mf" | sed -e 's/[.[\*^$()+?{|\\]/\\&/g')
+            _mf_re_parts+=("$_esc_mf")
+        done
+        local _joined_mf_re
+        local IFS='|'
+        _joined_mf_re="${_mf_re_parts[*]}"
+        unset IFS
         mapfile -t exact_manifest_files < <(gzip -dc "$companion_index_file" 2>/dev/null \
             | sed -E -e '/^[lh]/s/ (->|link to) .*$//' -e 's/^([^[:space:]]+[[:space:]]+){5}//' \
-            | grep -E '^(\./|\.system_state/)?(apt_repos_keys\.tar\.gz|apt_repos.*\.txt|apt_packages.*\.txt|dpkg_.*architectures\.txt|debconf_selections\.txt|dnf_repos_keys\.tar\.gz|dnf_repos.*\.txt|dnf_packages.*\.txt|dconf_settings\.(ini|dconf)|flatpak_.*\.txt|pipx-spec\.json|systemd_user.*_units\.txt|crontab_backup\.txt)$' \
+            | grep -E "^(\./|\.system_state/)?(${_joined_mf_re})\$" \
             | sort -u)
     fi
     [ -n "$temp_index_dl" ] && rm -f "$temp_index_dl" 2>/dev/null
@@ -5221,13 +5302,27 @@ run_restore_system() {
         return 1
     fi
     if [ "$tar_exit_code" -gt 1 ] && [ "$tar_exit_code" -ne 141 ]; then
-        local ERROR_MSG="Failed to extract system state manifests (tar exit code ${tar_exit_code})."
-        [ -n "$tar_err_msg" ] && ERROR_MSG="${ERROR_MSG} Details: ${tar_err_msg}"
-        log_message "$ERROR_MSG"
-        echo "ERROR: ${ERROR_MSG}" >&2
-        rm -rf "$staging_tmp" 2>/dev/null
-        CURRENT_SYSTEM_STATE_TMP_DIR=""
-        return 1
+        # When extracting wildcard candidate patterns without a companion index, GNU tar exits with code 2
+        # because non-applicable patterns (e.g. DNF manifests on an APT system or legacy filenames) are absent.
+        local fatal_tar_err=true
+        if [ "$tar_exit_code" -eq 2 ] && [ ${#exact_manifest_files[@]} -eq 0 ]; then
+            local real_tar_errs=""
+            if [ -n "$tar_err_msg" ]; then
+                real_tar_errs=$(printf '%s\n' "$tar_err_msg" | grep -v -E '(: Not found in archive|Exiting with failure status due to previous errors)' || true)
+            fi
+            if [ -z "$real_tar_errs" ]; then
+                fatal_tar_err=false
+            fi
+        fi
+        if [ "$fatal_tar_err" = true ]; then
+            local ERROR_MSG="Failed to extract system state manifests (tar exit code ${tar_exit_code})."
+            [ -n "$tar_err_msg" ] && ERROR_MSG="${ERROR_MSG} Details: ${tar_err_msg}"
+            log_message "$ERROR_MSG"
+            echo "ERROR: ${ERROR_MSG}" >&2
+            rm -rf "$staging_tmp" 2>/dev/null
+            CURRENT_SYSTEM_STATE_TMP_DIR=""
+            return 1
+        fi
     fi
 
     apply_system_state "$staging_tmp" "${filter_opts[@]}"
@@ -5892,25 +5987,27 @@ pin_archive() {
     local on_local=false
     local on_preserved=false
     local on_cloud=false
-
-    if [ -n "$local_backup_path" ] && [ -d "$local_backup_path" ] && [ -f "${local_backup_path}/${clean_target}" ]; then
-        on_local=true
-    fi
     local preserved_archive_path=""
-    local -a pres_search_dirs=("${SOURCE_DIR}")
-    local _s_dir="${SCRATCH_DIR:-${SOURCE_DIR}/.backup_scratch}"
-    if [ -d "$_s_dir" ] && [ "$_s_dir" != "${SOURCE_DIR}" ]; then
-        pres_search_dirs+=("$_s_dir")
-    fi
-    for _pdir in "${pres_search_dirs[@]}"; do
-        if [ -f "${_pdir}/${clean_target}" ]; then
-            on_preserved=true
-            preserved_archive_path="${_pdir}/${clean_target}"
-            break
+
+    if [[ "$source_scope" == "all" || "$source_scope" == "both" || "$source_scope" == "local" || "$source_scope" == "auto" ]]; then
+        if [ -n "$local_backup_path" ] && [ -d "$local_backup_path" ] && [ -f "${local_backup_path}/${clean_target}" ]; then
+            on_local=true
         fi
-    done
+        local -a pres_search_dirs=("${SOURCE_DIR}")
+        local _s_dir="${SCRATCH_DIR:-${SOURCE_DIR}/.backup_scratch}"
+        if [ -d "$_s_dir" ] && [ "$_s_dir" != "${SOURCE_DIR}" ]; then
+            pres_search_dirs+=("$_s_dir")
+        fi
+        for _pdir in "${pres_search_dirs[@]}"; do
+            if [ -f "${_pdir}/${clean_target}" ]; then
+                on_preserved=true
+                preserved_archive_path="${_pdir}/${clean_target}"
+                break
+            fi
+        done
+    fi
     if [[ "$source_scope" == "all" || "$source_scope" == "both" || "$source_scope" == "cloud" || "$source_scope" == "auto" ]]; then
-        if [[ "$BACKUP_DIR" == *:* ]] && command -v rclone &>/dev/null; then
+        if [ -n "$BACKUP_DIR" ] && command -v rclone &>/dev/null; then
             if rclone lsf --files-only --max-depth 1 "${RCLONE_QUERY_OPTS[@]}" --include "${clean_target}" "${BACKUP_DIR}" 2>/dev/null | grep -F -x -q "${clean_target}"; then
                 on_cloud=true
             fi
@@ -6222,25 +6319,27 @@ unpin_archive() {
     local is_pinned_cloud=false
 
     local base_target="${clean_target%%.tar.*}"
-
-    if [ -n "$local_backup_path" ] && { [ -f "${local_backup_path}/${clean_target}.pinned" ] || [ -f "${local_backup_path}/${base_target}.pinned" ]; }; then
-        is_pinned_local=true
-    fi
     local -a pres_pin_files=()
-    local -a unpin_check_dirs=("${SOURCE_DIR}")
-    local _s_dir="${SCRATCH_DIR:-${SOURCE_DIR}/.backup_scratch}"
-    if [ -d "$_s_dir" ] && [ "$_s_dir" != "${SOURCE_DIR}" ]; then
-        unpin_check_dirs+=("$_s_dir")
-    fi
-    for _pdir in "${unpin_check_dirs[@]}"; do
-        [ -f "${_pdir}/${clean_target}.pinned" ] && pres_pin_files+=("${_pdir}/${clean_target}.pinned")
-        [ -f "${_pdir}/${base_target}.pinned" ] && pres_pin_files+=("${_pdir}/${base_target}.pinned")
-    done
-    if [ ${#pres_pin_files[@]} -gt 0 ]; then
-        is_pinned_preserved=true
+
+    if [[ "$source_scope" == "all" || "$source_scope" == "both" || "$source_scope" == "local" || "$source_scope" == "auto" ]]; then
+        if [ -n "$local_backup_path" ] && { [ -f "${local_backup_path}/${clean_target}.pinned" ] || [ -f "${local_backup_path}/${base_target}.pinned" ]; }; then
+            is_pinned_local=true
+        fi
+        local -a unpin_check_dirs=("${SOURCE_DIR}")
+        local _s_dir="${SCRATCH_DIR:-${SOURCE_DIR}/.backup_scratch}"
+        if [ -d "$_s_dir" ] && [ "$_s_dir" != "${SOURCE_DIR}" ]; then
+            unpin_check_dirs+=("$_s_dir")
+        fi
+        for _pdir in "${unpin_check_dirs[@]}"; do
+            [ -f "${_pdir}/${clean_target}.pinned" ] && pres_pin_files+=("${_pdir}/${clean_target}.pinned")
+            [ -f "${_pdir}/${base_target}.pinned" ] && pres_pin_files+=("${_pdir}/${base_target}.pinned")
+        done
+        if [ ${#pres_pin_files[@]} -gt 0 ]; then
+            is_pinned_preserved=true
+        fi
     fi
     if [[ "$source_scope" == "all" || "$source_scope" == "both" || "$source_scope" == "cloud" || "$source_scope" == "auto" ]]; then
-        if [[ "$BACKUP_DIR" == *:* ]] && command -v rclone &>/dev/null; then
+        if [ -n "$BACKUP_DIR" ] && command -v rclone &>/dev/null; then
             if rclone lsf --files-only --max-depth 1 "${RCLONE_QUERY_OPTS[@]}" --include "${clean_target}.pinned" --include "${base_target}.pinned" "${BACKUP_DIR}" 2>/dev/null | grep -F -x -q -e "${clean_target}.pinned" -e "${base_target}.pinned"; then
                 is_pinned_cloud=true
             fi
@@ -6682,6 +6781,12 @@ upload_preserved_archive() {
     target_bytes=$(stat -c %s "$target_file" 2>/dev/null || echo 0)
     [ "$target_bytes" -gt 0 ] && target_hr=$(numfmt --to=iec --suffix=B "$target_bytes" 2>/dev/null || echo "${target_bytes}B")
 
+    if [ "${DRY_RUN:-false}" = "true" ]; then
+        echo "[DRY-RUN] Would upload preserved archive ${target_name} (${target_hr}) to ${BACKUP_DIR}, remove local preserved copy, and run retention rotation."
+        log_message "[DRY-RUN] Would upload preserved archive: ${target_name} (${target_hr}) to ${BACKUP_DIR}"
+        return 0
+    fi
+
     # Ensure SHA-256 sidecar exists for preserved archive
     local target_sha256="${target_file}.sha256"
     if [ ! -f "$target_sha256" ]; then
@@ -6691,16 +6796,20 @@ upload_preserved_archive() {
     echo "Uploading preserved archive ${target_name} (${target_hr}) to ${BACKUP_DIR}..."
     log_message "Uploading preserved archive: ${target_name} (${target_hr})"
 
-    # Also stage to local backup drive if mounted and not yet present
+    # Also stage to local backup drive if mounted and not yet present (defer rotation until after cloud upload)
     local target_manifest="${target_file}.manifest.json"
     local local_backup_path
+    local local_stage_ok=false
     if local_backup_path=$(get_local_backup_path 2>/dev/null) && [ -d "${local_backup_path}" ]; then
         if [ ! -f "${local_backup_path}/${target_name}" ]; then
             echo "Staging copy of preserved archive to local backup drive..."
-            if handle_local_backup "${target_file}" "${target_name}"; then
+            if handle_local_backup "${target_file}" "${target_name}" true; then
+                local_stage_ok=true
                 [ -f "$target_manifest" ] && update_manifest_destination_status "$target_manifest" "local_backup" "OK"
                 [ -f "${local_backup_path}/${target_name}.manifest.json" ] && update_manifest_destination_status "${local_backup_path}/${target_name}.manifest.json" "local_backup" "OK"
             fi
+        else
+            local_stage_ok=true
         fi
     fi
 
@@ -6797,6 +6906,9 @@ upload_preserved_archive() {
         echo "Upload of ${target_name} succeeded in ${duration_str}!"
         rm -f "${target_file}" "${target_sha256}" "${target_manifest}" "${target_index}" "${target_pin}" "${target_file%%.tar.*}.pinned"
         run_rotation "${target_name}"
+        if [ "$local_stage_ok" = true ]; then
+            run_local_rotation "${target_name}"
+        fi
         send_notification "normal" "Backup Upload Succeeded" "Preserved archive ${target_name} (${target_hr}) successfully uploaded in ${duration_str}." "drive-harddisk"
         return 0
     else
@@ -6858,6 +6970,14 @@ manage_preserved_archives() {
             return 0
             ;;
         --delete|-d|--clean|-c)
+            if [ "${DRY_RUN:-false}" = "true" ]; then
+                echo "[DRY-RUN] Would delete all ${count} preserved failed-upload archive(s):"
+                for p in "${preserved_archives[@]}"; do
+                    echo "  - $(basename "$p")"
+                    log_message "[DRY-RUN] Would delete preserved archive: $(basename "$p")"
+                done
+                return 0
+            fi
             echo "Deleting all ${count} preserved failed-upload archive(s)..."
             for p in "${preserved_archives[@]}"; do
                 log_message "Deleting preserved archive: $(basename "$p")"
@@ -6963,6 +7083,13 @@ manage_preserved_archives() {
                 done
                 ;;
             3)
+                if [ "${DRY_RUN:-false}" = "true" ]; then
+                    echo "[DRY-RUN] Would delete all ${count} preserved archive(s)."
+                    for p in "${preserved_archives[@]}"; do
+                        log_message "[DRY-RUN] Would delete preserved archive: $(basename "$p")"
+                    done
+                    return 0
+                fi
                 local del_confirm=""
                 read -r -p "Are you sure you want to permanently delete ALL ${count} preserved archive(s)? (y/N): " del_confirm
                 if [[ "$del_confirm" =~ ^[Yy]$ ]]; then
@@ -6996,6 +7123,11 @@ manage_preserved_archives() {
                         fi
                     done
                     if [ -n "$sel_path" ]; then
+                        if [ "${DRY_RUN:-false}" = "true" ]; then
+                            echo "[DRY-RUN] Would permanently delete ${sel_name}."
+                            log_message "[DRY-RUN] Would delete preserved archive: ${sel_name}"
+                            break
+                        fi
                         local del_one=""
                         read -r -p "Permanently delete ${sel_name}? (y/N): " del_one
                         if [[ "$del_one" =~ ^[Yy]$ ]]; then
@@ -7047,6 +7179,9 @@ bundle_standalone_script() {
         echo "Arguments:"
         echo "  [target_file]   Destination path (default: ~/.local/bin/backup_script_standalone.sh)"
         return 0
+    elif [[ "$target_file" == -* ]]; then
+        echo "ERROR: Unknown option '${target_file}'. Usage: $0 bundle [target_file]" >&2
+        return 1
     fi
 
     if [ -z "$target_file" ]; then
@@ -7057,13 +7192,13 @@ bundle_standalone_script() {
     if [ "${SCRIPT_IS_STANDALONE:-false}" = "true" ]; then
         local self_script="${SCRIPT_PATH:-${BASH_SOURCE[0]}}"
         if [ -n "${self_script}" ] && [ -f "${self_script}" ]; then
-            if [ -e "${target_file}" ] && [ "$(realpath "${self_script}" 2>/dev/null)" = "$(realpath "${target_file}" 2>/dev/null)" ]; then
-                chmod 755 "${target_file}" 2>/dev/null || true
+            if [ -e "${target_file}" ] && [ "$(realpath -- "${self_script}" 2>/dev/null)" = "$(realpath -- "${target_file}" 2>/dev/null)" ]; then
+                chmod 755 -- "${target_file}" 2>/dev/null || true
                 echo "Standalone bundle is already up to date: ${target_file}"
                 return 0
             fi
-            if cp -p "${self_script}" "${target_file}" 2>/dev/null; then
-                chmod 755 "${target_file}" 2>/dev/null || true
+            if cp -p -- "${self_script}" "${target_file}" 2>/dev/null; then
+                chmod 755 -- "${target_file}" 2>/dev/null || true
                 echo "Standalone script bundle written to: ${target_file}"
                 return 0
             else
@@ -7075,7 +7210,7 @@ bundle_standalone_script() {
 
     local target_parent
     target_parent=$(dirname -- "$target_file")
-    [ -d "$target_parent" ] || mkdir -p "$target_parent" 2>/dev/null || true
+    [ -d "$target_parent" ] || mkdir -p -- "$target_parent" 2>/dev/null || true
 
     local _modules=(config core cloud crypto consistency system_state retention backup restore analytics ui main_dispatcher)
     for _mod in "${_modules[@]}"; do
@@ -7129,9 +7264,10 @@ EOF
             echo "# MODULE: ${_mod}.sh"
             echo "#=============================================================================="
             if [ "$_mod" = "main_dispatcher" ]; then
+                # shellcheck disable=SC2016
                 echo 'if [ "$_IS_SOURCED" = true ]; then'
                 echo '    unset _IS_SOURCED'
-                echo '    return 0 2>/dev/null || exit 0'
+                echo '    return 0 2>/dev/null'
                 echo 'fi'
                 echo 'unset _IS_SOURCED'
             fi
@@ -7139,14 +7275,14 @@ EOF
             echo
         done
     } > "$temp_bundle" || {
-        rm -f "$temp_bundle" 2>/dev/null
+        rm -f -- "$temp_bundle" 2>/dev/null
         return 1
     }
 
-    chmod 755 "$temp_bundle" 2>/dev/null || true
-    mv -f "$temp_bundle" "$target_file" 2>/dev/null
+    chmod 755 -- "$temp_bundle" 2>/dev/null || true
+    mv -f -- "$temp_bundle" "$target_file" 2>/dev/null
     local rc=$?
-    rm -f "$temp_bundle" 2>/dev/null
+    rm -f -- "$temp_bundle" 2>/dev/null
     local _idx
     for _idx in "${!CURRENT_GENERIC_TMP_FILES[@]}"; do
         if [ "${CURRENT_GENERIC_TMP_FILES[_idx]:-}" = "$temp_bundle" ]; then
@@ -7545,7 +7681,7 @@ archive:
 
 6. Flatpak Remotes & Applications:
    # Add remotes from ${FLATPAK_REMOTES_FILE}
-   # Install apps: xargs -a ${FLATPAK_PACKAGES_FILE} flatpak install -y
+   # Install apps: cut -f1 ${FLATPAK_PACKAGES_FILE} | xargs -r flatpak install -y
 
 7. Python Pipx Packages (${PIPX_SPEC_FILE}):
    pipx install <package_name> (refer to ${PIPX_SPEC_FILE} for package names)
@@ -9071,14 +9207,23 @@ run_backup() {
         tar_checkpoint_opts=("--checkpoint=10000" "--checkpoint-action=ttyout=\rArchiving: %u records...   ")
     fi
 
+    if ! [[ "${ZSTD_LEVEL:-6}" =~ ^[0-9]+$ ]] || [ "$ZSTD_LEVEL" -lt 1 ] || [ "$ZSTD_LEVEL" -gt 22 ]; then
+        log_message "WARNING: Invalid ZSTD_LEVEL '${ZSTD_LEVEL}'; falling back to level 6."
+        ZSTD_LEVEL=6
+    fi
     local zstd_compress_cmd="zstd -${ZSTD_LEVEL} -T0 --check"
     if [ "${ZSTD_LEVEL:-6}" -gt 19 ] 2>/dev/null; then
         zstd_compress_cmd="${zstd_compress_cmd} --ultra"
     fi
     if [ "$ZSTD_LONG" = true ] || [ "$ZSTD_LONG" = "1" ]; then
         zstd_compress_cmd="${zstd_compress_cmd} --long=27"
-    elif [[ "$ZSTD_LONG" =~ ^[0-9]+$ ]] && [ "$ZSTD_LONG" -gt 0 ]; then
+    elif [ "$ZSTD_LONG" = false ] || [ "$ZSTD_LONG" = "0" ] || [ -z "${ZSTD_LONG:-}" ]; then
+        :
+    elif [[ "$ZSTD_LONG" =~ ^[0-9]+$ ]] && [ "$ZSTD_LONG" -ge 10 ] && [ "$ZSTD_LONG" -le 31 ]; then
         zstd_compress_cmd="${zstd_compress_cmd} --long=${ZSTD_LONG}"
+    else
+        log_message "WARNING: Invalid ZSTD_LONG '${ZSTD_LONG}' (must be true/false or 10-31); falling back to --long=27."
+        zstd_compress_cmd="${zstd_compress_cmd} --long=27"
     fi
 
     local backup_tmp_dir
@@ -9572,11 +9717,22 @@ run_backup() {
         cloud_backup_status="Skipped (verification failed)"
         echo "Skipping cloud upload (pre-upload integrity verification failed)."
         log_message "Skipped cloud upload: pre-upload integrity verification failed."
-        update_manifest_destination_status "$FULL_MANIFEST_PATH" "cloud_backup" "$cloud_backup_status"
         local local_backup_path
         if local_backup_path=$(get_local_backup_path 2>/dev/null) && [ -n "$local_backup_path" ] && [ -d "$local_backup_path" ]; then
-            update_manifest_destination_status "${local_backup_path}/${ENCRYPTED_MANIFEST_NAME}" "cloud_backup" "$cloud_backup_status"
+            if [ "$PRESERVE_ARCHIVE" != true ] && [ "$local_rc" -eq 0 ]; then
+                log_message "Removing unverified/corrupted archive and sidecars from local backup drive (${local_backup_path}/${ENCRYPTED_TARBALL_NAME})..."
+                rm -f -- "${local_backup_path}/${ENCRYPTED_TARBALL_NAME}" \
+                         "${local_backup_path}/${ENCRYPTED_SHA256_NAME}" \
+                         "${local_backup_path}/${ENCRYPTED_MANIFEST_NAME}" \
+                         "${local_backup_path}/${ENCRYPTED_FILES_INDEX_NAME}" \
+                         "${local_backup_path}/${ENCRYPTED_PIN_NAME}" 2>/dev/null || true
+                local_backup_status="Failed (verification failed)"
+                update_manifest_destination_status "$FULL_MANIFEST_PATH" "local_backup" "$local_backup_status"
+            else
+                update_manifest_destination_status "${local_backup_path}/${ENCRYPTED_MANIFEST_NAME}" "cloud_backup" "$cloud_backup_status"
+            fi
         fi
+        update_manifest_destination_status "$FULL_MANIFEST_PATH" "cloud_backup" "$cloud_backup_status"
 
         if [ "$PRESERVE_ARCHIVE" = true ]; then
             local PRESERVED_PATH="${SOURCE_DIR}/${ENCRYPTED_TARBALL_NAME}"
@@ -10659,13 +10815,13 @@ run_restore() {
     # Handle CLI specified source or archive
     if [ -n "$cli_source" ]; then
         case "$cli_source" in
-            local|"local file"|preserved)
+            local)
                 if [ "$local_available" = false ] && [ ${#preserved_archives[@]} -eq 0 ]; then
                     local ERROR_MSG="ERROR: Local backup drive is not available and no preserved archives found in ${SCRATCH_DIR:-${SOURCE_DIR}}."
                     log_message "$ERROR_MSG"; echo "$ERROR_MSG" >&2
                     return 1
                 fi
-                if [ "$local_available" = true ] && [ "$cli_source" = "local" ]; then
+                if [ "$local_available" = true ]; then
                     restore_source="local"
                     backups=("${local_backups[@]}")
                 else
@@ -10673,13 +10829,23 @@ run_restore() {
                     backups=("${preserved_archives[@]}")
                 fi
                 ;;
+            "local file"|preserved|scratch)
+                cli_source="preserved"
+                if [ ${#preserved_archives[@]} -eq 0 ] && { [ -z "$cli_archive" ] || [ ! -f "$cli_archive" ]; }; then
+                    local ERROR_MSG="ERROR: No preserved archives found in ${SCRATCH_DIR:-${SOURCE_DIR}}."
+                    log_message "$ERROR_MSG"; echo "$ERROR_MSG" >&2
+                    return 1
+                fi
+                restore_source="local file"
+                backups=("${preserved_archives[@]}")
+                ;;
             cloud)
                 restore_source="cloud"
                 ;;
             auto)
                 ;;
             *)
-                echo "ERROR: Invalid source '${cli_source}'. Use 'local', 'cloud', or 'auto'." >&2
+                echo "ERROR: Invalid source '${cli_source}'. Use 'local', 'preserved', 'cloud', or 'auto'." >&2
                 return 1
                 ;;
         esac
@@ -10687,7 +10853,7 @@ run_restore() {
 
     if [ -n "$cli_archive" ]; then
         if [ "$cli_archive" = "latest" ] || [ "$cli_archive" = "auto" ]; then
-            if [ "$local_available" = true ] && [ "$cli_source" != "cloud" ]; then
+            if [ "$local_available" = true ] && [ "$cli_source" != "cloud" ] && [ "$cli_source" != "preserved" ]; then
                 restore_source="local"
                 backups=("${local_backups[@]}")
                 backup_choice="${backups[0]}"
@@ -10736,7 +10902,7 @@ run_restore() {
                 backup_choice="$(basename "$direct_archive_file")"
             else
                 local found_local=false
-                if [ "$local_available" = true ] && [ "$cli_source" != "cloud" ]; then
+                if [ "$local_available" = true ] && [ "$cli_source" != "cloud" ] && [ "$cli_source" != "preserved" ]; then
                     for b in "${local_backups[@]}"; do
                         if [ "$b" = "$req_archive" ]; then
                             found_local=true
@@ -10748,7 +10914,7 @@ run_restore() {
                     restore_source="local"
                     backups=("${local_backups[@]}")
                     backup_choice="$req_archive"
-                elif [ "$cli_source" = "local" ]; then
+                elif [ "$cli_source" = "local" ] || [ "$cli_source" = "preserved" ]; then
                     local ERROR_MSG="ERROR: Specified archive '${req_archive}' not found as local file, in preserved directories, or on local backup drive."
                     log_message "$ERROR_MSG"; echo "$ERROR_MSG" >&2
                     return 1
@@ -10777,7 +10943,7 @@ run_restore() {
 
     if [ -z "$backup_choice" ]; then
         if [ ! -t 0 ] || [ "$cli_yes" = true ]; then
-            if [ "$local_available" = true ] && [ "$cli_source" != "cloud" ]; then
+            if [ "$local_available" = true ] && [ "$cli_source" != "cloud" ] && [ "$cli_source" != "preserved" ]; then
                 restore_source="local"
                 backups=("${local_backups[@]}")
                 backup_choice="${backups[0]}"
@@ -10806,9 +10972,9 @@ run_restore() {
             fi
         else
             local source_options=()
-            [ "$local_available" = true ] && [ "$cli_source" != "cloud" ] && source_options+=("Local Drive (${local_backup_path}) [Fastest]")
-            [ ${#preserved_archives[@]} -gt 0 ] && [ "$cli_source" != "cloud" ] && source_options+=("Preserved Local Archives (${SCRATCH_DIR:-${SOURCE_DIR}}) [${#preserved_archives[@]} archive(s)]")
-            [ "$cli_source" != "local" ] && source_options+=("Cloud Storage (${BACKUP_DIR})")
+            [ "$local_available" = true ] && [ "$cli_source" != "cloud" ] && [ "$cli_source" != "preserved" ] && source_options+=("Local Drive (${local_backup_path}) [Fastest]")
+            [ ${#preserved_archives[@]} -gt 0 ] && [ "$cli_source" != "cloud" ] && [ "$cli_source" != "local" ] && source_options+=("Preserved Local Archives (${SCRATCH_DIR:-${SOURCE_DIR}}) [${#preserved_archives[@]} archive(s)]")
+            [ "$cli_source" != "local" ] && [ "$cli_source" != "preserved" ] && source_options+=("Cloud Storage (${BACKUP_DIR})")
             source_options+=("Cancel")
 
             if [ ${#source_options[@]} -gt 2 ]; then
@@ -10836,7 +11002,7 @@ run_restore() {
                             ;;
                     esac
                 done
-            elif [ "$local_available" = true ] && [ "$cli_source" != "cloud" ]; then
+            elif [ "$local_available" = true ] && [ "$cli_source" != "cloud" ] && [ "$cli_source" != "preserved" ]; then
                 restore_source="local"
                 backups=("${local_backups[@]}")
             elif [ ${#preserved_archives[@]} -gt 0 ] && [ "$cli_source" != "cloud" ]; then
@@ -11089,6 +11255,14 @@ run_restore() {
         archive_size_bytes=$(rclone lsl "${RCLONE_QUERY_OPTS[@]}" "${BACKUP_DIR}${backup_choice}" 2>/dev/null | awk 'NR==1 {print $1}')
     fi
 
+    local effective_stream_restore=false
+    if [ "$restore_source" = "cloud" ]; then
+        local _initial_stream_pref="${cli_stream:-${STREAM_CLOUD_RESTORE:-auto}}"
+        if [ "$_initial_stream_pref" = "true" ] || [ "$_initial_stream_pref" = "1" ] || [ "$_initial_stream_pref" = "stream" ]; then
+            effective_stream_restore=true
+        fi
+    fi
+
     if [ -n "$archive_size_bytes" ] && [ "$archive_size_bytes" -gt 0 ] 2>/dev/null; then
         local archive_size_kb=$((archive_size_bytes / 1024))
         local buffer_kb=$((512 * 1024)) # 512MB safety buffer
@@ -11110,7 +11284,6 @@ run_restore() {
         local target_avail_kb scratch_avail_kb
         target_avail_kb=$(df -Pk "${restore_target}" 2>/dev/null | awk 'NR==2 {print $4}')
 
-        local effective_stream_restore=false
         if [ "$restore_source" = "cloud" ]; then
             local stream_pref="${cli_stream:-${STREAM_CLOUD_RESTORE:-auto}}"
             if [ "$stream_pref" = "true" ] || [ "$stream_pref" = "1" ] || [ "$stream_pref" = "stream" ]; then
@@ -11936,13 +12109,13 @@ run_verify() {
                 echo "Usage: $0 verify [archive|path|latest|local|cloud] [source] [options]"
                 echo
                 echo "Options:"
-                echo "  --checksum-only, -c, --quick   Perform fast SHA-256 sidecar checksum verification without decrypting"
-                echo "  --source, -s <local|cloud>     Verify backup from specific source"
-                echo "  local | cloud                  Verify backup from specific source"
-                echo "  [archive]                      Archive filename, file path, or 'latest' (default: latest)"
+                echo "  --checksum-only, -c, --quick          Perform fast SHA-256 sidecar checksum verification without decrypting"
+                echo "  --source, -s <local|preserved|cloud>  Verify backup from specific source"
+                echo "  local | preserved | cloud             Verify backup from specific source"
+                echo "  [archive]                             Archive filename, file path, or 'latest' (default: latest)"
                 return 0
                 ;;
-            local|cloud|auto)
+            local|preserved|cloud|auto)
                 if [ -z "$target_arg" ]; then
                     target_arg="$1"
                 elif [ -z "$forced_source" ]; then
@@ -11967,10 +12140,10 @@ run_verify() {
 
     if [ -n "$forced_source" ]; then
         case "$forced_source" in
-            local|cloud|auto)
+            local|preserved|cloud|auto)
                 ;;
             *)
-                echo "ERROR: Invalid source '${forced_source}'. Must be 'local', 'cloud', or 'auto'." >&2
+                echo "ERROR: Invalid source '${forced_source}'. Must be 'local', 'preserved', 'cloud', or 'auto'." >&2
                 return 1
                 ;;
         esac
@@ -12025,6 +12198,16 @@ run_verify() {
                     backup_choice="$(basename "$direct_archive_file")"
                 fi
                 ;;
+            preserved)
+                if [ ${#preserved_archives[@]} -eq 0 ]; then
+                    local ERROR_MSG="ERROR: No preserved archives found in ${SCRATCH_DIR:-${SOURCE_DIR}}."
+                    log_message "$ERROR_MSG"; echo "$ERROR_MSG" >&2
+                    return 1
+                fi
+                verify_source="local file"
+                direct_archive_file="${preserved_archives[0]}"
+                backup_choice="$(basename "$direct_archive_file")"
+                ;;
             cloud)
                 verify_source="cloud"
                 echo "Querying cloud backups..."
@@ -12064,6 +12247,15 @@ run_verify() {
                         return 1
                     fi
                     backup_choice="${backups[0]}"
+                elif [ "$forced_source" = "preserved" ]; then
+                    if [ ${#preserved_archives[@]} -eq 0 ]; then
+                        local ERROR_MSG="ERROR: No preserved archives found in ${SCRATCH_DIR:-${SOURCE_DIR}}."
+                        log_message "$ERROR_MSG"; echo "$ERROR_MSG" >&2
+                        return 1
+                    fi
+                    verify_source="local file"
+                    direct_archive_file="${preserved_archives[0]}"
+                    backup_choice="$(basename "$direct_archive_file")"
                 elif [ "$local_available" = true ] && [ "$forced_source" != "cloud" ]; then
                     verify_source="local"
                     backups=("${local_backups[@]}")
@@ -12107,7 +12299,7 @@ run_verify() {
                 elif [[ "$target_arg" =~ ^~(/.*)?$ ]] && [ -f "${HOME}${BASH_REMATCH[1]}" ]; then
                     direct_file="${HOME}${BASH_REMATCH[1]}"
                 else
-                    if [ "$forced_source" != "cloud" ]; then
+                    if [ "$forced_source" != "cloud" ] && [ "$forced_source" != "preserved" ]; then
                         for b in "${local_backups[@]}"; do
                             if [ "$b" = "$requested_file" ]; then
                                 found_local=true
@@ -12133,7 +12325,7 @@ run_verify() {
                 elif [ "$found_local" = true ]; then
                     verify_source="local"
                     backup_choice="$requested_file"
-                elif [ "$forced_source" = "local" ]; then
+                elif [ "$forced_source" = "local" ] || [ "$forced_source" = "preserved" ]; then
                     local ERROR_MSG="ERROR: Specified archive '${target_arg}' not found on local drive, in preserved directories, or as local file."
                     log_message "$ERROR_MSG"; echo "$ERROR_MSG" >&2
                     return 1
@@ -13109,6 +13301,7 @@ show_backup_stats() {
         done
         cloud_temp_dirs=()
         CURRENT_STATS_TMP_DIRS=()
+        unset -f cleanup_stats_tmp 2>/dev/null
     }
 
     # 1. Custom directory path source
@@ -13953,6 +14146,17 @@ list_archive_contents() {
         fi
     fi
 
+    # Validate regex pattern; fallback to literal fixed-string search on syntax error
+    local -a grep_filter_opts=(-i)
+    if [ -n "$pattern_filter" ]; then
+        grep -E -e "$pattern_filter" /dev/null &>/dev/null
+        if [ $? -gt 1 ]; then
+            grep_filter_opts+=(-F)
+        else
+            grep_filter_opts+=(-E)
+        fi
+    fi
+
     if [ -n "$local_index_file" ] || [ "$cloud_index_available" = true ]; then
         local pager_cmd=()
         if [ "$use_pager" = true ]; then
@@ -13981,17 +14185,6 @@ list_archive_contents() {
         echo "Listing contents of: ${backup_choice} (${archive_source})..."
         [ -n "$pattern_filter" ] && echo "Filtering for pattern: '${pattern_filter}'"
         echo "-------------------------------------------------------------------------------"
-
-        # Validate regex pattern; fallback to literal fixed-string search on syntax error
-        local -a grep_filter_opts=(-i)
-        if [ -n "$pattern_filter" ]; then
-            grep -E -e "$pattern_filter" /dev/null &>/dev/null
-            if [ $? -gt 1 ]; then
-                grep_filter_opts+=(-F)
-            else
-                grep_filter_opts+=(-E)
-            fi
-        fi
 
         local index_query_failed=false
         local cloud_idx_tmp=""
@@ -14128,12 +14321,12 @@ list_archive_contents() {
             if [ "$archive_enc_type" = "asymmetric" ] || [ -z "$ENCRYPTION_PASSWORD" ]; then
                 "${gpg_cmd[@]}" 2>"$gpg_err_file" \
                     | tar "${tar_compress_opts[@]}" "$tar_list_flag" - 2>/dev/null \
-                    | grep --color="$grep_color" -E -i "$pattern_filter" \
+                    | grep --color="$grep_color" "${grep_filter_opts[@]}" -e "$pattern_filter" \
                     | "${pager_cmd[@]}"
             else
                 "${gpg_cmd[@]}" 3< <(printf '%s' "$ENCRYPTION_PASSWORD") 2>"$gpg_err_file" \
                     | tar "${tar_compress_opts[@]}" "$tar_list_flag" - 2>/dev/null \
-                    | grep --color="$grep_color" -E -i "$pattern_filter" \
+                    | grep --color="$grep_color" "${grep_filter_opts[@]}" -e "$pattern_filter" \
                     | "${pager_cmd[@]}"
             fi
             local pipe_statuses=("${PIPESTATUS[@]}")
@@ -14166,13 +14359,13 @@ list_archive_contents() {
                 rclone cat "${RCLONE_STREAM_OPTS[@]}" "${BACKUP_DIR}${backup_choice}" 2>"$rclone_err_file" \
                     | "${gpg_cmd[@]}" 2>"$gpg_err_file" \
                     | tar "${tar_compress_opts[@]}" "$tar_list_flag" - 2>/dev/null \
-                    | grep --color="$grep_color" -E -i "$pattern_filter" \
+                    | grep --color="$grep_color" "${grep_filter_opts[@]}" -e "$pattern_filter" \
                     | "${pager_cmd[@]}"
             else
                 rclone cat "${RCLONE_STREAM_OPTS[@]}" "${BACKUP_DIR}${backup_choice}" 2>"$rclone_err_file" \
                     | "${gpg_cmd[@]}" 3< <(printf '%s' "$ENCRYPTION_PASSWORD") 2>"$gpg_err_file" \
                     | tar "${tar_compress_opts[@]}" "$tar_list_flag" - 2>/dev/null \
-                    | grep --color="$grep_color" -E -i "$pattern_filter" \
+                    | grep --color="$grep_color" "${grep_filter_opts[@]}" -e "$pattern_filter" \
                     | "${pager_cmd[@]}"
             fi
             local pipe_statuses=("${PIPESTATUS[@]}")
@@ -14724,7 +14917,7 @@ find_file() {
     if [ "$chosen_source" = "local" ]; then
         restore_source_arg="local"
     elif [ "$chosen_source" = "preserved" ]; then
-        restore_source_arg="local"
+        restore_source_arg="preserved"
         local p_idx_loc="${archive_indices[$chosen_archive]#*|}"
         local p_dir
         p_dir="$(dirname "$p_idx_loc")"
@@ -15215,13 +15408,16 @@ diff_backups() {
 
     if ! resolve_index_target "$baseline_req" base_canon base_source base_loc; then
         echo "ERROR: Companion index not found for baseline archive '${baseline_req}'." >&2
+        unset -f resolve_index_target 2>/dev/null
         return 1
     fi
 
     if ! resolve_index_target "$target_req" tgt_canon tgt_source tgt_loc; then
         echo "ERROR: Companion index not found for target archive '${target_req}'." >&2
+        unset -f resolve_index_target 2>/dev/null
         return 1
     fi
+    unset -f resolve_index_target 2>/dev/null
 
     # Ensure chronological order: if baseline is newer than target, swap them
     local base_ts tgt_ts
@@ -15248,6 +15444,7 @@ diff_backups() {
                 unset 'CURRENT_DIFF_TMP_DIRS[i]'
             fi
         done
+        unset -f resolve_index_target fetch_index_to_file cleanup_diff_tmp 2>/dev/null
     }
 
     local base_idx_file="${diff_tmp_dir}/base.idx"
@@ -15327,11 +15524,13 @@ diff_backups() {
     fi
 
     # Pipeline: awk comparison scanner -> sort -> awk formatter -> pager
-    awk -v filter_pat="$filter_pattern" \
-        -v filter_is_re="$filter_is_regex" \
+    FILTER_PAT="$filter_pattern" awk -v filter_is_re="$filter_is_regex" \
         -v min_size="$min_size_bytes" \
         -v show_mode="$show_filter" '
-    BEGIN { FS = "[ \t]+" }
+    BEGIN {
+        FS = "[ \t]+"
+        filter_pat = ENVIRON["FILTER_PAT"]
+    }
     function clean_path(line,   tp) {
         tp = substr(line, 1, 1)
         sub(/^([^[:space:]]+[[:space:]]+){5}/, "", line)
@@ -15591,19 +15790,39 @@ diff_backups() {
 #                automated scheduled backups (default: daily at 00:45:00).
 #---
 install_systemd_timer() {
-    if [[ "${1:-}" =~ ^(--help|-h|help)$ ]]; then
-        echo "Usage: $0 install-timer [schedule]"
-        echo "Install and enable a systemd --user timer to run automatic backups."
-        echo "  schedule    systemd calendar expression (default: '*-*-* 00:45:00')"
-        return 0
-    fi
+    local schedule=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --help|-h|help)
+                echo "Usage: $0 install-timer [schedule]"
+                echo "Install and enable a systemd --user timer to run automatic backups."
+                echo "  schedule    systemd calendar expression (default: '*-*-* 00:45:00')"
+                return 0
+                ;;
+            --dry-run|-n)
+                DRY_RUN=true
+                shift
+                ;;
+            -*)
+                echo "ERROR: Unknown option '$1'. Run '$0 install-timer --help' for usage." >&2
+                return 1
+                ;;
+            *)
+                if [ -z "$schedule" ]; then
+                    schedule="$1"
+                else
+                    schedule="${schedule} $1"
+                fi
+                shift
+                ;;
+        esac
+    done
 
     if ! command -v systemctl &>/dev/null; then
         echo "ERROR: 'systemctl' command not found. systemd is required for timer management." >&2
         return 1
     fi
 
-    local schedule="${1:-}"
     if [ -z "$schedule" ]; then
         if [ -t 0 ]; then
             echo
@@ -15619,11 +15838,26 @@ install_systemd_timer() {
         schedule="${schedule:-*-*-* 00:45:00}"
     fi
 
-    local user_unit_dir="${HOME}/.config/systemd/user"
-    mkdir -p "$user_unit_dir"
+    if command -v systemd-analyze &>/dev/null; then
+        if ! systemd-analyze calendar "$schedule" &>/dev/null; then
+            echo "ERROR: Invalid systemd calendar schedule expression: '${schedule}'." >&2
+            echo "Example valid schedules: 'daily', 'weekly', '*-*-* 00:45:00', 'Mon *-*-* 02:00:00'" >&2
+            return 1
+        fi
+    fi
 
+    local user_unit_dir="${HOME}/.config/systemd/user"
     local service_path="${user_unit_dir}/backup-home.service"
     local timer_path="${user_unit_dir}/backup-home.timer"
+
+    if [ "${DRY_RUN:-false}" = "true" ]; then
+        echo "[DRY-RUN] Would write service unit to ${service_path}"
+        echo "[DRY-RUN] Would write timer unit to ${timer_path} (OnCalendar=${schedule})"
+        echo "[DRY-RUN] Would reload systemd user daemon and enable backup-home.timer."
+        return 0
+    fi
+
+    mkdir -p "$user_unit_dir"
 
     echo "Writing service unit to ${service_path}..."
     cat <<EOF > "$service_path"
@@ -15792,13 +16026,33 @@ journal_systemd_timer() {
 #  DESCRIPTION:  Disables and removes the systemd user backup timer and service units.
 #---
 uninstall_systemd_timer() {
-    if [[ "${1:-}" =~ ^(--help|-h|help)$ ]]; then
-        echo "Usage: $0 uninstall-timer [-y|--yes]"
-        echo
-        echo "Disable and remove the systemd user backup timer and service units."
-        echo "  -y, --yes    Non-interactive mode (bypass confirmation prompt)"
-        return 0
-    fi
+    local force_yes=false
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --help|-h|help)
+                echo "Usage: $0 uninstall-timer [-y|--yes]"
+                echo
+                echo "Disable and remove the systemd user backup timer and service units."
+                echo "  -y, --yes    Non-interactive mode (bypass confirmation prompt)"
+                return 0
+                ;;
+            -y|--yes|--force|-f)
+                force_yes=true
+                shift
+                ;;
+            --dry-run|-n)
+                DRY_RUN=true
+                shift
+                ;;
+            -*)
+                echo "ERROR: Unknown option '$1'. Run '$0 uninstall-timer --help' for usage." >&2
+                return 1
+                ;;
+            *)
+                shift
+                ;;
+        esac
+    done
 
     if ! command -v systemctl &>/dev/null; then
         echo "ERROR: 'systemctl' command not found. systemd is required." >&2
@@ -15814,9 +16068,9 @@ uninstall_systemd_timer() {
         return 0
     fi
 
-    local force_yes=false
-    if [ "${1:-}" = "-y" ] || [ "${1:-}" = "--yes" ]; then
-        force_yes=true
+    if [ "${DRY_RUN:-false}" = "true" ]; then
+        echo "[DRY-RUN] Would disable and remove ${timer_path} and ${service_path}."
+        return 0
     fi
 
     if [ "$force_yes" = false ] && [ -t 0 ]; then
@@ -15859,7 +16113,7 @@ manage_systemd_timer() {
             return 0
             ;;
         install|add)
-            install_systemd_timer "${2:-}"
+            install_systemd_timer "${@:2}"
             return $?
             ;;
         status|info)
@@ -15974,6 +16228,14 @@ init_config() {
                 force=1
                 shift
                 ;;
+            --dry-run|-n)
+                DRY_RUN=true
+                shift
+                ;;
+            -*)
+                echo "ERROR: Unknown option '$1'. Run '$0 init-config --help' for usage." >&2
+                return 1
+                ;;
             *)
                 if [ -z "$target_file" ]; then
                     target_file="$1"
@@ -15990,6 +16252,11 @@ init_config() {
     # Expand leading tilde if literal ~ was passed in quotes
     if [[ "$target_file" =~ ^~(/.*)?$ ]]; then
         target_file="${HOME}${BASH_REMATCH[1]}"
+    fi
+
+    if [ "${DRY_RUN:-false}" = "true" ]; then
+        echo "[DRY-RUN] Would generate template configuration file at '${target_file}' (chmod 600)."
+        return 0
     fi
 
     if [ -f "$target_file" ] && [ "$force" -ne 1 ]; then
@@ -16216,6 +16483,10 @@ init_config() {
 # Default: debconf_selections.txt
 #DEBCONF_SELECTIONS_FILE="debconf_selections.txt"
 
+# Filename for exported foreign DPKG architectures list (e.g. i386 for multiarch/Wine/Steam).
+# Default: dpkg_foreign_architectures.txt
+#DPKG_ARCHITECTURES_FILE="dpkg_foreign_architectures.txt"
+
 # Filename for exported user-installed DNF packages list.
 # Default: dnf_packages_userinstalled.txt
 #DNF_PACKAGES_FILE="dnf_packages_userinstalled.txt"
@@ -16364,11 +16635,13 @@ init_config() {
 #    "./test"
 #    "./external_drive"
 #    "./sensitive"
+#    "./linsw"
 #    "./googledrive"
 #    "./.config/google-chrome"
 #    "./.config/chromium"
 #    "./.config/vivaldi-snapshot"
 #    "./.mozilla"
+#    "./snap"
 #    # Browser transient state, internal caches, and IPC/process locks (Vivaldi, Chromium, Firefox, Thunderbird)
 #    "SingletonLock"
 #    "*/SingletonLock"
@@ -16398,10 +16671,18 @@ init_config() {
 #    "./.local/share/flatpak/.changed"
 #    "./.var/app/*/data/tmp"
 #    "./.local/share/pipx/venvs"
+#    # Games and container runtimes
+#    "./.local/share/Steam"
+#    "./.steam"
+#    "./.local/share/containers"
+#    # Developer build artifacts and package caches
+#    # Rust
+#    "./.rustup"
 #    "./.cargo/registry"
 #    "./.cargo/git"
 #    "target"
 #    "*/target"
+#    # JavaScript / TypeScript / Node / Web
 #    "node_modules"
 #    "*/node_modules"
 #    "./.npm"
@@ -16413,6 +16694,7 @@ init_config() {
 #    "*/.nuxt"
 #    ".turbo"
 #    "*/.turbo"
+#    # Python
 #    "__pycache__"
 #    "*.pyc"
 #    ".venv"
@@ -16424,21 +16706,19 @@ init_config() {
 #    ".ruff_cache"
 #    "*/.ruff_cache"
 #    ".tox"
+#    # JVM (Gradle & Maven)
 #    "./.gradle/caches"
 #    "./.gradle/wrapper"
 #    "./.m2/repository"
+#    # Go
 #    "./go/pkg/mod"
+#    # C / C++ / CMake
 #    "./.ccache"
 #    "CMakeFiles"
 #    "*/CMakeFiles"
 #    "CMakeCache.txt"
-#    "./linsw"
 #    "./Videos"
-#    # Games, containers, and virtual machines
-#    "./.local/share/Steam"
-#    "./.steam"
-#    "./.local/share/containers"
-#    "./.rustup"
+#    # Virtualization & VM Disk Images
 #    "./.local/share/gnome-boxes/images"
 #    "./VirtualBox VMs"
 #    "*.qcow2"
@@ -16456,6 +16736,9 @@ init_config() {
 #    "./${TARBALL_BASENAME}_*.tar.*.gpg"
 #    "./${TARBALL_BASENAME}_*.sha256"
 #    "./${TARBALL_BASENAME}_*.manifest.json"
+#    "./${TARBALL_BASENAME}_*.files.gz"
+#    "./${TARBALL_BASENAME}_*.pinned"
+#    "./${TARBALL_BASENAME}_*.log"
 #)
 
 #------------------------------------------------------------------------------
@@ -16667,6 +16950,10 @@ check_config() {
                 opt_fix=true
                 shift
                 ;;
+            --dry-run|-n)
+                DRY_RUN=true
+                shift
+                ;;
             --quiet|-q)
                 opt_quiet=true
                 shift
@@ -16689,6 +16976,11 @@ check_config() {
                 ;;
         esac
     done
+
+    if [ "$opt_fix" = true ] && [ "${DRY_RUN:-false}" = "true" ]; then
+        echo "Notice: --dry-run is active; --fix will report permission issues without modifying files on disk."
+        opt_fix=false
+    fi
 
     local c_reset="" c_bold="" c_green="" c_yellow="" c_red="" c_blue="" c_cyan=""
     if [ -t 1 ]; then
@@ -16945,10 +17237,36 @@ check_config() {
 
     if [ "${ENCRYPTION_MODE}" = "symmetric" ] || [ "${ENCRYPTION_MODE}" = "hybrid" ]; then
         local pass_source=""
+        local cred_pass=""
+        local keyring_pass=""
+        if [ -n "${CREDENTIALS_DIRECTORY:-}" ]; then
+            local _cred_cand _cred_v
+            for _cred_cand in "backup_passphrase" "backup_password" "passphrase" "encryption_password"; do
+                if [ -f "${CREDENTIALS_DIRECTORY}/${_cred_cand}" ] && [ -r "${CREDENTIALS_DIRECTORY}/${_cred_cand}" ]; then
+                    _cred_v=$(< "${CREDENTIALS_DIRECTORY}/${_cred_cand}")
+                    if [ -n "$_cred_v" ] && [ "$_cred_v" != "EnterPasswordHere" ]; then
+                        cred_pass="$_cred_v"
+                        pass_source="systemd credential (${CREDENTIALS_DIRECTORY}/${_cred_cand})"
+                        break
+                    fi
+                fi
+            done
+        fi
+        if [ -z "$pass_source" ] && command -v secret-tool &>/dev/null; then
+            keyring_pass=$(secret-tool lookup service backup_script user "$CURRENT_USER" 2>/dev/null || true)
+            if [ -n "$keyring_pass" ] && [ "$keyring_pass" != "EnterPasswordHere" ]; then
+                pass_source="GNOME Keyring / Secret Service (secret-tool)"
+            else
+                keyring_pass=""
+            fi
+        fi
+
         if [ -n "${ENCRYPTION_PASSWORD:-}" ] && [ "$ENCRYPTION_PASSWORD" != "EnterPasswordHere" ]; then
             pass_source="environment variable (ENCRYPTION_PASSWORD)"
         elif [ -n "${BACKUP_ENCRYPTION_PASSWORD:-}" ] && [ "$BACKUP_ENCRYPTION_PASSWORD" != "EnterPasswordHere" ]; then
             pass_source="environment variable (BACKUP_ENCRYPTION_PASSWORD)"
+        elif [ -n "$pass_source" ]; then
+            : # already set from systemd credential or keyring
         elif [ -f "$PASSWORD_FILE" ]; then
             pass_source="file (${PASSWORD_FILE})"
         fi
@@ -16957,7 +17275,7 @@ check_config() {
             report_ok "Passphrase Source" "Configured via ${pass_source}"
         else
             if [ "${ENCRYPTION_MODE}" = "symmetric" ]; then
-                report_warn "Passphrase Source" "No passphrase configured in environment or ${PASSWORD_FILE}. Automated timer runs will fail (interactive runs prompt)."
+                report_warn "Passphrase Source" "No passphrase configured in environment, keyring, or ${PASSWORD_FILE}. Automated timer runs will fail (interactive runs prompt)."
             else
                 report_info "Passphrase Source" "No passphrase configured (hybrid mode can still restore with secret key)."
             fi
@@ -16992,6 +17310,10 @@ check_config() {
                 test_pass="$ENCRYPTION_PASSWORD"
             elif [ -n "${BACKUP_ENCRYPTION_PASSWORD:-}" ] && [ "$BACKUP_ENCRYPTION_PASSWORD" != "EnterPasswordHere" ]; then
                 test_pass="$BACKUP_ENCRYPTION_PASSWORD"
+            elif [ -n "$cred_pass" ]; then
+                test_pass="$cred_pass"
+            elif [ -n "$keyring_pass" ]; then
+                test_pass="$keyring_pass"
             elif [ -f "$PASSWORD_FILE" ]; then
                 test_pass=$(< "$PASSWORD_FILE")
             fi
@@ -17242,19 +17564,36 @@ check_config() {
 
     # Pinned Archives (Retention Holds) Check
     local local_pinned_count=0 cloud_pinned_count=0 pres_pinned_count=0
+    local -A _unique_pinned_map=()
+    local _pin_f
     local local_dest_check
     if local_dest_check=$(get_local_backup_path --no-mount 2>/dev/null) && [ -d "$local_dest_check" ]; then
-        local_pinned_count=$(find "$local_dest_check" -maxdepth 1 -type f -name "${TARBALL_BASENAME}_*.pinned" -printf "%f\n" 2>/dev/null | grep -c -E "$(get_pinned_filename_regex)" || true)
+        while IFS= read -r _pin_f; do
+            [ -z "$_pin_f" ] && continue
+            ((local_pinned_count++))
+            _unique_pinned_map["$_pin_f"]=1
+        done < <(find "$local_dest_check" -maxdepth 1 -type f -name "${TARBALL_BASENAME}_*.pinned" -printf "%f\n" 2>/dev/null | grep -E "$(get_pinned_filename_regex)" || true)
     fi
-    if [ -d "$SOURCE_DIR" ]; then
-        pres_pinned_count=$(find "$SOURCE_DIR" -maxdepth 1 -type f -name "${TARBALL_BASENAME}_*.pinned" -printf "%f\n" 2>/dev/null | grep -c -E "$(get_pinned_filename_regex)" || true)
+    local -a _pres_dirs=()
+    [ -n "${SCRATCH_DIR:-}" ] && [ -d "$SCRATCH_DIR" ] && _pres_dirs+=("$SCRATCH_DIR")
+    [ -d "$SOURCE_DIR" ] && [ "${SOURCE_DIR%/}" != "${SCRATCH_DIR%/}" ] && _pres_dirs+=("$SOURCE_DIR")
+    if [ ${#_pres_dirs[@]} -gt 0 ]; then
+        while IFS= read -r _pin_f; do
+            [ -z "$_pin_f" ] && continue
+            ((pres_pinned_count++))
+            _unique_pinned_map["$_pin_f"]=1
+        done < <(find "${_pres_dirs[@]}" -maxdepth 1 -type f -name "${TARBALL_BASENAME}_*.pinned" -printf "%f\n" 2>/dev/null | sort -u | grep -E "$(get_pinned_filename_regex)" || true)
     fi
     if [[ "$BACKUP_DIR" == *:* ]] && command -v rclone &>/dev/null; then
-        cloud_pinned_count=$(rclone lsf --files-only --max-depth 1 "${RCLONE_QUERY_OPTS[@]}" --include "${TARBALL_BASENAME}_*.pinned" "$BACKUP_DIR" 2>/dev/null | grep -c -E "$(get_pinned_filename_regex)" || true)
+        while IFS= read -r _pin_f; do
+            [ -z "$_pin_f" ] && continue
+            ((cloud_pinned_count++))
+            _unique_pinned_map["$_pin_f"]=1
+        done < <(rclone lsf --files-only --max-depth 1 "${RCLONE_QUERY_OPTS[@]}" --include "${TARBALL_BASENAME}_*.pinned" "$BACKUP_DIR" 2>/dev/null | grep -E "$(get_pinned_filename_regex)" || true)
     fi
-    local total_pinned=$((local_pinned_count + pres_pinned_count + cloud_pinned_count))
+    local total_pinned="${#_unique_pinned_map[@]}"
     if [ "$total_pinned" -gt 0 ]; then
-        report_ok "Retention Holds" "${total_pinned} pinned archive marker(s) active (local: ${local_pinned_count}, preserved: ${pres_pinned_count}, cloud: ${cloud_pinned_count})"
+        report_ok "Retention Holds" "${total_pinned} unique pinned archive(s) active (local: ${local_pinned_count}, preserved: ${pres_pinned_count}, cloud: ${cloud_pinned_count})"
     else
         report_info "Retention Holds" "No archives currently pinned (use 'pin' to exempt archives from rotation)"
     fi
@@ -17755,7 +18094,7 @@ show_main_menu() {
             5) list_backups ;;
             6) display_manifest ;;
             7) show_backup_stats ;;
-            8) execute_with_inhibit contents ;;
+            8) execute_with_inhibit list-files ;;
             9) execute_with_inhibit find-file ;;
             10) execute_with_inhibit diff ;;
             11) execute_with_inhibit manage-preserved ;;
@@ -17786,7 +18125,7 @@ show_main_menu() {
 #==============================================================================
 if [ "$_IS_SOURCED" = true ]; then
     unset _IS_SOURCED
-    return 0 2>/dev/null || exit 0
+    return 0 2>/dev/null
 fi
 unset _IS_SOURCED
 #------------------------------------------------------------------------------
@@ -17797,17 +18136,16 @@ unset _IS_SOURCED
 if [ "${1:-}" = "--dry-run" ] || [ "${1:-}" = "-n" ]; then
     export DRY_RUN="true"
     shift
-    # If explicit 'backup' followed '--dry-run'/'-n', consume it
+    # If explicit 'backup' followed '--dry-run'/'-n', keep 'backup' and forward '-n'
     if [ "${1:-}" = "backup" ]; then
         shift
-    fi
-    # If no further arguments or leading options for backup, dispatch as backup
-    if [ $# -eq 0 ]; then
+        set -- "backup" "-n" "$@"
+    elif [ $# -eq 0 ]; then
         set -- "backup" "-n"
     elif [[ "${1:-}" == -* ]]; then
         case "$1" in
-            help|-h|--help|version|--version|-V|bundle|--bundle|init-config|--init-config|list|-l|--list)
-                # Known top-level flag/command; do not prepend backup
+            -h|--help|--version|-V|--bundle|--init-config|-l|--list)
+                # Known top-level flag; do not prepend backup
                 ;;
             *)
                 set -- "backup" "-n" "$@"
@@ -17817,8 +18155,8 @@ if [ "${1:-}" = "--dry-run" ] || [ "${1:-}" = "-n" ]; then
 elif [ $# -gt 0 ] && [[ "${1:-}" == -* ]]; then
     # If invoked with leading options (e.g. -v, --pin, etc.) without an explicit subcommand
     case "$1" in
-        help|-h|--help|version|--version|-V|bundle|--bundle|init-config|--init-config|list|-l|--list)
-            # Known top-level flag/command
+        -h|--help|--version|-V|--bundle|--init-config|-l|--list)
+            # Known top-level flag
             ;;
         *)
             set -- "backup" "$@"
@@ -18073,7 +18411,7 @@ if [ -n "$1" ]; then
             manage_systemd_timer "${@:2}"
             exit $?
             ;;
-        list-files|list_files|view-archive|view_archive|list-contents|list_contents|\
+        list-files|list_files|view-archive|view_archive|list-contents|list_contents|contents|\
         find-file|find_file|search-file|search_file|\
         diff-backups|diff_backups|backup-diff|backup_diff|drift|diff|\
         backup|restore|restore-system|restore_system|system-restore|system_restore|verify|manage-preserved|clean-preserved|pin|unpin|manage-pinned|manage_pinned)
