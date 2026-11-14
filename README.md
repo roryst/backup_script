@@ -50,9 +50,10 @@ A robust, enterprise-grade Bash backup, verification, and disaster-recovery solu
 ### 🛡️ Security & Encryption
 - **Multi-Mode & Multi-Recipient Encryption**: Supports symmetric AES-256 (`gpg`), asymmetric public-key encryption across one or multiple GPG recipients (`GPG_RECIPIENT` / `GPG_RECIPIENTS`, ideal for headless servers with zero secret keys on disk), or hybrid encryption (unlockable with either a secret key or passphrase).
 - **Hardware-Accelerated AEAD Encryption**: Automatically enables modern AEAD authenticated encryption (`OCB` or `EAX` mode via `GPG_AEAD_ALGO="auto"`) when supported by GnuPG for faster throughput and tamper detection, with seamless fallback to standard CFB+MDC packets.
+- **Optional Sidecar Encryption**: Optionally GPG-encrypts companion file indexes (`.files.gz.gpg`) and JSON manifests (`.manifest.json.gpg`) via `ENCRYPT_SIDECARS`, `ENCRYPT_FILE_INDEX`, and `ENCRYPT_MANIFEST` to prevent metadata and filename enumeration on untrusted cloud storage, with transparent on-demand decryption and local caching.
 - **Strict Permission Enforcement**: Automatically ensures configuration directories, config files, and passphrase secrets are locked to `chmod 700` and `600` (with `check-config --fix` auto-remediation).
 - **Disaster Recovery Escrow Exports**: Built-in CLI commands to export OAuth cloud configurations (`export-rclone-config`) and ASCII-armored GPG public and secret keys (`export-gpg-keys`) with automated strict `chmod 600` permission enforcement for offline paper/USB vaults.
-- **Zero Temporary Secret Leakage**: Passphrases and encryption pipes are handled in memory and secure file descriptors (`--passphrase-fd 3`), and explicitly scrubbed from memory on exit.
+- **Zero Temporary Secret Leakage**: Passphrases and encryption pipes are handled in memory and secure file descriptors (`--passphrase-fd 3`), passed across `systemd-inhibit` re-exec boundaries via immediately unlinked `0600` runtime files in `$XDG_RUNTIME_DIR` rather than `/proc/<pid>/environ`, and explicitly scrubbed from memory on exit.
 
 ### ⚡ Compression & Performance
 - **Modern Zstandard (`zstd`)**: Tuned multi-threaded compression (default level 6) with **Long Distance Matching (`--long=27`)** to dramatically compress repetitive text, code repositories, and container structures.
@@ -60,7 +61,7 @@ A robust, enterprise-grade Bash backup, verification, and disaster-recovery solu
 - **Non-Disruptive Process Priority (`nice` & `ionice`)**: Automatically lowers execution priority to background levels (`nice -n 19`, `ionice -c 2 -n 7`), preventing workstation UI freezes or I/O stalls during intensive backups and restores.
 - **Adaptive Cloud Streaming**: Restore directly from cloud storage via `rclone cat` without downloading full multi-gigabyte archives to local disk, or stage to scratch space automatically when disk space permits.
 - **Resilient Network Transfers**: Multi-threaded cloud uploads (`--multi-thread-streams 4`) and resilient `rclone cat` streaming operations incorporate multi-level retries (`--retries 3 --low-level-retries 10`), socket timeouts, and optional bandwidth throttling (`RCLONE_BWLIMIT`) to resist transient socket drops.
-- **Batched Companion Uploads**: Companion sidecars (`.sha256`, `.manifest.json`, `.files.gz`, `.pinned`) are transferred in a single batched `rclone copy --files-from-raw` pass to minimize cloud API round-trips.
+- **Batched Companion Uploads & Sidecar Cache Sync**: Companion sidecars (`.sha256`, `.manifest.json[.gpg]`, `.files.gz[.gpg]`, `.pinned`) are transferred and synchronized into a persistent `chmod 700` local cache (`SIDECAR_CACHE_DIR`) in a single batched `rclone copy --files-from-raw` pass to minimize cloud API round-trips and accelerate repeated cloud queries.
 - **Resource Aware**: Dynamically scales decompression memory (`ZSTD_DECOMPRESS_MEMORY`) to match LDM window sizes and enforces pre-flight scratch space checks (`MIN_FREE_SPACE_GB`) before archiving.
 
 ### 🔄 Dual-Destination Synchronization & Retention
@@ -79,11 +80,11 @@ A robust, enterprise-grade Bash backup, verification, and disaster-recovery solu
 - **Full Tar Stream Validation**: Thoroughly validates GPG decryption and `tar`/`zstd` archive block structure without writing files to disk.
 
 ### 📦 System State Snapshots, Manifests & File Indexing
-- **OS Environment Capture**: Exports lists of installed system packages (APT manual packages, foreign `dpkg` architectures, and `debconf` selections on Debian/Ubuntu/Mint; DNF user-installed packages on Fedora/RHEL), Flatpaks, Pipx packages, enabled systemd user units, desktop `dconf` configurations, crontabs, and repository/GPG keyrings into the backup.
-- **Modular System State Restore (`restore-system`)**: Dedicated subcommand that re-applies packages, repositories, desktop settings, systemd user units, and crontabs directly from unpacked directories or extracts manifests from an archive in a single pass without downloading or unpacking the entire home directory.
-- **Interactive Archive File Browser**: Search and browse files inside archives using companion `.files.gz` indexes, multi-select items with number ranges (`1, 3-5`), and restore selectively without full downloads.
-- **Companion JSON Manifests (`.manifest.json`)**: Instantly inspect archive metadata, compression ratios, package counts, destination sync statuses, and checksums without downloading or decrypting the archive.
-- **Zero-Bandwidth Companion File Indexes (`.files.gz`)**: Captures full file tables during archive creation (`tar -vv --index-file`) with zero extra disk passes, enabling instant file search (`find-file`) and zero-download archive exploration (`list-files`) across all local and remote snapshots.
+- **OS Environment Capture**: Exports lists of installed system packages (APT manual packages, foreign `dpkg` architectures, and `debconf` selections on Debian/Ubuntu/Mint; DNF user-installed packages on Fedora/RHEL), Flatpaks (with origin remotes), Pipx packages, enabled systemd user units, desktop `dconf` configurations, crontabs, and repository/GPG keyrings (including custom `Signed-By` APT keyrings and `gpgkey=file:///...` RPM keys) into the backup.
+- **Modular System State Restore (`restore-system`)**: Dedicated subcommand that re-applies packages, repositories, Flatpaks (targeted to their recorded origin remotes), desktop settings, systemd user units, and crontabs directly from unpacked directories or extracts manifests from an archive in a single pass without downloading or unpacking the entire home directory.
+- **Interactive Archive File Browser**: Search and browse files inside archives using companion `.files.gz` (or encrypted `.files.gz.gpg`) indexes, multi-select items with number ranges (`1, 3-5`), and restore selectively without full downloads.
+- **Companion JSON Manifests (`.manifest.json` / `.manifest.json.gpg`)**: Instantly inspect archive metadata, compression ratios, package counts, destination sync statuses, and checksums without downloading or decrypting the full archive.
+- **Zero-Bandwidth Companion File Indexes (`.files.gz` / `.files.gz.gpg`)**: Captures full file tables during archive creation (`tar -vv --index-file`) with zero extra disk passes, enabling instant file search (`find-file`) and zero-download archive exploration (`list-files`) across all local and remote snapshots via the local sidecar cache (`SIDECAR_CACHE_DIR`).
 - **Zero-Decryption Backup Drift Comparison (`diff-backups`)**: Instantly diff any two backups (local or cloud) using companion index sidecars in seconds without decrypting or decompressing multi-gigabyte archives. Categorizes added, removed, and modified files with exact size deltas, net storage drift analytics, interactive filtering, and structured JSON/CSV exports.
 
 ### ⚙️ Reliability & Safety
@@ -582,7 +583,7 @@ $ ./backup_script.sh manifest latest
   Created (UTC)    : 2026-09-21T05:53:37Z
   Host / User      : hp / rory
   Source Directory : /home/rory
-  Script Version   : 11.7.2
+  Script Version   : 11.8.0
   Duration         : 1m 46s (106s)
 -------------------------------------------------------------------------------
   Archive Details
@@ -1225,7 +1226,8 @@ If performing manual bare-metal recovery without `backup_script.sh`, the exporte
 
 - **DNF (Fedora / RHEL / Rocky / AlmaLinux)**:
   ```bash
-  sudo tar -xzvf dnf_repos_keys.tar.gz -C /etc/
+  sudo tar -xzvf dnf_repos_keys.tar.gz -C /
+  # Note: For legacy archives created with paths relative to /etc, extract to -C /etc/
   sudo dnf clean all && sudo dnf makecache
   xargs -a dnf_packages_userinstalled.txt sudo dnf install -y --skip-broken
   ```
@@ -1318,6 +1320,10 @@ Key variables configurable in `~/.config/backup_script/config`:
 | `ARCHIVE_LIST_PAGER` | `${PAGER:-less -FRX}` | Preferred pager command for viewing archive file listings |
 | `GENERATE_MANIFEST` | `true` | Generate companion JSON manifest (`.manifest.json`) with metadata and inventory |
 | `GENERATE_FILE_INDEX` | `true` | Generate companion file index (`.files.gz`) for fast zero-download search & listing |
+| `ENCRYPT_SIDECARS` | `false` | Master toggle to GPG-encrypt both `.files.gz` and `.manifest.json` companion sidecars (`true`/`false`) |
+| `ENCRYPT_FILE_INDEX` | `${ENCRYPT_SIDECARS}` | GPG-encrypt companion file index as `.files.gz.gpg` (`true`/`false`) |
+| `ENCRYPT_MANIFEST` | `${ENCRYPT_SIDECARS}` | GPG-encrypt companion JSON manifest as `.manifest.json.gpg` (`true`/`false`) |
+| `SIDECAR_CACHE_DIR` | `~/.cache/backup_script/sidecars` | Local `0700` cache directory for cloud companion sidecars (`.files.gz`, `.manifest.json`, `.sha256`) |
 | `LOG_DIR` | `~/.config/backup_script/logs` | Directory path for multi-run timestamped execution logs |
 | `LOG_RETENTION_COUNT` | `14` | Number of historical run log files to retain before automated rotation |
 | `ENABLE_PV` | `auto` | Pipe Viewer integration for live archive transfer throughput (`auto`, `true`, `false`) |
