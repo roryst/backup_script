@@ -87,7 +87,7 @@ A robust, enterprise-grade Bash backup, verification, and disaster-recovery solu
 - **Zero-Decryption Backup Drift Comparison (`diff-backups`)**: Instantly diff any two backups (local or cloud) using companion index sidecars in seconds without decrypting or decompressing multi-gigabyte archives. Categorizes added, removed, and modified files with exact size deltas, net storage drift analytics, interactive filtering, and structured JSON/CSV exports.
 
 ### ⚙️ Reliability & Safety
-- **Dry-Run Simulation (`--dry-run` / `-n`)**: Simulate the entire backup workflow—including pre-flight checks, exclusion rules, and count/GFS retention pruning calculations—without creating or deleting any files.
+- **Dry-Run Simulation (`--dry-run` / `-n`)**: Simulate backup creation, selective or full archive restoration (`restore`), archive pinning/unpinning (`pin` / `unpin`), preserved archive cleanup (`clean-preserved`), configuration & timer management (`init-config`, `check-config --fix`, `install-timer`, `uninstall-timer`), and escrow exports (`export-rclone-config`, `export-gpg-keys`) without creating, modifying, or deleting any files.
 - **Application Consistency Guard, SQLite WAL Checkpointing & Cgroup-Decoupled Relaunch**: Detects running database-heavy applications (Vivaldi, Chrome, Firefox, Thunderbird, Brave, etc.) and either gracefully terminates them (`SIGTERM` with configurable `25s` settle timeout) or performs safe, passive SQLite WAL checkpointing (`PRAGMA wal_checkpoint(PASSIVE)`) on open browser/email databases before flushing OS buffers (`sync`). When `RESTART_CLOSED_APPS=true` (or `--restart-apps`), closed applications are automatically relaunched in independent `app.slice` scopes as soon as local archiving finishes (before cloud upload).
 - **Pre & Post Backup Lifecycle Hooks**: Execute custom scripts (`~/.config/backup_script/pre-backup.sh`, `post-backup.sh`) or inline commands (`PRE_BACKUP_COMMAND`, `POST_BACKUP_COMMAND`) before and after backup runs with rich status arguments.
 - **Multi-Run Historical Log Retention**: Retains timestamped per-run logs in `~/.config/backup_script/logs` (`backup_<user>_YYYY-MM-DD_HHMMSS.log`) with configurable pruning retention (`LOG_RETENTION_COUNT=14`) while maintaining a backwards-compatible active `$LOG_FILE` pointer.
@@ -166,6 +166,7 @@ Ensure the following tools are installed on your Linux system:
 | `systemd` | Managing automated `--user` timers, sleep inhibition, and cgroup-decoupled app relaunch |
 | `pv` | Live terminal progress and throughput rate display |
 | `ionice` | Background I/O scheduling class and priority control |
+| `secret-tool` | Storing and retrieving encryption passphrases via GNOME Keyring / Secret Service (`libsecret-tools`) |
 
 To install common dependencies on Debian/Ubuntu/Mint:
 ```bash
@@ -202,6 +203,11 @@ Store your backup passphrase securely in `~/.config/backup_script/passphrase`:
 ```bash
 echo "YOUR_STRONG_PASSPHRASE" > ~/.config/backup_script/passphrase
 chmod 600 ~/.config/backup_script/passphrase
+```
+Alternatively, you can store the passphrase in GNOME Keyring / Secret Service (`secret-tool`) or provide it via systemd encrypted credentials (`$CREDENTIALS_DIRECTORY`):
+```bash
+# Store passphrase in GNOME Keyring / Secret Service:
+secret-tool store --label="Backup Script Passphrase" service backup_script user "$USER"
 ```
 
 #### Asymmetric / Public-Key or Hybrid Encryption (Optional)
@@ -953,6 +959,17 @@ Service Status (Last Run):
 #### View Recent Journal Logs
 ```bash
 ./backup_script.sh journal-timer 50
+# Stream live logs:
+./backup_script.sh journal-timer -f
+```
+
+#### Uninstall Timer or Use Unified Timer Manager
+```bash
+# Disable and remove the user timer and service units
+./backup_script.sh uninstall-timer
+
+# Launch interactive timer management menu (or pass install|status|journal|uninstall|run)
+./backup_script.sh timer
 ```
 
 ---
@@ -982,29 +999,35 @@ $ ./backup_script.sh test-notification normal "Backup Test" "Desktop notificatio
 Export critical cloud OAuth tokens and cryptographic keys to offline, isolated media (such as an encrypted paper backup or air-gapped USB drive) so you can recover your data from a clean machine without circular dependencies:
 
 #### 1. Export Rclone Cloud Storage Configuration (`export-rclone-config`)
-Exports your authenticated `rclone.conf` with automated `chmod 600` permissions:
+Exports your authenticated `rclone` configuration with automated `chmod 600` permissions (exports only the active backup remote by default to minimize credential exposure, or all configured remotes with `--full` / `-a`):
 
 ```bash
-# Export to default location (~/rclone_disaster_recovery_backup.conf)
+# Export active remote config to default location (~/.config/backup_script/rclone.conf.escrow)
 ./backup_script.sh export-rclone-config
+
+# Export entire rclone configuration (all remotes)
+./backup_script.sh export-rclone-config --full
+
+# Print active remote configuration block to stdout
+./backup_script.sh export-rclone-config --print
 
 # Export directly to an external secure mount or USB drive
 ./backup_script.sh export-rclone-config /media/rory/SECURE_USB/rclone.conf
 ```
 
 #### 2. Export GPG Public & Secret Keys (`export-gpg-keys`)
-Exports ASCII-armored public (`.pub.asc`) and secret (`.sec.asc`) keyrings for every configured GPG recipient with automated `chmod 600` permissions:
+Exports ASCII-armored public (`gpg_backup_public.key`) and secret (`gpg_backup_secret.key`) keys for your configured GPG recipient with automated `chmod 600` permissions:
 
 ```bash
-# Export to default directory (~/gpg_disaster_recovery_keys)
+# Export to default directory (~/.config/backup_script/gpg_escrow)
 ./backup_script.sh export-gpg-keys
 
-# Export directly to an external secure mount or USB drive
-./backup_script.sh export-gpg-keys /media/rory/SECURE_USB/gpg_keys
+# Export a specific GPG key ID or email to an external secure mount or USB drive
+./backup_script.sh export-gpg-keys /media/rory/SECURE_USB/gpg_keys --recipient your_email@domain.com
 ```
 
 > [!CAUTION]
-> The exported `.sec.asc` and `rclone.conf` files contain highly sensitive credentials. Store them in an encrypted password manager vault or offline hardware token—never on unencrypted network shares.
+> The exported `gpg_backup_secret.key` and `rclone.conf.escrow` files contain highly sensitive credentials. Store them in an encrypted password manager vault or offline hardware token—never on unencrypted network shares.
 
 ---
 
@@ -1141,10 +1164,10 @@ For asymmetric or hybrid encrypted backups, the target system must possess the G
 #### Step 1: Import Keypair from Escrow
 ```bash
 # Import secret key exported via ./backup_script.sh export-gpg-keys
-gpg --import /path/to/gpg_keys/*.sec.asc
+gpg --import /path/to/gpg_escrow/gpg_backup_secret.key
 
 # Import public key
-gpg --import /path/to/gpg_keys/*.pub.asc
+gpg --import /path/to/gpg_escrow/gpg_backup_public.key
 ```
 
 #### Step 2: Set Ultimate Key Trust
