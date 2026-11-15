@@ -5,7 +5,7 @@
 #
 #   DESCRIPTION:  Self-contained single-file bundle generated from modular libraries.
 #                 Version: 11.8.0
-#                 Generated on: 2026-11-14 17:33:32
+#                 Generated on: 2026-11-14 17:56:19
 #
 #==============================================================================
 SCRIPT_IS_STANDALONE=true
@@ -447,7 +447,7 @@ GENERATE_FILE_INDEX="${GENERATE_FILE_INDEX:-true}"
 
 # Optional GPG encryption for cloud companion sidecars (.files.gz.gpg and .manifest.json.gpg)
 # Prevents leaking directory structure, filenames, and host metadata in plaintext on cloud storage.
-ENCRYPT_SIDECARS="${ENCRYPT_SIDECARS:-false}"
+ENCRYPT_SIDECARS="${ENCRYPT_SIDECARS:-true}"
 ENCRYPT_FILE_INDEX="${ENCRYPT_FILE_INDEX:-${ENCRYPT_SIDECARS}}"
 ENCRYPT_MANIFEST="${ENCRYPT_MANIFEST:-${ENCRYPT_SIDECARS}}"
 
@@ -2065,9 +2065,9 @@ get_cached_or_cloud_sidecar() {
         local -a remote_candidates=()
         if [[ "$sidecar_name" == *.gpg ]]; then
             remote_candidates=("$sidecar_name" "$base_sidecar")
-        elif [[ "$base_sidecar" == *.files.gz ]] && [[ "${ENCRYPT_FILE_INDEX:-false}" =~ ^([Tt][Rr][Uu][Ee]|1|[Yy][Ee][Ss]|[Oo][Nn])$ ]]; then
+        elif [[ "$base_sidecar" == *.files.gz ]] && [[ "${ENCRYPT_FILE_INDEX:-true}" =~ ^([Tt][Rr][Uu][Ee]|1|[Yy][Ee][Ss]|[Oo][Nn])$ ]]; then
             remote_candidates=("${base_sidecar}.gpg" "$base_sidecar")
-        elif [[ "$base_sidecar" == *.manifest.json ]] && [[ "${ENCRYPT_MANIFEST:-false}" =~ ^([Tt][Rr][Uu][Ee]|1|[Yy][Ee][Ss]|[Oo][Nn])$ ]]; then
+        elif [[ "$base_sidecar" == *.manifest.json ]] && [[ "${ENCRYPT_MANIFEST:-true}" =~ ^([Tt][Rr][Uu][Ee]|1|[Yy][Ee][Ss]|[Oo][Nn])$ ]]; then
             remote_candidates=("${base_sidecar}.gpg" "$base_sidecar")
         else
             remote_candidates=("$base_sidecar" "${base_sidecar}.gpg")
@@ -7544,7 +7544,7 @@ upload_preserved_archive() {
             cache_sidecar_file "$target_manifest" "$(basename "$target_manifest")" || true
             local mlog="${ptmp}/manifest.log"
             local _upload_mf="$target_manifest"
-            if [[ "${ENCRYPT_MANIFEST:-${ENCRYPT_SIDECARS:-false}}" =~ ^([Tt][Rr][Uu][Ee]|1|[Yy][Ee][Ss]|[Oo][Nn])$ ]]; then
+            if [[ "${ENCRYPT_MANIFEST:-${ENCRYPT_SIDECARS:-true}}" =~ ^([Tt][Rr][Uu][Ee]|1|[Yy][Ee][Ss]|[Oo][Nn])$ ]]; then
                 if encrypt_sidecar_file "$target_manifest" "${ptmp}/$(basename "$target_manifest").gpg"; then
                     _upload_mf="${ptmp}/$(basename "$target_manifest").gpg"
                 fi
@@ -7559,7 +7559,7 @@ upload_preserved_archive() {
             cache_sidecar_file "$target_index" "$(basename "$target_index")" || true
             local ilog="${ptmp}/index.log"
             local _upload_idx="$target_index"
-            if [[ "${ENCRYPT_FILE_INDEX:-${ENCRYPT_SIDECARS:-false}}" =~ ^([Tt][Rr][Uu][Ee]|1|[Yy][Ee][Ss]|[Oo][Nn])$ ]]; then
+            if [[ "${ENCRYPT_FILE_INDEX:-${ENCRYPT_SIDECARS:-true}}" =~ ^([Tt][Rr][Uu][Ee]|1|[Yy][Ee][Ss]|[Oo][Nn])$ ]]; then
                 if encrypt_sidecar_file "$target_index" "${ptmp}/$(basename "$target_index").gpg"; then
                     _upload_idx="${ptmp}/$(basename "$target_index").gpg"
                 fi
@@ -10595,7 +10595,7 @@ run_backup() {
         local _enc_manifest_tmp="" _enc_index_tmp=""
         [ -f "${FULL_SHA256_PATH}" ] && sidecar_files+=("$(basename "${FULL_SHA256_PATH}")")
         if [ -f "${FULL_MANIFEST_PATH}" ]; then
-            if [[ "${ENCRYPT_MANIFEST:-${ENCRYPT_SIDECARS:-false}}" =~ ^([Tt][Rr][Uu][Ee]|1|[Yy][Ee][Ss]|[Oo][Nn])$ ]]; then
+            if [[ "${ENCRYPT_MANIFEST:-${ENCRYPT_SIDECARS:-true}}" =~ ^([Tt][Rr][Uu][Ee]|1|[Yy][Ee][Ss]|[Oo][Nn])$ ]]; then
                 _enc_manifest_tmp="${FULL_MANIFEST_PATH}.gpg"
                 CURRENT_GENERIC_TMP_FILES+=("$_enc_manifest_tmp")
                 if encrypt_sidecar_file "${FULL_MANIFEST_PATH}" "$_enc_manifest_tmp"; then
@@ -10609,7 +10609,7 @@ run_backup() {
             fi
         fi
         if [ -f "${FULL_INDEX_PATH}" ]; then
-            if [[ "${ENCRYPT_FILE_INDEX:-${ENCRYPT_SIDECARS:-false}}" =~ ^([Tt][Rr][Uu][Ee]|1|[Yy][Ee][Ss]|[Oo][Nn])$ ]]; then
+            if [[ "${ENCRYPT_FILE_INDEX:-${ENCRYPT_SIDECARS:-true}}" =~ ^([Tt][Rr][Uu][Ee]|1|[Yy][Ee][Ss]|[Oo][Nn])$ ]]; then
                 _enc_index_tmp="${FULL_INDEX_PATH}.gpg"
                 CURRENT_GENERIC_TMP_FILES+=("$_enc_index_tmp")
                 if encrypt_sidecar_file "${FULL_INDEX_PATH}" "$_enc_index_tmp"; then
@@ -16740,10 +16740,10 @@ init_config() {
 # GPG-encrypt cloud companion sidecars (.files.gz.gpg and .manifest.json.gpg) using the active
 # ENCRYPTION_MODE so filenames, directory structure, and host metadata are not stored in plaintext
 # on cloud storage. Sidecars are transparently decrypted into the local sidecar cache on demand.
-# Default: false
-#ENCRYPT_SIDECARS="false"
-#ENCRYPT_FILE_INDEX="false"
-#ENCRYPT_MANIFEST="false"
+# Default: true
+#ENCRYPT_SIDECARS="true"
+#ENCRYPT_FILE_INDEX="true"
+#ENCRYPT_MANIFEST="true"
 
 #------------------------------------------------------------------------------
 # 9. Compression
@@ -17819,10 +17819,10 @@ check_config() {
         report_info "File List Indexing" "Disabled (GENERATE_FILE_INDEX=${GENERATE_FILE_INDEX})"
     fi
 
-    if [[ "${ENCRYPT_SIDECARS:-false}" =~ ^([Tt][Rr][Uu][Ee]|1|[Yy][Ee][Ss]|[Oo][Nn])$ ]] || \
-       [[ "${ENCRYPT_FILE_INDEX:-false}" =~ ^([Tt][Rr][Uu][Ee]|1|[Yy][Ee][Ss]|[Oo][Nn])$ ]] || \
-       [[ "${ENCRYPT_MANIFEST:-false}" =~ ^([Tt][Rr][Uu][Ee]|1|[Yy][Ee][Ss]|[Oo][Nn])$ ]]; then
-        report_ok "Sidecar Encryption" "Enabled (index=${ENCRYPT_FILE_INDEX:-false}, manifest=${ENCRYPT_MANIFEST:-false})"
+    if [[ "${ENCRYPT_SIDECARS:-true}" =~ ^([Tt][Rr][Uu][Ee]|1|[Yy][Ee][Ss]|[Oo][Nn])$ ]] || \
+       [[ "${ENCRYPT_FILE_INDEX:-true}" =~ ^([Tt][Rr][Uu][Ee]|1|[Yy][Ee][Ss]|[Oo][Nn])$ ]] || \
+       [[ "${ENCRYPT_MANIFEST:-true}" =~ ^([Tt][Rr][Uu][Ee]|1|[Yy][Ee][Ss]|[Oo][Nn])$ ]]; then
+        report_ok "Sidecar Encryption" "Enabled (index=${ENCRYPT_FILE_INDEX:-true}, manifest=${ENCRYPT_MANIFEST:-true})"
     else
         report_info "Sidecar Encryption" "Disabled (set ENCRYPT_SIDECARS=true to GPG-encrypt cloud sidecars)"
     fi
